@@ -106,12 +106,12 @@ Easy to get wrong from the diff alone:
 - **e2e builds binaries at runtime**, so the test cache can't see example
   source changes — `make e2e` passes `-count=1` to force a rebuild.
 - **Live examples are gated.** `serve` and `handoff` mint real tunnels from
-  `api.trycloudflare.com`, which rate-limits — 12 CI matrix cells minting
-  concurrently would trip 429s. The e2e harness skips them unless
-  `LIBTUNNEL_E2E_LIVE=1`; run that once locally when touching the engine or
-  the examples. A `served: error code: 1033` from a fresh tunnel is edge
-  route propagation lag (more likely with several tunnels minted at once) —
-  rerun the case before suspecting the code.
+  `api.trycloudflare.com`, which rate-limits — minting from all 12 CI matrix
+  cells would trip 429s, so exactly one cell (ubuntu-24.04/stable) sets
+  `LIBTUNNEL_E2E_LIVE=1` and the rest skip the live tier. Run it locally too
+  when touching the engine or the examples. A `served: error code: 1033`
+  from a fresh tunnel is edge route propagation lag (more likely with
+  several tunnels minted at once) — rerun before suspecting the code.
 - **cloudflared registers prometheus collectors globally.** The Cloudflare
   engine swaps `prometheus.DefaultRegisterer` to a noop (under a mutex) for
   the construction window so host applications' metrics stay clean. Don't
