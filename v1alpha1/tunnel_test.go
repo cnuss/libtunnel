@@ -1,8 +1,9 @@
-package v1alpha1
+package v1alpha1_test
 
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
+	"github.com/cnuss/libtunnel/v1alpha1"
 )
 
 // fakeEngine satisfies the Engine contract without dialing anything: it
@@ -24,9 +26,9 @@ func newFakeEngine(spec *v1.CloudflareSpec) *fakeEngine {
 }
 
 func (e *fakeEngine) Name() string                              { return "fake" }
-func (e *fakeEngine) Provider() v1.Provider[*v1.CloudflareSpec] { return Static(e.spec) }
+func (e *fakeEngine) Provider() v1.Provider[*v1.CloudflareSpec] { return v1alpha1.Static(e.spec) }
 func (e *fakeEngine) CACerts() []*x509.Certificate              { return []*x509.Certificate{} }
-func (e *fakeEngine) WithListener(t *TunnelImpl[*v1.CloudflareSpec], l net.Listener) error {
+func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*v1.CloudflareSpec], l net.Listener) error {
 	e.got <- l
 	return nil
 }
@@ -34,8 +36,10 @@ func (e *fakeEngine) WithListener(t *TunnelImpl[*v1.CloudflareSpec], l net.Liste
 // foreignBackend implements v1.Backend but not Engine.
 type foreignBackend struct{}
 
-func (foreignBackend) Name() string                              { return "foreign" }
-func (foreignBackend) Provider() v1.Provider[*v1.CloudflareSpec] { return Static(&v1.CloudflareSpec{}) }
+func (foreignBackend) Name() string { return "foreign" }
+func (foreignBackend) Provider() v1.Provider[*v1.CloudflareSpec] {
+	return v1alpha1.Static(&v1.CloudflareSpec{})
+}
 
 func listen(t *testing.T) net.Listener {
 	t.Helper()
@@ -49,7 +53,7 @@ func listen(t *testing.T) net.Listener {
 
 func TestLocalGettersDeriveFromListener(t *testing.T) {
 	l := listen(t)
-	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
+	tun := v1alpha1.New(newFakeEngine(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
 	conn := tun.WithListener(l)
 
 	addr := l.Addr().(*net.TCPAddr)
@@ -69,7 +73,7 @@ func TestLocalGettersDeriveFromListener(t *testing.T) {
 }
 
 func TestLocalGettersBlockUntilListener(t *testing.T) {
-	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{}))
+	tun := v1alpha1.New(newFakeEngine(&v1.CloudflareSpec{}))
 
 	port := make(chan int, 1)
 	go func() { port <- tun.LocalPort() }()
@@ -100,7 +104,7 @@ func TestUnspecifiedBindFallsBackToOutboundRouteIP(t *testing.T) {
 	}
 	defer l.Close()
 
-	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{}))
+	tun := v1alpha1.New(newFakeEngine(&v1.CloudflareSpec{}))
 	conn := tun.WithListener(l)
 
 	ip := conn.LocalIP()
@@ -113,7 +117,7 @@ func TestUnspecifiedBindFallsBackToOutboundRouteIP(t *testing.T) {
 }
 
 func TestSpecGettersDeriveFromProvider(t *testing.T) {
-	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
+	tun := v1alpha1.New(newFakeEngine(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
 
 	if got := tun.Hostname(); got != "demo.trycloudflare.com" {
 		t.Errorf("Hostname() = %q", got)
@@ -132,7 +136,7 @@ func TestSpecGettersDeriveFromProvider(t *testing.T) {
 func TestEngineReceivesListener(t *testing.T) {
 	engine := newFakeEngine(&v1.CloudflareSpec{})
 	l := listen(t)
-	New[*v1.CloudflareSpec](engine).WithListener(l)
+	v1alpha1.New(engine).WithListener(l)
 
 	select {
 	case got := <-engine.got:
@@ -144,23 +148,42 @@ func TestEngineReceivesListener(t *testing.T) {
 	}
 }
 
+// TestTunnelReadyAfterEngineConnects uses a hostname that genuinely resolves
+// (Cloudflare's own) so the public-resolver readiness poller succeeds — the
+// fake engine supplies the connection half. Needs outbound DNS.
 func TestTunnelReadyAfterEngineConnects(t *testing.T) {
-	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
-	// Pre-resolve hostname readiness so the test doesn't poll real DNS for a
-	// fabricated hostname.
-	tun.hostnameReadyOnce.Do(func() { close(tun.hostnameReady) })
+	tun := v1alpha1.New(newFakeEngine(&v1.CloudflareSpec{Hostname: "one.one.one.one"}))
 
 	conn := tun.WithListener(listen(t))
 
 	select {
 	case <-conn.TunnelReady():
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("TunnelReady never closed after the engine connected")
 	}
 }
 
+// TestHostnameReadyBailsWhenNeverResolving feeds a hostname that cannot
+// exist (.invalid is reserved): the poller must walk its whole resolver
+// fleet and then cancel the tunnel with a descriptive cause rather than wait
+// forever. Needs outbound DNS; takes ~10s (one attempt per fleet member).
+func TestHostnameReadyBailsWhenNeverResolving(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&v1.CloudflareSpec{Hostname: "never.invalid"}))
+	tun.HostnameReady()
+
+	select {
+	case <-tun.Context().Done():
+		cause := context.Cause(tun.Context())
+		if cause == nil || !strings.Contains(cause.Error(), "did not resolve on any of") {
+			t.Errorf("cancel cause = %v, want fleet-exhausted message", cause)
+		}
+	case <-time.After(90 * time.Second):
+		t.Fatal("tunnel was not canceled after the resolver fleet was exhausted")
+	}
+}
+
 func TestForeignBackendCancels(t *testing.T) {
-	tun := New[*v1.CloudflareSpec](foreignBackend{})
+	tun := v1alpha1.New[*v1.CloudflareSpec](foreignBackend{})
 	tun.WithListener(listen(t))
 
 	select {
@@ -174,45 +197,31 @@ func TestForeignBackendCancels(t *testing.T) {
 }
 
 // FuzzHostnameParsing checks the Host/Domain/Port derivation invariants over
-// arbitrary hostnames: the first label plus the remainder reassemble the
-// input, and the port is 443 unless the hostname encodes a valid one.
+// arbitrary spec hostnames, through the public getters: the first label plus
+// the remainder reassemble the input, and the port is 443 unless the
+// hostname encodes a valid one.
 func FuzzHostnameParsing(f *testing.F) {
 	f.Add("demo.trycloudflare.com")
 	f.Add("localhost")
 	f.Add("example.com:8443")
 	f.Add("")
+	f.Add(".")
 
 	f.Fuzz(func(t *testing.T, hostname string) {
-		host, domain, port := hostOf(hostname), domainOf(hostname), portOf(hostname)
+		tun := v1alpha1.New(newFakeEngine(&v1.CloudflareSpec{Hostname: hostname}))
+		defer tun.Cancel(errors.New("fuzz iteration done")) // reap the ctx watcher
+
+		host, domain, port := tun.Host(), tun.Domain(), tun.Port()
 
 		if strings.Contains(hostname, ".") {
 			if host+"."+domain != hostname {
-				t.Errorf("hostOf/domainOf lost data: host=%q domain=%q from %q", host, domain, hostname)
+				t.Errorf("Host/Domain lost data: host=%q domain=%q from %q", host, domain, hostname)
 			}
 		} else if host != hostname {
-			t.Errorf("hostOf(%q) = %q; want the input when it has no dot", hostname, host)
+			t.Errorf("Host() = %q; want the input when it has no dot", host)
 		}
 		if port < 1 || port > 65535 {
-			t.Errorf("portOf(%q) = %d, out of range", hostname, port)
+			t.Errorf("Port() = %d, out of range", port)
 		}
 	})
-}
-
-func TestHostnameReadyBailsWhenFleetExhausted(t *testing.T) {
-	saved := publicResolvers
-	publicResolvers = []string{"127.0.0.1:1", "127.0.0.1:1"} // nothing listens here
-	t.Cleanup(func() { publicResolvers = saved })
-
-	tun := New(newFakeEngine(&v1.CloudflareSpec{Hostname: "never.trycloudflare.com"}))
-	tun.HostnameReady()
-
-	select {
-	case <-tun.Context().Done():
-		cause := context.Cause(tun.Context())
-		if cause == nil || !strings.Contains(cause.Error(), "did not resolve on any of") {
-			t.Errorf("cancel cause = %v, want fleet-exhausted message", cause)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("tunnel was not canceled after the resolver fleet was exhausted")
-	}
 }

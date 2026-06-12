@@ -166,15 +166,15 @@ make run handoff
 
 ```sh
 make test   # library unit + fuzz tests (fast, in-package)
-make e2e    # example binaries + scenario tests (subprocess handoff, …)
+make e2e    # live tier: real tunnels through the real edge (gated)
 ```
 
 `make e2e` runs `go test -count=1 -v ./e2e`. The `-count=1` defeats the test
 cache, since the harness builds the example binaries at runtime and the cache
-key wouldn't otherwise pick up example source changes. Offline scenarios (the
-subprocess spec handoff) always run; the examples themselves mint real
-tunnels from `api.trycloudflare.com` (rate-limited), so the harness skips
-them unless you opt in:
+key wouldn't otherwise pick up example source changes. The e2e tier is live
+tunnels only — everything mints from `api.trycloudflare.com` (rate-limited),
+so the whole tier is skipped unless you opt in (offline subprocess handoff
+coverage lives in the unit tier and always runs):
 
 ```sh
 LIBTUNNEL_E2E_LIVE=1 make e2e

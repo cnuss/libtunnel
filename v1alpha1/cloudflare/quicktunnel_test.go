@@ -1,4 +1,4 @@
-package cloudflare
+package cloudflare_test
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
 const specJSON = `{"success":true,"result":{
@@ -28,7 +30,7 @@ func TestQuickTunnelSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	spec, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background())
+	spec, err := (&cloudflare.QuickTunnelProvider{URL: srv.URL}).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +54,7 @@ func TestQuickTunnelRetriesAfter429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	spec, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background())
+	spec, err := (&cloudflare.QuickTunnelProvider{URL: srv.URL}).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +77,7 @@ func TestQuickTunnelRetriesAfterMalformedBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background()); err != nil {
+	if _, err := (&cloudflare.QuickTunnelProvider{URL: srv.URL}).Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := calls.Load(); got != 2 {
@@ -93,7 +95,7 @@ func TestQuickTunnelHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(ctx); err == nil {
+	if _, err := (&cloudflare.QuickTunnelProvider{URL: srv.URL}).Spec(ctx); err == nil {
 		t.Fatal("Spec returned nil error although the API never succeeds and ctx expired")
 	}
 }
@@ -111,9 +113,9 @@ func TestQuickTunnelSurfacesRateLimit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 
-	_, err := (&QuickTunnelProvider{URL: srv.URL, Log: log}).Spec(ctx)
-	if !errors.Is(err, ErrRateLimited) {
-		t.Errorf("err = %v, want errors.Is(_, ErrRateLimited)", err)
+	_, err := (&cloudflare.QuickTunnelProvider{URL: srv.URL, Log: log}).Spec(ctx)
+	if !errors.Is(err, cloudflare.ErrRateLimited) {
+		t.Errorf("err = %v, want errors.Is(_, cloudflare.ErrRateLimited)", err)
 	}
 	if !strings.Contains(buf.String(), "quick tunnel rate limited") {
 		t.Errorf("no rate-limit warning logged; log output:\n%s", buf.String())

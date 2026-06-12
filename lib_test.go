@@ -1,13 +1,14 @@
-package e2e
+package libtunnel_test
 
-// Offline scenario tests: subprocess flows that exercise the spec handoff
-// machinery without any network access. Every spec here is fabricated, no
-// listener is ever provided, and the Cloudflare credential chain always finds
-// TUNNEL_SPEC before it would mint anything.
+// Subprocess handoff tests for the façade: fabricated specs, no network, no
+// real tunnels (those live in e2e). Each test re-execs this test binary with
+// -test.run anchored to itself and a role variable set; the role branch at
+// the top turns the process into the child.
 
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -15,12 +16,66 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 )
 
+// roleEnv selects a child role inside a re-exec'd test binary.
+const roleEnv = "LIBTUNNEL_TEST_ROLE"
+
+func role() string { return os.Getenv(roleEnv) }
+
+// reexec builds a command that re-runs this test binary anchored to a single
+// test, with extra environment entries appended to the current environment.
+func reexec(test string, extraEnv ...string) *exec.Cmd {
+	cmd := exec.Command(os.Args[0], "-test.run=^"+test+"$", "-test.v")
+	cmd.Env = append(os.Environ(), extraEnv...)
+	return cmd
+}
+
 // reportSpec is the shared child role body: build a tunnel, adopt whatever
 // the environment carries, and report the resolved identity.
 func reportSpec() {
 	tun := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Printf("%s hostname: %s\n", role(), tun.Hostname())
 	fmt.Printf("%s host=%s domain=%s port=%d\n", role(), tun.Host(), tun.Domain(), tun.Port())
+}
+
+// TestSpecHandoffAcrossProcesses is the basic parent→child handoff: the
+// parent (this test) mints a spec and passes it to a child (a re-exec of
+// this test binary) through an explicit exec.Cmd.Env entry; the child adopts
+// it via the Cloudflare credential chain and reports what its tunnel
+// resolves to. The quick-tunnel fallback is never consulted, so nothing
+// dials out.
+func TestSpecHandoffAcrossProcesses(t *testing.T) {
+	if role() == "handoff-child" {
+		reportSpec()
+		fmt.Printf("%s cacerts: %t\n", role(), len(libtunnel.New(libtunnel.Cloudflare()).CACerts()) > 0)
+		return
+	}
+
+	spec := &v1.CloudflareSpec{
+		ID:         "00000000-0000-0000-0000-000000000000",
+		Name:       "lib-scenario",
+		Hostname:   "scenario.trycloudflare.com",
+		AccountTag: "tag",
+		Secret:     []byte("secret"),
+	}
+	entry, err := libtunnel.SpecEnviron(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := reexec("TestSpecHandoffAcrossProcesses", roleEnv+"=handoff-child", entry).CombinedOutput()
+	t.Logf("child output:\n%s", out)
+	if err != nil {
+		t.Fatalf("child failed: %v", err)
+	}
+	for _, want := range []string{
+		"handoff-child hostname: scenario.trycloudflare.com",
+		"handoff-child host=scenario domain=trycloudflare.com port=443",
+		"handoff-child cacerts: true",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("child output does not contain %q", want)
+		}
+	}
 }
 
 // TestExportSpecReExec covers the re-exec (daemonize) handoff path: the
@@ -38,8 +93,7 @@ func TestExportSpecReExec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := reexec("TestExportSpecReExec", roleEnv+"=reexec-child")
-	out, err := cmd.CombinedOutput()
+	out, err := reexec("TestExportSpecReExec", roleEnv+"=reexec-child").CombinedOutput()
 	t.Logf("child output:\n%s", out)
 	if err != nil {
 		t.Fatalf("child failed: %v", err)

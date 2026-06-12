@@ -1,4 +1,4 @@
-package e2e
+package e2e_test
 
 // Shared plumbing for the scenario tests: re-exec roles, live gating, retry
 // helpers, and a self-signed TLS config. Scenario tests re-exec this test

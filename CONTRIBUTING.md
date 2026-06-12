@@ -18,7 +18,8 @@ Deep-link by filename; line numbers will drift.
 | Cloudflare engine (cloudflared supervisor wiring) | [`v1alpha1/cloudflare/cloudflare.go`](./v1alpha1/cloudflare/cloudflare.go) |
 | Quick-tunnel provider (api.trycloudflare.com)  | [`v1alpha1/cloudflare/quicktunnel.go`](./v1alpha1/cloudflare/quicktunnel.go) |
 | Unit tests + fuzz target                       | [`v1alpha1/tunnel_test.go`](./v1alpha1/tunnel_test.go)           |
-| e2e scenarios (subprocess handoff, live)       | [`e2e/handoff_test.go`](./e2e/handoff_test.go)                   |
+| Live e2e scenarios + helpers                   | [`e2e/live_test.go`](./e2e/live_test.go), [`e2e/scenario_test.go`](./e2e/scenario_test.go) |
+| Subprocess handoff unit tests                  | [`lib_test.go`](./lib_test.go)                                   |
 | godoc examples                                 | [`v1/example_test.go`](./v1/example_test.go)                     |
 | e2e harness + runner                           | [`e2e/e2e_test.go`](./e2e/e2e_test.go)                           |
 | Worked examples                                | [`examples/`](./examples)                                        |
@@ -59,7 +60,7 @@ Requires Go 1.26 or later (cloudflared's floor).
 git clone https://github.com/cnuss/libtunnel.git
 cd libtunnel
 make test   # library unit + fuzz tests (fast, in-package)
-make e2e    # builds and runs every example binary (live ones skipped)
+make e2e    # live tier: real tunnels; skipped unless LIBTUNNEL_E2E_LIVE=1
 ```
 
 Run a specific example locally:
@@ -73,15 +74,19 @@ make run handoff
 
 Three tiers, each with a distinct job — don't blur them:
 
-- **`*_test.go` next to the code** — unit tests (plus fuzz targets, and the
-  godoc examples in `v1/example_test.go`). Fast, in-package, no subprocesses.
+- **`*_test.go` next to the code** — unit tests: anything with fabricated
+  specs or fakes, however elaborate. Includes fuzz targets, the godoc
+  examples in `v1/example_test.go`, and the subprocess handoff scenarios at
+  the repo root (`lib_test.go` — re-exec'd children adopting fabricated
+  specs, no network).
 - **`examples/`** — real-world, simple-ish API usage written for humans. An
   example demonstrates; it never asserts. Assertion logic belongs in `e2e/`.
-- **`e2e/`** — complicated scenarios, not meant for human consumption. The
-  harness builds and runs the example binaries and asserts on their output,
-  and adds scenario tests of its own (subprocess handoff, live tunnels,
-  output parsing). If a flow needs orchestration or verification beyond what
-  a readable example should carry, it lives here.
+- **`e2e/`** — **live tunnels only**, gated behind `LIBTUNNEL_E2E_LIVE=1`
+  and not meant for human consumption. The harness builds and runs the
+  example binaries against the real edge and asserts on their output, plus
+  live scenario tests (shared-tunnel subtests, TLS origin, resurrection,
+  concurrent tunnels). If a check can pass without a real tunnel, it is a
+  unit test, not e2e.
 
 ## Before you push
 

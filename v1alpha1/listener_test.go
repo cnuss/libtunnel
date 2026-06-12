@@ -1,4 +1,4 @@
-package v1alpha1
+package v1alpha1_test
 
 import (
 	"crypto/ecdsa"
@@ -11,6 +11,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/cnuss/libtunnel/v1alpha1"
 )
 
 // declaredListener opts in to TLS detection through the probe interface.
@@ -28,19 +30,19 @@ func TestIsTLS(t *testing.T) {
 	}
 	defer plain.Close()
 
-	if IsTLS(plain) {
-		t.Error("IsTLS(net.Listen) = true, want false")
+	if v1alpha1.IsTLS(plain) {
+		t.Error("v1alpha1.IsTLS(net.Listen) = true, want false")
 	}
 
 	wrapped := tls.NewListener(plain, selfSigned(t))
-	if !IsTLS(wrapped) {
-		t.Error("IsTLS(tls.NewListener) = false, want true")
+	if !v1alpha1.IsTLS(wrapped) {
+		t.Error("v1alpha1.IsTLS(tls.NewListener) = false, want true")
 	}
 
-	if !IsTLS(declaredListener{Listener: plain, tls: true}) {
+	if !v1alpha1.IsTLS(declaredListener{Listener: plain, tls: true}) {
 		t.Error("isTLS ignored a listener declaring TLS() = true")
 	}
-	if IsTLS(declaredListener{Listener: wrapped, tls: false}) {
+	if v1alpha1.IsTLS(declaredListener{Listener: wrapped, tls: false}) {
 		t.Error("isTLS ignored a listener declaring TLS() = false")
 	}
 }

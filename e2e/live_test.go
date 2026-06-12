@@ -1,4 +1,4 @@
-package e2e
+package e2e_test
 
 // Live scenario tests: real quick tunnels against the Cloudflare edge, gated
 // behind LIBTUNNEL_E2E_LIVE=1. These are deliberately complicated — origin
