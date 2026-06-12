@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
+	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
 // WithLogger sets the logger. A no-op once a listener has been provided.
@@ -272,13 +274,57 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 	return t.tunnelReady
 }
 
-// HostnameReady starts (on first use) a poller that watches the zone's
-// authoritative nameservers and closes the returned channel once the tunnel
-// hostname resolves there. Polling the authoritative servers directly avoids
-// waiting out negative-cache TTLs on recursive resolvers and reflects
-// provisioning truth: the record exists the moment the zone serves it.
+// HostnameReady starts (on first use) two pollers and closes the returned
+// channel as soon as either sees the tunnel hostname resolve:
+//
+//   - the authoritative rung queries the zone's authoritative nameservers
+//     directly over :53, forever — provisioning truth, no recursive negative
+//     caches;
+//   - the DoH rung consumes a fleet of DNS-over-HTTPS endpoints, one query
+//     per endpoint, never revisiting — plain :53 is useless on networks that
+//     intercept or block port 53 (VPN exit nodes, corporate resolvers), where
+//     every authoritative query is silently answered by the interceptor; DoH
+//     rides ordinary HTTPS. Endpoints are recursive caches that may hold a
+//     premature NXDOMAIN for the zone's negative TTL (30 minutes for
+//     trycloudflare.com), which is why each is burned at most once.
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	t.hostnameReadyOnce.Do(func() {
+		// Both rungs race to report readiness; whoever sees the record first
+		// closes the channel.
+		ready := func(rung, hostname string, addrs any, attempt int) {
+			t.hostnameReadyClose.Do(func() {
+				t.Logger().Info("hostname resolved", "rung", rung, "hostname", hostname, "addrs", addrs, "attempts", attempt)
+				close(t.hostnameReady)
+			})
+		}
+
+		// DoH rung. Linear backoff stretches eight endpoints across ~35s,
+		// outliving the typical propagation tail without burning the whole
+		// fleet on a record that is seconds away from existing.
+		go func() {
+			client := &http.Client{Timeout: 5 * time.Second}
+			host := dnsName(t.Hostname())
+			sleep := 0 * time.Second
+			for i, endpoint := range resolver.Endpoints {
+				select {
+				case <-t.ctx.Done():
+					return
+				case <-t.hostnameReady:
+					return
+				case <-time.After(sleep):
+				}
+				sleep += time.Second
+
+				started := time.Now()
+				addrs, err := resolver.LookupA(t.ctx, client, endpoint, host)
+				t.Logger().Debug("DoH readiness query answered", "hostname", host, "endpoint", endpoint, "attempt", i+1, "took", time.Since(started), "addrs", addrs, "error", err)
+				if err == nil && len(addrs) > 0 {
+					ready("doh", host, addrs, i+1)
+					return
+				}
+			}
+			t.Logger().Debug("DoH endpoint fleet consumed; authoritative polling continues", "hostname", host)
+		}()
 		// authServers resolves the zone's authoritative nameservers to ip:53
 		// endpoints. Run once up front and stashed; NS records are stable.
 		// DNS queries take bare names, so any :port the spec's hostname
@@ -313,6 +359,8 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 				select {
 				case <-t.ctx.Done():
 					return
+				case <-t.hostnameReady:
+					return
 				case <-time.After(time.Second):
 				}
 			}
@@ -342,13 +390,14 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 				t.Logger().Debug("authoritative query answered", "hostname", host, "server", target, "attempt", attempt, "took", time.Since(started), "addrs", addrs, "error", err)
 
 				if err == nil && len(addrs) > 0 {
-					t.Logger().Info("hostname resolved on authoritative nameservers", "hostname", host, "addrs", addrs, "attempts", attempt)
-					close(t.hostnameReady)
+					ready("authoritative", host, addrs, attempt)
 					return
 				}
 
 				select {
 				case <-t.ctx.Done():
+					return
+				case <-t.hostnameReady:
 					return
 				case <-time.After(time.Second):
 				}
