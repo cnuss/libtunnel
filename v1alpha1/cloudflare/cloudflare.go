@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -35,8 +36,19 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1"
 )
 
-// cloudflaredVersion is reported to the edge as the connector version.
-const cloudflaredVersion = "2026.3.0"
+// cloudflaredVersion is reported to the edge as the connector version —
+// inferred from the cloudflared module in the build info so it tracks go.mod
+// instead of drifting in a hand-maintained constant.
+var cloudflaredVersion = func() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, dep := range bi.Deps {
+			if dep.Path == "github.com/cloudflare/cloudflared" {
+				return dep.Version
+			}
+		}
+	}
+	return "unknown"
+}()
 
 // promMu serializes the prometheus.DefaultRegisterer swap below: cloudflared
 // registers metrics against the global registerer at construction, which
@@ -152,7 +164,7 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 		if err != nil {
 			return nil, fmt.Errorf("failed to create client config: %w", err)
 		}
-		protocolSelector, err := connection.NewProtocolSelector("auto", spec.AccountTag, false, false, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
+		protocolSelector, err := connection.NewProtocolSelector("auto", spec.AccountTag, false, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create protocol selector: %w", err)
 		}
