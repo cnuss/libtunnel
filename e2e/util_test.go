@@ -18,6 +18,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
+	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
 // roleEnv selects a child role inside a re-exec'd test binary.
@@ -123,19 +125,51 @@ func waitReady(t *testing.T, conn v1.Connected[*cloudflare.Spec], d time.Duratio
 	}
 }
 
-// v4Client dials IPv4 only: some CI runners (macos-26) have no IPv6 egress,
-// and a resolver that answers AAAA for a fresh tunnel hostname — while
-// negative-caching the A record for the zone's 1800s SOA minimum — makes
-// every dual-stack dial fail "no route to host" persistently. The harness
-// asserts tunnel behavior, not the runner's IPv6 stack; the edge is
-// dual-homed, so IPv4 always works where the runners live.
+// v4Client dials IPv4 only and resolves hostnames over DoH instead of the
+// system resolver. CI runner resolvers have produced two persistent failure
+// modes no retry budget can outwait: answering only AAAA on hosts with no
+// IPv6 egress, and negative-caching a fresh hostname's A record for the
+// zone's 1800s SOA minimum. The DoH fleet is the same machinery
+// HostnameReady trusts for readiness, so the harness sees the record the
+// moment the tunnel reports ready. TLS is unaffected — the transport still
+// uses the URL hostname for SNI and certificate verification; only the TCP
+// dial target changes.
 var v4Client = &http.Client{
 	Timeout: 15 * time.Second,
 	Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, "tcp4", addr)
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			if net.ParseIP(host) == nil {
+				addrs, err := dohResolve(ctx, host)
+				if err != nil {
+					return nil, err
+				}
+				host = addrs[0].String()
+			}
+			return (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, "tcp4", net.JoinHostPort(host, port))
 		},
 	},
+}
+
+// dohResolve walks the DoH fleet until one endpoint returns A records.
+func dohResolve(ctx context.Context, host string) ([]netip.Addr, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	var lastErr error
+	for _, endpoint := range resolver.Endpoints {
+		addrs, err := resolver.LookupA(ctx, client, endpoint, host)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(addrs) > 0 {
+			return addrs, nil
+		}
+		lastErr = fmt.Errorf("%s has no A records for %s yet", endpoint, host)
+	}
+	return nil, fmt.Errorf("DoH fleet exhausted resolving %s: %w", host, lastErr)
 }
 
 // getBody requests url once and returns the body.
