@@ -172,20 +172,17 @@ func TestLiveResurrection(t *testing.T) {
 	}
 	gateLive(t)
 
-	// Reuse the preflight spec instead of minting: TestLiveTunnel closed its
-	// tunnel, so the hostname is free, and resolving it here exports it into
-	// this process's environment — the spawned children inherit the tunnel
-	// identity with no plumbing.
-	if preflightSpec != nil {
-		if entry, err := v1alpha1.SpecEnviron(preflightSpec); err == nil {
-			t.Setenv(v1alpha1.SpecEnv, strings.TrimPrefix(entry, v1alpha1.SpecEnv+"="))
-		}
-	}
+	// Mint a fresh spec: resurrection is about a hostname surviving killed
+	// connectors. (Reusing TestLiveTunnel's deliberately closed hostname
+	// proved flaky — after a graceful unregister the edge can serve a sticky
+	// "530 origin unregistered" long after a new connector registers.)
+	// Minting exports the spec into this process's environment, so the
+	// spawned children inherit the tunnel identity with no plumbing.
 	spec := libtunnel.New(libtunnel.Cloudflare()).Spec()
 	if spec == nil || spec.Hostname == "" {
 		t.Fatal("failed to mint a spec")
 	}
-	t.Logf("spec: %s", spec.Hostname)
+	t.Logf("minted: %s", spec.Hostname)
 	url := "https://" + spec.Hostname + "/"
 
 	spawn := func(body string) (kill func()) {
