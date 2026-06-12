@@ -70,17 +70,11 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected[T] {
 // stays caller-owned, so closing that restarts the origin while the tunnel
 // persists.
 func (t *TunnelImpl[T]) Listener() net.Listener {
-	select {
-	case <-t.listenerProvided:
-	case <-t.ctx.Done():
-		// The listener field is only safe to read once listenerProvided is
-		// closed (the close is the happens-before edge for the write), so a
-		// cancellation wake re-checks instead of reading the field.
-		select {
-		case <-t.listenerProvided:
-		default:
-			return nil
-		}
+	// The listener field is only safe to read once listenerProvided is closed
+	// (the close is the happens-before edge for the write), so a cancellation
+	// wake returns nil instead of reading the field.
+	if !await(t.ctx, t.listenerProvided) {
+		return nil
 	}
 	return tunnelListener[T]{Listener: t.listener, t: t}
 }
@@ -244,21 +238,15 @@ func (t *TunnelImpl[T]) Port() int {
 func (t *TunnelImpl[T]) URL() *url.URL {
 	t.urlOnce.Do(func() {
 		hostname := t.Hostname()
-		select {
-		case <-t.ctx.Done():
-		case <-t.HostnameReady():
+		// A cancellation wake leaves the zero value: the hostname never
+		// resolved, so there is no URL to report.
+		if !await(t.ctx, t.HostnameReady()) {
+			return
 		}
-		// Build only if the hostname actually resolved — a cancellation wake
-		// leaves the zero value. Re-checking (rather than branching on which
-		// case fired) also covers both channels being ready at once.
-		select {
-		case <-t.HostnameReady():
-			t.url = &url.URL{
-				Scheme: "https",
-				Host:   hostname,
-				Path:   "/",
-			}
-		default:
+		t.url = &url.URL{
+			Scheme: "https",
+			Host:   hostname,
+			Path:   "/",
 		}
 	})
 	return t.url
@@ -380,6 +368,32 @@ func hostOf(hostname string) string {
 func domainOf(hostname string) string {
 	_, domain, _ := strings.Cut(hostname, ".")
 	return domain
+}
+
+// await blocks until ch yields or ctx is done, whichever comes first, and
+// reports whether ch yielded. It is the one place blocked getters wait, so
+// cancellation semantics aren't re-derived select-by-select at every call
+// site: every wait stops naturally on context cancel, and the return value
+// says whether the awaited state actually arrived (false ⇒ the getter owes
+// its caller a zero value). When both channels are ready it prefers ch, so
+// state that landed just before cancellation still reads as delivered.
+func await[E any](ctx context.Context, ch <-chan E) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+	}
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
 }
 
 // dnsName strips any :port from hostname: DNS queries take bare names, while
