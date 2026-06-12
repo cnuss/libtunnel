@@ -70,7 +70,7 @@ func (b *Backend) Name() string {
 // anonymous quick tunnel from api.trycloudflare.com. Mutators for named
 // tunnels / other endpoints will hang off Cloudflare() when they exist.
 func (b *Backend) Provider() v1.Provider[*Spec] {
-	return v1alpha1.Env(QuickTunnel())
+	return v1alpha1.Env(b.Name(), QuickTunnel())
 }
 
 // CACerts returns the Mozilla CA bundle plus the Cloudflare origin roots —

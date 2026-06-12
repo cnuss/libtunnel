@@ -50,7 +50,9 @@ func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel[T] {
 // adopts a spec from the TUNNEL_SPEC environment variable when a parent
 // process handed one off, mints an anonymous *.trycloudflare.com quick
 // tunnel otherwise, and exports a freshly minted spec back into the
-// environment so spawned children inherit the same tunnel identity.
+// environment so spawned children inherit the same tunnel identity. A spec
+// this process exported itself is never re-adopted: a second in-process
+// tunnel mints its own identity.
 func Cloudflare() v1.Backend[*cloudflare.Spec] {
 	return cloudflare.New()
 }

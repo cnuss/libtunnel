@@ -59,7 +59,7 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 		AccountTag: "tag",
 		Secret:     []byte("secret"),
 	}
-	entry, err := v1alpha1.SpecEnviron(spec)
+	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestReExecInheritsSpec(t *testing.T) {
 	}
 
 	spec := &cloudflare.Spec{Hostname: "reexec.trycloudflare.com"}
-	entry, err := v1alpha1.SpecEnviron(spec)
+	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestHandoffChain(t *testing.T) {
 	}
 
 	spec := &cloudflare.Spec{Hostname: "chain.trycloudflare.com"}
-	entry, err := v1alpha1.SpecEnviron(spec)
+	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestSpecHostnameWithPort(t *testing.T) {
 	}
 
 	spec := &cloudflare.Spec{Hostname: "scenario.trycloudflare.com:8443"}
-	entry, err := v1alpha1.SpecEnviron(spec)
+	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,6 +5,8 @@ import (
 	"crypto/x509"
 	"log/slog"
 	"net"
+	"os"
+	"strings"
 	"testing"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -21,7 +23,7 @@ func TestSpecEnvironRoundTrip(t *testing.T) {
 		Secret:     []byte("secret"),
 	}
 
-	entry, err := v1alpha1.SpecEnviron(spec)
+	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +34,7 @@ func TestSpecEnvironRoundTrip(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, entry[len(v1alpha1.SpecEnv)+1:])
 
 	adopted := &cloudflare.Spec{}
-	ok, err := v1alpha1.SpecFromEnv(adopted)
+	ok, err := v1alpha1.SpecFromEnv("cloudflare", adopted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,33 +46,55 @@ func TestSpecEnvironRoundTrip(t *testing.T) {
 	}
 }
 
-func TestExportSpec(t *testing.T) {
+func TestExportSpecGuardsSelfAdoption(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "") // restore after the test
 	spec := &cloudflare.Spec{Hostname: "exported.trycloudflare.com"}
-	if err := v1alpha1.ExportSpec(spec); err != nil {
+	if err := v1alpha1.ExportSpec("cloudflare", spec); err != nil {
 		t.Fatal(err)
 	}
 
-	adopted := &cloudflare.Spec{}
-	if ok, err := v1alpha1.SpecFromEnv(adopted); err != nil || !ok {
-		t.Fatalf("SpecFromEnv = (%t, %v) after ExportSpec; want (true, nil)", ok, err)
+	// The exported value sits in the environment for children to inherit …
+	if env := os.Getenv(v1alpha1.SpecEnv); !strings.Contains(env, "exported.trycloudflare.com") {
+		t.Errorf("env %s = %q, want the exported spec", v1alpha1.SpecEnv, env)
 	}
-	if adopted.Hostname != spec.Hostname {
-		t.Errorf("Hostname = %q, want %q", adopted.Hostname, spec.Hostname)
+
+	// … but this process never re-adopts its own export: a second in-process
+	// tunnel must mint its own identity, not race to inherit this one's.
+	if ok, err := v1alpha1.SpecFromEnv("cloudflare", &cloudflare.Spec{}); ok || err != nil {
+		t.Errorf("SpecFromEnv = (%t, %v) for a self-exported spec; want (false, nil)", ok, err)
 	}
 }
 
 func TestSpecFromEnvAbsent(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "")
-	if ok, err := v1alpha1.SpecFromEnv(&cloudflare.Spec{}); ok || err != nil {
+	if ok, err := v1alpha1.SpecFromEnv("cloudflare", &cloudflare.Spec{}); ok || err != nil {
 		t.Errorf("SpecFromEnv = (%t, %v) with no env; want (false, nil)", ok, err)
 	}
 }
 
 func TestSpecFromEnvMalformed(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "{not json")
-	if ok, err := v1alpha1.SpecFromEnv(&cloudflare.Spec{}); err == nil {
+	if ok, err := v1alpha1.SpecFromEnv("cloudflare", &cloudflare.Spec{}); err == nil {
 		t.Errorf("SpecFromEnv = (%t, nil) with malformed env; want an error", ok)
+	}
+}
+
+func TestSpecFromEnvWrongBackend(t *testing.T) {
+	t.Setenv(v1alpha1.SpecEnv, `{"backend":"other","spec":{"hostname":"x.example.com"}}`)
+	ok, err := v1alpha1.SpecFromEnv("cloudflare", &cloudflare.Spec{})
+	if err == nil {
+		t.Errorf("SpecFromEnv = (%t, nil) for a foreign backend's spec; want an error", ok)
+	}
+	if err != nil && !strings.Contains(err.Error(), `"other"`) {
+		t.Errorf("err = %v, want it to name the foreign backend", err)
+	}
+}
+
+func TestSpecFromEnvRejectsUntaggedSpec(t *testing.T) {
+	// The pre-envelope wire form: a bare spec with no backend tag.
+	t.Setenv(v1alpha1.SpecEnv, `{"hostname":"bare.trycloudflare.com"}`)
+	if ok, err := v1alpha1.SpecFromEnv("cloudflare", &cloudflare.Spec{}); err == nil {
+		t.Errorf("SpecFromEnv = (%t, nil) for an untagged spec; want an error", ok)
 	}
 }
 
@@ -92,10 +116,10 @@ var (
 )
 
 func TestEnvProviderAdoptsEnvironment(t *testing.T) {
-	t.Setenv(v1alpha1.SpecEnv, `{"hostname":"fromenv.trycloudflare.com"}`)
+	t.Setenv(v1alpha1.SpecEnv, `{"backend":"cloudflare","spec":{"hostname":"fromenv.trycloudflare.com"}}`)
 
 	next := &trackingProvider{}
-	spec, err := v1alpha1.Env[cloudflare.Spec](next).Spec(context.Background())
+	spec, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +135,7 @@ func TestEnvProviderFallsBack(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "")
 
 	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "minted.trycloudflare.com"}}
-	spec, err := v1alpha1.Env[cloudflare.Spec](next).Spec(context.Background())
+	spec, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +182,7 @@ func TestEnvProviderForwardsLogger(t *testing.T) {
 	want := slog.New(slog.DiscardHandler)
 	inner := &loggingProvider{trackingProvider: trackingProvider{spec: &cloudflare.Spec{}}}
 
-	wrapped := v1alpha1.Env[cloudflare.Spec](inner)
+	wrapped := v1alpha1.Env[cloudflare.Spec]("cloudflare", inner)
 	if pl, ok := wrapped.(interface{ SetLogger(*slog.Logger) }); !ok {
 		t.Fatal("Env provider does not forward SetLogger")
 	} else {
@@ -185,15 +209,36 @@ func TestEnvProviderExportsMintedSpec(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "")
 
 	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "minted.trycloudflare.com"}}
-	if _, err := v1alpha1.Env[cloudflare.Spec](next).Spec(context.Background()); err != nil {
+	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	adopted := &cloudflare.Spec{}
-	if ok, err := v1alpha1.SpecFromEnv(adopted); err != nil || !ok {
-		t.Fatalf("SpecFromEnv = (%t, %v) after a mint; want the spec exported", ok, err)
+	// The mint lands in the environment for spawned children to inherit.
+	if env := os.Getenv(v1alpha1.SpecEnv); !strings.Contains(env, "minted.trycloudflare.com") {
+		t.Errorf("env %s = %q, want the minted spec exported", v1alpha1.SpecEnv, env)
 	}
-	if adopted.Hostname != "minted.trycloudflare.com" {
-		t.Errorf("exported Hostname = %q, want the minted spec", adopted.Hostname)
+}
+
+// TestEnvProviderNeverAdoptsOwnExport pins the in-process isolation rule: a
+// second tunnel in the same process must mint its own identity, not inherit
+// the first tunnel's export through the environment.
+func TestEnvProviderNeverAdoptsOwnExport(t *testing.T) {
+	t.Setenv(v1alpha1.SpecEnv, "")
+
+	first := &trackingProvider{spec: &cloudflare.Spec{Hostname: "alpha.trycloudflare.com"}}
+	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", first).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	second := &trackingProvider{spec: &cloudflare.Spec{Hostname: "beta.trycloudflare.com"}}
+	spec, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", second).Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.called {
+		t.Error("second provider was not consulted: it adopted the first tunnel's export")
+	}
+	if spec.Hostname != "beta.trycloudflare.com" {
+		t.Errorf("second tunnel's Hostname = %q, want its own mint", spec.Hostname)
 	}
 }

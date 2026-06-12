@@ -41,7 +41,7 @@ func TestLiveTunnel(t *testing.T) {
 	// Reuse the preflight mint: hand its spec to this tunnel through the
 	// environment (the Cloudflare chain adopts TUNNEL_SPEC before minting).
 	if preflightSpec != nil {
-		if entry, err := v1alpha1.SpecEnviron(preflightSpec); err == nil {
+		if entry, err := v1alpha1.SpecEnviron("cloudflare", preflightSpec); err == nil {
 			t.Setenv(v1alpha1.SpecEnv, strings.TrimPrefix(entry, v1alpha1.SpecEnv+"="))
 		}
 	}
