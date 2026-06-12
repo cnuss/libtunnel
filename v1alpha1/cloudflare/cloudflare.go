@@ -110,6 +110,10 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 	if spec == nil {
 		return fmt.Errorf("no spec resolved")
 	}
+	tunnelID, err := uuid.Parse(spec.ID)
+	if err != nil {
+		return fmt.Errorf("invalid tunnel id %q in spec: %w", spec.ID, err)
+	}
 
 	// quic-go logs a buffer-size warning straight to the global log package
 	// (bypassing any configured logger) when the kernel caps its 7 MB UDP
@@ -119,115 +123,131 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 		os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
 	}
 
-	// cloudflared registers collectors against the global default registerer;
-	// point it at a noop for the construction window so concurrent tunnels
-	// don't collide and the host application's metrics stay clean.
-	promMu.Lock()
-	defer promMu.Unlock()
-	registerer := prometheus.DefaultRegisterer
-	prometheus.DefaultRegisterer = noop()
-	defer func() { prometheus.DefaultRegisterer = registerer }()
+	// The closure scopes the prometheus.DefaultRegisterer swap to supervisor
+	// construction: cloudflared registers collectors against the global
+	// registerer at construction, which would collide across tunnels and
+	// pollute the host application's metrics, so it is pointed at a noop
+	// (under promMu) and restored by defer when construction finishes. The
+	// supervisor's run and the (unbounded) wait for the first edge connection
+	// happen below, outside the lock, so concurrent tunnels neither serialize
+	// behind one tunnel's connect nor discard the host's own registrations in
+	// the meantime.
+	sup, err := func() (*supervisor.Supervisor, error) {
+		promMu.Lock()
+		defer promMu.Unlock()
+		registerer := prometheus.DefaultRegisterer
+		prometheus.DefaultRegisterer = noop()
+		defer func() { prometheus.DefaultRegisterer = registerer }()
 
-	originDialer := ingress.NewOriginDialer(ingress.OriginConfig{}, log)
+		featureSelector, err := features.NewFeatureSelector(ctx, spec.AccountTag, nil, false, log)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create feature selector: %w", err)
+		}
+		clientConfig, err := client.NewConfig(cloudflaredVersion, fmt.Sprintf("%s_%s", runtime.GOOS, runtime.GOARCH), featureSelector)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create client config: %w", err)
+		}
+		protocolSelector, err := connection.NewProtocolSelector("auto", spec.AccountTag, false, false, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create protocol selector: %w", err)
+		}
 
-	tunnelConfig := &supervisor.TunnelConfig{
-		ClientConfig: func() *client.Config {
-			featureSelector, _ := features.NewFeatureSelector(ctx, spec.AccountTag, nil, false, log)
-			cfg, _ := client.NewConfig(cloudflaredVersion, fmt.Sprintf("%s_%s", runtime.GOOS, runtime.GOARCH), featureSelector)
-			return cfg
-		}(),
-		// cloudflared's own default (its --grace-period flag): how long the
-		// supervisor waits for in-flight requests on graceful shutdown — and
-		// ctx.Done is wired as the graceful-shutdown signal below, so this
-		// bounds teardown after a cancel. Max accepted is 3m.
-		GracePeriod:   30 * time.Second,
-		Region:        "",
-		EdgeIPVersion: allregions.Auto,
-		HAConnections: 1,
-		// No tags, matching cloudflared's quick-tunnel default. (Tags never
-		// were the connector ID — client.NewConfig mints a fresh random UUID
-		// for that; tags only become Cf-Warp-Tag-* headers injected into
-		// every request hitting the origin.)
-		Tags:            nil,
-		Log:             log,
-		LogTransport:    log,
-		Observer:        connection.NewObserver(log, log),
-		ReportedVersion: cloudflaredVersion,
-		Retries:         5,
-		RunFromTerminal: false,
-		NamedTunnel: func() *connection.TunnelProperties {
-			tunnelID, _ := uuid.Parse(spec.ID)
-			return &connection.TunnelProperties{
+		originDialer := ingress.NewOriginDialer(ingress.OriginConfig{}, log)
+
+		tunnelConfig := &supervisor.TunnelConfig{
+			ClientConfig: clientConfig,
+			// cloudflared's own default (its --grace-period flag): how long the
+			// supervisor waits for in-flight requests on graceful shutdown — and
+			// ctx.Done is wired as the graceful-shutdown signal below, so this
+			// bounds teardown after a cancel. Max accepted is 3m.
+			GracePeriod:   30 * time.Second,
+			Region:        "",
+			EdgeIPVersion: allregions.Auto,
+			HAConnections: 1,
+			// No tags, matching cloudflared's quick-tunnel default. (Tags never
+			// were the connector ID — client.NewConfig mints a fresh random UUID
+			// for that; tags only become Cf-Warp-Tag-* headers injected into
+			// every request hitting the origin.)
+			Tags:            nil,
+			Log:             log,
+			LogTransport:    log,
+			Observer:        connection.NewObserver(log, log),
+			ReportedVersion: cloudflaredVersion,
+			Retries:         5,
+			RunFromTerminal: false,
+			NamedTunnel: &connection.TunnelProperties{
 				Credentials: connection.Credentials{
 					AccountTag:   spec.AccountTag,
 					TunnelSecret: spec.Secret,
 					TunnelID:     tunnelID,
 				},
 				QuickTunnelUrl: t.Hostname(),
-			}
-		}(),
-		ProtocolSelector: func() connection.ProtocolSelector {
-			protocolSelector, _ := connection.NewProtocolSelector("auto", spec.AccountTag, false, false, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
-			return protocolSelector
-		}(),
-		EdgeTLSConfigs: func() map[connection.Protocol]*tls.Config {
-			pool := x509.NewCertPool()
-			for _, c := range t.CACerts() {
-				pool.AddCert(c)
-			}
-			out := make(map[connection.Protocol]*tls.Config, len(connection.ProtocolList))
-			for _, p := range connection.ProtocolList {
-				s := p.TLSSettings()
-				out[p] = &tls.Config{ServerName: s.ServerName, NextProtos: s.NextProtos, RootCAs: pool}
-			}
-			return out
-		}(),
-		MaxEdgeAddrRetries:  8,
-		RPCTimeout:          5 * time.Second,
-		OriginDNSService:    origins.NewDNSResolverService(originDialer, log, noop()),
-		OriginDialerService: originDialer,
-	}
+			},
+			ProtocolSelector: protocolSelector,
+			EdgeTLSConfigs: func() map[connection.Protocol]*tls.Config {
+				pool := x509.NewCertPool()
+				for _, c := range t.CACerts() {
+					pool.AddCert(c)
+				}
+				out := make(map[connection.Protocol]*tls.Config, len(connection.ProtocolList))
+				for _, p := range connection.ProtocolList {
+					s := p.TLSSettings()
+					out[p] = &tls.Config{ServerName: s.ServerName, NextProtos: s.NextProtos, RootCAs: pool}
+				}
+				return out
+			}(),
+			MaxEdgeAddrRetries:  8,
+			RPCTimeout:          5 * time.Second,
+			OriginDNSService:    origins.NewDNSResolverService(originDialer, log, noop()),
+			OriginDialerService: originDialer,
+		}
 
-	// The origin scheme follows the listener: a TLS listener gets an https
-	// ingress (self-signed is fine — verification is off), a plain one gets
-	// http.
-	tlsOrigin := v1alpha1.IsTLS(l)
-	scheme := "http"
-	if tlsOrigin {
-		scheme = "https"
-	}
+		// The origin scheme follows the listener: a TLS listener gets an https
+		// ingress (self-signed is fine — verification is off), a plain one gets
+		// http.
+		tlsOrigin := v1alpha1.IsTLS(l)
+		scheme := "http"
+		if tlsOrigin {
+			scheme = "https"
+		}
 
-	noTLSVerify := true
-	internalRules := []ingress.Rule{}
-	orchestrator, err := orchestration.NewOrchestrator(ctx, &orchestration.Config{
-		Ingress: func() *ingress.Ingress {
-			parsed, _ := ingress.ParseIngress(&config.Configuration{
-				OriginRequest: config.OriginRequestConfig{
-					NoTLSVerify: &noTLSVerify,
-					Http2Origin: &tlsOrigin,
-				},
-				WarpRouting: config.WarpRoutingConfig{},
-				Ingress: []config.UnvalidatedIngressRule{
-					{Service: fmt.Sprintf("%s://%s", scheme, l.Addr().String())},
-				},
-			})
-			return &parsed
-		}(),
-		WarpRouting:         ingress.NewWarpRoutingConfig(&config.WarpRoutingConfig{}), // cloudflared defaults: 5s connect, unlimited flows, 30s keepalive
-		OriginDialerService: originDialer,
-		ConfigurationFlags:  map[string]string{}, // CLI-flag overrides for remote config; empty matches cloudflared quick-tunnel behavior
-	}, tunnelConfig.Tags, internalRules, log)
+		noTLSVerify := true
+		internalRules := []ingress.Rule{}
+		parsed, err := ingress.ParseIngress(&config.Configuration{
+			OriginRequest: config.OriginRequestConfig{
+				NoTLSVerify: &noTLSVerify,
+				Http2Origin: &tlsOrigin,
+			},
+			WarpRouting: config.WarpRoutingConfig{},
+			Ingress: []config.UnvalidatedIngressRule{
+				{Service: fmt.Sprintf("%s://%s", scheme, l.Addr().String())},
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse ingress for %s://%s: %w", scheme, l.Addr().String(), err)
+		}
+		orchestrator, err := orchestration.NewOrchestrator(ctx, &orchestration.Config{
+			Ingress:             &parsed,
+			WarpRouting:         ingress.NewWarpRoutingConfig(&config.WarpRoutingConfig{}), // cloudflared defaults: 5s connect, unlimited flows, 30s keepalive
+			OriginDialerService: originDialer,
+			ConfigurationFlags:  map[string]string{}, // CLI-flag overrides for remote config; empty matches cloudflared quick-tunnel behavior
+		}, tunnelConfig.Tags, internalRules, log)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create orchestrator: %w", err)
+		}
+
+		reconnected := make(chan supervisor.ReconnectSignal) // TODO(partial): what to do with reconnected
+		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, reconnected, ctx.Done())
+		if err != nil {
+			return nil, fmt.Errorf("failed to create supervisor: %w", err)
+		}
+		return sup, nil
+	}()
 	if err != nil {
-		return fmt.Errorf("failed to create orchestrator: %w", err)
+		return err
 	}
 
 	connected := signal.New(make(chan struct{}))
-	reconnected := make(chan supervisor.ReconnectSignal) // TODO(partial): what to do with reconnected
-	sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, reconnected, ctx.Done())
-	if err != nil {
-		return fmt.Errorf("failed to create supervisor: %w", err)
-	}
-
 	go func() {
 		if err := sup.Run(ctx, connected); err != nil {
 			t.Cancel(fmt.Errorf("supervisor run failed: %w", err))

@@ -35,3 +35,7 @@ go.work.sum
 
 # Claude Code local state
 .claude/
+
+# e2e harness / make run build artifacts
+examples/serve/serve
+examples/subprocess/subprocess

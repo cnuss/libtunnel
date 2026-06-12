@@ -85,6 +85,23 @@ func TestQuickTunnelRetriesAfterMalformedBody(t *testing.T) {
 	}
 }
 
+func TestQuickTunnelRejectionIsPermanent(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Write([]byte(`{"success":false,"errors":[{"code":1003,"message":"quick tunnels disabled"}]}`))
+	}))
+	defer srv.Close()
+
+	_, err := (&cloudflare.QuickTunnelProvider{URL: srv.URL}).Spec(context.Background())
+	if !errors.Is(err, cloudflare.ErrMintRejected) {
+		t.Errorf("err = %v, want errors.Is(_, cloudflare.ErrMintRejected)", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("API called %d times, want 1 (definitive rejection must not retry)", got)
+	}
+}
+
 func TestQuickTunnelHonorsContext(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
