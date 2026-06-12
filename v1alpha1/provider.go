@@ -37,18 +37,13 @@ var (
 	selfExported   = map[string]bool{}
 )
 
-// assertSpec is a minimal v1.Spec used only by the compile-time interface
-// assertions below — this package cannot import a real backend's spec type
-// without creating a cycle.
-type assertSpec struct{}
-
-func (*assertSpec) GetHostname() string { return "" }
-
-var (
-	_ v1.Spec                  = (*assertSpec)(nil)
-	_ v1.Provider[*assertSpec] = staticProvider[*assertSpec]{}
-	_ v1.Provider[*assertSpec] = envProvider[assertSpec, *assertSpec]{}
-)
+// LoggerSetter is the optional provider capability the tunnel core probes to
+// thread its logger into providers that can log (retry warnings, rate
+// limits). Provider wrappers must forward SetLogger to what they wrap, or
+// logging is silently severed for everything beneath them.
+type LoggerSetter interface {
+	SetLogger(*slog.Logger)
+}
 
 // Static returns a provider that yields the given spec verbatim. Useful for
 // replaying known credentials (tests, fixed tunnels).
@@ -89,7 +84,7 @@ type envProvider[E any, T interface {
 
 // SetLogger forwards the tunnel's logger to the wrapped provider.
 func (p envProvider[E, T]) SetLogger(log *slog.Logger) {
-	if pl, ok := p.next.(interface{ SetLogger(*slog.Logger) }); ok {
+	if pl, ok := p.next.(LoggerSetter); ok {
 		pl.SetLogger(log)
 	}
 }

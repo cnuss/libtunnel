@@ -73,9 +73,10 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 	return v1alpha1.Env(b.Name(), QuickTunnel())
 }
 
-// CACerts returns the Mozilla CA bundle plus the Cloudflare origin roots —
-// the trust set cloudflared uses for its edge TLS connections.
-func (b *Backend) CACerts() []*x509.Certificate {
+// caCerts parses the trust set once per process: the Mozilla bundle is a
+// compile-time constant and the Cloudflare roots are fixed, so re-parsing
+// ~150 certificates per tunnel was pure waste.
+var caCerts = sync.OnceValue(func() []*x509.Certificate {
 	certificates := []*x509.Certificate{}
 
 	rest := []byte(embedded.MozillaCACertificatesPEM())
@@ -94,9 +95,13 @@ func (b *Backend) CACerts() []*x509.Certificate {
 	}
 
 	cloudflareRoots, _ := tlsconfig.GetCloudflareRootCA()
-	certificates = append(certificates, cloudflareRoots...)
+	return append(certificates, cloudflareRoots...)
+})
 
-	return certificates
+// CACerts returns the Mozilla CA bundle plus the Cloudflare origin roots —
+// the trust set cloudflared uses for its edge TLS connections.
+func (b *Backend) CACerts() []*x509.Certificate {
+	return caCerts()
 }
 
 // WithListener dials the Cloudflare edge and proxies it onto l. It blocks
@@ -236,7 +241,9 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 			return nil, fmt.Errorf("failed to create orchestrator: %w", err)
 		}
 
-		reconnected := make(chan supervisor.ReconnectSignal) // TODO(partial): what to do with reconnected
+		// Nothing here produces manual reconnect signals; the channel only
+		// exists to satisfy NewSupervisor, which selects on it.
+		reconnected := make(chan supervisor.ReconnectSignal)
 		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, reconnected, ctx.Done())
 		if err != nil {
 			return nil, fmt.Errorf("failed to create supervisor: %w", err)

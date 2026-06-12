@@ -93,16 +93,33 @@ func paceLive() {
 	lastLiveStart = time.Now()
 }
 
+// readyPrefix matches the "ready: <url>" line liveServeChild prints. The
+// example children print the same line, but keep their own literal — examples
+// are intentionally self-contained — so a change to either side must be
+// mirrored: a drifted prefix is a silent scanner hang, not an error.
+const readyPrefix = "ready: "
+
+// readyErr waits for TunnelReady with a deadline, returning an error when the
+// tunnel dies first (Done) or never readies within d. waitReady is the
+// t.Fatal form; scenarios that wait inside worker goroutines (where t.Fatal
+// is illegal) use this directly.
+func readyErr(conn v1.Connected[*cloudflare.Spec], d time.Duration) error {
+	select {
+	case <-conn.TunnelReady():
+		return nil
+	case <-conn.Done():
+		return fmt.Errorf("tunnel failed: %w", conn.Err())
+	case <-time.After(d):
+		return fmt.Errorf("tunnel not ready after %v (rate-limited mint or dead connection?)", d)
+	}
+}
+
 // waitReady waits for TunnelReady with a deadline, failing fast when the
 // tunnel dies first (Done) or never readies within d.
 func waitReady(t *testing.T, conn v1.Connected[*cloudflare.Spec], d time.Duration) {
 	t.Helper()
-	select {
-	case <-conn.TunnelReady():
-	case <-conn.Done():
-		t.Fatalf("tunnel failed: %v", conn.Err())
-	case <-time.After(d):
-		t.Fatalf("tunnel not ready after %v (rate-limited mint or dead connection?)", d)
+	if err := readyErr(conn, d); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -121,22 +138,31 @@ func getBody(url string) (string, int, error) {
 	return string(body), resp.StatusCode, nil
 }
 
-// eventuallyBody polls url until the body equals want or the deadline
+// eventuallyBodyErr polls url until the body equals want or the deadline
 // expires. Fresh tunnels and just-restarted origins can lag a few seconds
-// behind the edge.
-func eventuallyBody(t *testing.T, url, want string, deadline time.Duration) {
-	t.Helper()
+// behind the edge. eventuallyBody is the t.Fatal form; worker goroutines use
+// this directly.
+func eventuallyBodyErr(url, want string, deadline time.Duration) error {
 	var last string
 	var lastErr error
 	for end := time.Now().Add(deadline); time.Now().Before(end); {
 		body, code, err := getBody(url)
 		last, lastErr = body, err
 		if err == nil && code == http.StatusOK && body == want {
-			return
+			return nil
 		}
 		time.Sleep(2 * time.Second)
 	}
-	t.Fatalf("never saw body %q from %s (last body %q, last err %v)", want, url, last, lastErr)
+	return fmt.Errorf("never saw body %q from %s (last body %q, last err %v)", want, url, last, lastErr)
+}
+
+// eventuallyBody polls url until the body equals want or the deadline
+// expires.
+func eventuallyBody(t *testing.T, url, want string, deadline time.Duration) {
+	t.Helper()
+	if err := eventuallyBodyErr(url, want, deadline); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // selfSignedTLS returns a TLS config with a fresh self-signed certificate for

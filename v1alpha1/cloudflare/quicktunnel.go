@@ -12,9 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dustin/go-humanize"
-
 	v1 "github.com/cnuss/libtunnel/v1"
+	"github.com/cnuss/libtunnel/v1alpha1"
 )
 
 // quickTunnelURL is the public endpoint that mints anonymous quick tunnels.
@@ -44,7 +43,10 @@ func QuickTunnel() *QuickTunnelProvider {
 	return &QuickTunnelProvider{}
 }
 
-var _ v1.Provider[*Spec] = (*QuickTunnelProvider)(nil)
+var (
+	_ v1.Provider[*Spec]    = (*QuickTunnelProvider)(nil)
+	_ v1alpha1.LoggerSetter = (*QuickTunnelProvider)(nil)
+)
 
 // SetLogger adopts the tunnel's logger so retry warnings (rate limits
 // especially) surface through it. An explicitly set Log wins.
@@ -97,8 +99,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfter := resp.Header.Get("Retry-After")
 			if secs, err := strconv.Atoi(retryAfter); err == nil {
-				now := time.Now()
-				return nil, fmt.Errorf("%w: resets in %s", ErrRateLimited, humanize.RelTime(now.Add(time.Duration(secs)*time.Second), now, "", ""))
+				return nil, fmt.Errorf("%w: resets in %s", ErrRateLimited, time.Duration(secs)*time.Second)
 			}
 			if retryAfter != "" {
 				return nil, fmt.Errorf("%w (HTTP 429): Retry-After=%s", ErrRateLimited, retryAfter)

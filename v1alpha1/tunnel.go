@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"os"
@@ -37,24 +38,25 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected[T] {
 		t.listener = l
 		close(t.listenerProvided)
 
-		engine, ok := t.backend.(Engine[T])
-		if !ok {
-			t.cancel(fmt.Errorf("backend %q does not implement the v1alpha1 engine contract", t.backend.Name()))
+		if t.engine == nil {
+			// Foreign backend: the tunnel was born canceled (see New).
 			return
 		}
 
 		go func() {
 			t.Logger().Info("starting tunnel with local listener")
-			if err := engine.WithListener(t, l); err != nil {
-				t.cancel(fmt.Errorf("backend %q connect: %w", engine.Name(), err))
+			// Start the DNS readiness poller before the edge connect: the
+			// record exists from spec-mint time, so DNS propagation overlaps
+			// the (seconds-long) edge dial instead of queuing behind it.
+			ready := t.HostnameReady()
+			if err := t.engine.WithListener(t, l); err != nil {
+				t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
 				return
 			}
 
 			t.Logger().Info("tunnel connected, waiting for DNS")
-			select {
-			case <-t.ctx.Done():
+			if !await(t.ctx, ready) {
 				return
-			case <-t.HostnameReady():
 			}
 
 			t.Logger().Info("tunnel is ready")
@@ -98,6 +100,10 @@ func (t *TunnelImpl[T]) LocalPort() int {
 	if l == nil {
 		return 0
 	}
+	if addr, ok := l.Addr().(*net.TCPAddr); ok {
+		return addr.Port
+	}
+	// Exotic listener: fall back to parsing the address string.
 	_, port, err := net.SplitHostPort(l.Addr().String())
 	if err != nil {
 		t.cancel(fmt.Errorf("unable to determine local port from listener address %q: %w", l.Addr(), err))
@@ -122,13 +128,19 @@ func (t *TunnelImpl[T]) LocalIP() net.IP {
 			return
 		}
 
-		host, _, err := net.SplitHostPort(l.Addr().String())
-		if err != nil {
-			t.cancel(fmt.Errorf("unable to determine local IP from listener address %q: %w", l.Addr(), err))
-			return
+		var ip net.IP
+		if addr, ok := l.Addr().(*net.TCPAddr); ok {
+			ip = addr.IP
+		} else {
+			// Exotic listener: fall back to parsing the address string.
+			host, _, err := net.SplitHostPort(l.Addr().String())
+			if err != nil {
+				t.cancel(fmt.Errorf("unable to determine local IP from listener address %q: %w", l.Addr(), err))
+				return
+			}
+			ip = net.ParseIP(host)
 		}
-
-		if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() {
+		if ip != nil && !ip.IsUnspecified() {
 			t.localIP = ip
 			return
 		}
@@ -164,22 +176,19 @@ func (t *TunnelImpl[T]) LocalHost() string {
 // listener (https when it terminates TLS, http otherwise). Blocks until a
 // listener is provided.
 func (t *TunnelImpl[T]) LocalURL() *url.URL {
-	t.localURLOnce.Do(func() {
-		ip := t.LocalIP()
-		if ip == nil {
-			return
-		}
-		scheme := "http"
-		if IsTLS(t.listener) {
-			scheme = "https"
-		}
-		t.localURL = &url.URL{
-			Scheme: scheme,
-			Host:   net.JoinHostPort(ip.String(), strconv.Itoa(t.LocalPort())),
-			Path:   "/",
-		}
-	})
-	return t.localURL
+	ip := t.LocalIP()
+	if ip == nil {
+		return nil
+	}
+	scheme := "http"
+	if IsTLS(t.listener) {
+		scheme = "https"
+	}
+	return &url.URL{
+		Scheme: scheme,
+		Host:   net.JoinHostPort(ip.String(), strconv.Itoa(t.LocalPort())),
+		Path:   "/",
+	}
 }
 
 // Spec returns the resolved tunnel spec, fetching it from the backend's
@@ -190,7 +199,7 @@ func (t *TunnelImpl[T]) Spec() T {
 		// Providers that can log (retry warnings, rate limits) pick up the
 		// tunnel's logger here — they're built by the backend before any
 		// WithLogger call, so the logger is threaded late.
-		if pl, ok := provider.(interface{ SetLogger(*slog.Logger) }); ok {
+		if pl, ok := provider.(LoggerSetter); ok {
 			pl.SetLogger(t.Logger())
 		}
 
@@ -211,10 +220,7 @@ func (t *TunnelImpl[T]) Spec() T {
 
 // Hostname is the public hostname from the spec.
 func (t *TunnelImpl[T]) Hostname() string {
-	t.hostnameOnce.Do(func() {
-		t.hostname = t.Spec().GetHostname()
-	})
-	return t.hostname
+	return t.Spec().GetHostname()
 }
 
 // Host is the first label of Hostname.
@@ -236,31 +242,25 @@ func (t *TunnelImpl[T]) Port() int {
 // zone's authoritative nameservers. Returns nil if the tunnel is canceled
 // before that happens, per the v1 contract's zero-value-on-cancel rule.
 func (t *TunnelImpl[T]) URL() *url.URL {
-	t.urlOnce.Do(func() {
-		hostname := t.Hostname()
-		// A cancellation wake leaves the zero value: the hostname never
-		// resolved, so there is no URL to report.
-		if !await(t.ctx, t.HostnameReady()) {
-			return
-		}
-		t.url = &url.URL{
-			Scheme: "https",
-			Host:   hostname,
-			Path:   "/",
-		}
-	})
-	return t.url
+	hostname := t.Hostname()
+	if !await(t.ctx, t.HostnameReady()) {
+		return nil
+	}
+	return &url.URL{
+		Scheme: "https",
+		Host:   hostname,
+		Path:   "/",
+	}
 }
 
 // CACerts returns the backend's trust roots for its edge connections.
 func (t *TunnelImpl[T]) CACerts() []*x509.Certificate {
 	t.caCertsOnce.Do(func() {
-		engine, ok := t.backend.(Engine[T])
-		if !ok {
-			t.cancel(fmt.Errorf("backend %q does not implement the v1alpha1 engine contract", t.backend.Name()))
+		if t.engine == nil {
+			// Foreign backend: the tunnel was born canceled (see New).
 			return
 		}
-		t.caCerts = engine.CACerts()
+		t.caCerts = t.engine.CACerts()
 		t.Logger().Info("loaded CA certificates for tunnel", "numCACerts", len(t.caCerts))
 	})
 	return t.caCerts
@@ -332,7 +332,7 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 
 			host := dnsName(t.Hostname())
 			for attempt := 1; ; attempt++ {
-				target = ips[time.Now().UnixNano()%int64(len(ips))]
+				target = ips[rand.IntN(len(ips))]
 				t.Logger().Debug("querying authoritative nameserver", "hostname", host, "server", target, "attempt", attempt)
 
 				started := time.Now()
