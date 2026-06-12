@@ -97,13 +97,15 @@ jobs:
       - name: tests
         run: make test
 
-      # Exactly one cell runs the live e2e tier (real quick tunnels from
-      # api.trycloudflare.com): minting from all 12 cells would trip the
-      # API's rate limits. A `served: error code: 1033` failure here is edge
-      # route propagation lag, not code — rerun the job.
+      # One cell per OS runs the live e2e tier (real quick tunnels from
+      # api.trycloudflare.com) so platform-specific tunnel behavior is
+      # exercised on Linux, Windows, and macOS without minting from all 12
+      # cells, which would trip the API's rate limits. A `served: error
+      # code: 1033` failure here is edge route propagation lag, not code —
+      # rerun the job.
       - name: e2e
         env:
-          LIBTUNNEL_E2E_LIVE: ${{ matrix.os == 'ubuntu-24.04' && matrix.go == 'stable' && '1' || '' }}
+          LIBTUNNEL_E2E_LIVE: ${{ matrix.go == 'stable' && contains(fromJSON('["ubuntu-24.04", "windows-2025", "macos-26"]'), matrix.os) && '1' || '' }}
         run: make e2e
 
   release:

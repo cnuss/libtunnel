@@ -112,9 +112,10 @@ Easy to get wrong from the diff alone:
   source changes — `make e2e` passes `-count=1` to force a rebuild.
 - **Live examples are gated.** `serve` and `subprocess` mint real tunnels from
   `api.trycloudflare.com`, which rate-limits — minting from all 12 CI matrix
-  cells would trip 429s, so exactly one cell (ubuntu-24.04/stable) sets
-  `LIBTUNNEL_E2E_LIVE=1` and the rest skip the live tier. Run it locally too
-  when touching the engine or the examples. A `served: error code: 1033`
+  cells would trip 429s, so one stable-Go cell per OS (ubuntu-24.04,
+  windows-2025, macos-26) sets `LIBTUNNEL_E2E_LIVE=1` and the rest skip the
+  live tier. For local verification, prefer `make run serve` (one tunnel)
+  over the full live suite. A `served: error code: 1033`
   from a fresh tunnel is edge route propagation lag (more likely with
   several tunnels minted at once) — rerun before suspecting the code.
 - **cloudflared registers prometheus collectors globally.** The Cloudflare
