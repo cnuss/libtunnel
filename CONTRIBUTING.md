@@ -18,6 +18,7 @@ Deep-link by filename; line numbers will drift.
 | Cloudflare engine (cloudflared supervisor wiring) | [`v1alpha1/cloudflare/cloudflare.go`](./v1alpha1/cloudflare/cloudflare.go) |
 | Quick-tunnel provider (api.trycloudflare.com)  | [`v1alpha1/cloudflare/quicktunnel.go`](./v1alpha1/cloudflare/quicktunnel.go) |
 | Unit tests + fuzz target                       | [`v1alpha1/tunnel_test.go`](./v1alpha1/tunnel_test.go)           |
+| e2e scenarios (subprocess handoff, live)       | [`e2e/handoff_test.go`](./e2e/handoff_test.go)                   |
 | godoc examples                                 | [`v1/example_test.go`](./v1/example_test.go)                     |
 | e2e harness + runner                           | [`e2e/e2e_test.go`](./e2e/e2e_test.go)                           |
 | Worked examples                                | [`examples/`](./examples)                                        |
@@ -64,10 +65,23 @@ make e2e    # builds and runs every example binary (live ones skipped)
 Run a specific example locally:
 
 ```sh
-make run offline
 make run serve
 make run handoff
 ```
+
+## Test layout
+
+Three tiers, each with a distinct job — don't blur them:
+
+- **`*_test.go` next to the code** — unit tests (plus fuzz targets, and the
+  godoc examples in `v1/example_test.go`). Fast, in-package, no subprocesses.
+- **`examples/`** — real-world, simple-ish API usage written for humans. An
+  example demonstrates; it never asserts. Assertion logic belongs in `e2e/`.
+- **`e2e/`** — complicated scenarios, not meant for human consumption. The
+  harness builds and runs the example binaries and asserts on their output,
+  and adds scenario tests of its own (subprocess handoff, live tunnels,
+  output parsing). If a flow needs orchestration or verification beyond what
+  a readable example should carry, it lives here.
 
 ## Before you push
 

@@ -138,16 +138,21 @@ func (t *TunnelImpl[T]) LocalHost() string {
 	return t.localHost
 }
 
-// LocalURL is https://<LocalIP>:<LocalPort>/. Blocks until a listener is
-// provided.
+// LocalURL is <scheme>://<LocalIP>:<LocalPort>/, where the scheme follows the
+// listener (https when it terminates TLS, http otherwise). Blocks until a
+// listener is provided.
 func (t *TunnelImpl[T]) LocalURL() *url.URL {
 	t.localURLOnce.Do(func() {
 		ip := t.LocalIP()
 		if ip == nil {
 			return
 		}
+		scheme := "http"
+		if IsTLS(t.listener) {
+			scheme = "https"
+		}
 		t.localURL = &url.URL{
-			Scheme: "https",
+			Scheme: scheme,
 			Host:   net.JoinHostPort(ip.String(), strconv.Itoa(t.LocalPort())),
 			Path:   "/",
 		}
@@ -330,6 +335,18 @@ func portOf(hostname string) int {
 		return 443
 	}
 	return p
+}
+
+// IsTLS reports whether l terminates TLS itself, so origin URLs can carry the
+// matching scheme. crypto/tls's listener type is unexported, so detection
+// probes an opt-in interface first (custom listeners can declare themselves
+// with a `TLS() bool` method) and falls back to the concrete type name for
+// listeners straight out of tls.Listen/tls.NewListener.
+func IsTLS(l net.Listener) bool {
+	if t, ok := l.(interface{ TLS() bool }); ok {
+		return t.TLS()
+	}
+	return fmt.Sprintf("%T", l) == "*tls.listener"
 }
 
 // await bridges a receive on ch with cancellation: the returned channel

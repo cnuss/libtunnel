@@ -103,7 +103,10 @@ type Tunnel[T Spec] interface {
 	WithLogger(log *slog.Logger) Tunnel[T]
 	// WithListener provides the local listener and lazily starts the edge
 	// connection. It is the terminal mutator: the returned Connected carries
-	// no further configuration surface.
+	// no further configuration surface. The tunnel infers the origin scheme
+	// from the listener: TLS listeners (tls.Listen, or any listener with a
+	// TLS() bool method reporting true) are dialed over https, plain ones
+	// over http.
 	WithListener(l net.Listener) Connected[T]
 }
 

@@ -48,9 +48,10 @@ func main() {
 }
 ```
 
-(The Cloudflare ingress dials the origin over https, so the listener should
-speak TLS — a self-signed certificate is enough; see
-[`examples/serve/main.go`](./examples/serve/main.go).)
+(The ingress scheme follows the listener: hand over a plain listener and the
+origin is dialed over http; wrap it with `tls.NewListener` — or implement
+`TLS() bool` on a custom listener — and the ingress switches to https,
+self-signed certificates welcome.)
 
 ## Layout
 
@@ -150,14 +151,12 @@ Self-contained programs in [`./examples`](./examples):
 
 | Example   | Demonstrates                                                       |
 | --------- | ------------------------------------------------------------------ |
-| `offline` | Spec handoff + lazy getters, no network access.                     |
 | `serve`   | Real quick tunnel: serve HTTPS locally, request the public URL.     |
 | `handoff` | Parent mints a spec; child adopts it via `TUNNEL_SPEC` and serves.  |
 
 Run one locally:
 
 ```sh
-make run offline
 make run serve
 make run handoff
 ```
@@ -166,16 +165,15 @@ make run handoff
 
 ```sh
 make test   # library unit + fuzz tests (fast, in-package)
-make e2e    # builds and runs the example binaries, asserts their output
+make e2e    # example binaries + scenario tests (subprocess handoff, …)
 ```
 
 `make e2e` runs `go test -count=1 -v ./e2e`. The `-count=1` defeats the test
 cache, since the harness builds the example binaries at runtime and the cache
-key wouldn't otherwise pick up example source changes.
-
-The `serve` and `handoff` examples mint real tunnels from
-`api.trycloudflare.com` (rate-limited), so the e2e harness skips them unless
-you opt in:
+key wouldn't otherwise pick up example source changes. Offline scenarios (the
+subprocess spec handoff) always run; the examples themselves mint real
+tunnels from `api.trycloudflare.com` (rate-limited), so the harness skips
+them unless you opt in:
 
 ```sh
 LIBTUNNEL_E2E_LIVE=1 make e2e

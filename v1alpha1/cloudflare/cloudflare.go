@@ -158,19 +158,27 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*v1.CloudflareSpec], l net
 		OriginDialerService: originDialer,
 	}
 
+	// The origin scheme follows the listener: a TLS listener gets an https
+	// ingress (self-signed is fine — verification is off), a plain one gets
+	// http.
+	tlsOrigin := v1alpha1.IsTLS(l)
+	scheme := "http"
+	if tlsOrigin {
+		scheme = "https"
+	}
+
 	noTLSVerify := true
-	http2Origin := true
 	internalRules := []ingress.Rule{}
 	orchestrator, err := orchestration.NewOrchestrator(ctx, &orchestration.Config{
 		Ingress: func() *ingress.Ingress {
 			parsed, _ := ingress.ParseIngress(&config.Configuration{
 				OriginRequest: config.OriginRequestConfig{
 					NoTLSVerify: &noTLSVerify,
-					Http2Origin: &http2Origin,
+					Http2Origin: &tlsOrigin,
 				},
 				WarpRouting: config.WarpRoutingConfig{},
 				Ingress: []config.UnvalidatedIngressRule{
-					{Service: fmt.Sprintf("https://%s", l.Addr().String())},
+					{Service: fmt.Sprintf("%s://%s", scheme, l.Addr().String())},
 				},
 			})
 			return &parsed

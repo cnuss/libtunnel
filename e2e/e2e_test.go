@@ -68,8 +68,8 @@ func TestExamples(t *testing.T) {
 		want string
 		live bool // mints a real tunnel; gated behind LIBTUNNEL_E2E_LIVE=1
 	}{
-		{"offline", "domain: trycloudflare.com", false},
 		{"serve", "served: hello from libtunnel", true},
+		{"handoff", "handoff: hello from the child", true},
 	}
 	for _, tc := range cases {
 		tc := tc

@@ -1,5 +1,5 @@
-// Command serve exposes a local HTTPS server to the public internet through
-// a Cloudflare quick tunnel, waits until the tunnel is reachable end to end,
+// Command serve exposes a local HTTP server to the public internet through a
+// Cloudflare quick tunnel, waits until the tunnel is reachable end to end,
 // then requests its own public URL to prove the round trip.
 //
 // It needs network access (it mints a tunnel from api.trycloudflare.com); the
@@ -7,28 +7,20 @@
 package main
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
-	"time"
 
 	"github.com/cnuss/libtunnel"
 )
 
 func main() {
-	// The tunnel's ingress dials the origin over https (certificate
-	// verification disabled), so the local listener must speak TLS — a
-	// self-signed certificate is enough.
-	l, err := tls.Listen("tcp", "127.0.0.1:0", selfSigned())
+	// You own the bind. The tunnel infers everything else from the listener —
+	// including whether the origin speaks TLS (wrap with tls.NewListener and
+	// the ingress switches to https automatically).
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -57,32 +49,4 @@ func main() {
 	}
 
 	fmt.Printf("served: %s\n", body)
-}
-
-// selfSigned returns a TLS config with a fresh self-signed certificate for
-// 127.0.0.1 — the minimum the tunnel's https ingress needs from the origin.
-func selfSigned() *tls.Config {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "libtunnel example"},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{{
-			Certificate: [][]byte{der},
-			PrivateKey:  key,
-		}},
-	}
 }

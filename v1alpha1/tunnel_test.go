@@ -57,8 +57,8 @@ func TestLocalGettersDeriveFromListener(t *testing.T) {
 		t.Errorf("LocalIP() = %v, want %v (the listener's IP)", got, addr.IP)
 	}
 	wantHost := net.JoinHostPort(addr.IP.String(), strconv.Itoa(addr.Port))
-	if got := conn.LocalURL(); got.Host != wantHost || got.Scheme != "https" {
-		t.Errorf("LocalURL() = %v, want https://%s/", got, wantHost)
+	if got := conn.LocalURL(); got.Host != wantHost || got.Scheme != "http" {
+		t.Errorf("LocalURL() = %v, want http://%s/ (plain listener => http)", got, wantHost)
 	}
 	if got := conn.Listener(); got != l {
 		t.Errorf("Listener() = %v, want the provided listener", got)

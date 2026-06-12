@@ -9,23 +9,14 @@ package main
 
 import (
 	"bufio"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/cnuss/libtunnel"
 )
@@ -78,14 +69,8 @@ func parent() {
 		log.Fatal("child exited before the tunnel became ready")
 	}
 
-	// The child must have connected under the exact hostname the parent
-	// minted — that's the point of the handoff.
-	if u, err := url.Parse(childURL); err != nil || u.Hostname() != spec.Hostname {
-		log.Fatalf("child connected under %q, want the minted hostname %q", childURL, spec.Hostname)
-	}
-
-	// Request through the parent's own handle on the hostname, not the
-	// child's echo: both processes share the same tunnel identity.
+	// Both processes share the tunnel identity: the parent can reach the
+	// child through the hostname it minted itself.
 	resp, err := http.Get("https://" + spec.Hostname + "/")
 	if err != nil {
 		log.Fatal(err)
@@ -103,7 +88,7 @@ func parent() {
 // TUNNEL_SPEC, so the QuickTunnel fallback is never consulted), provides the
 // listener, and serves until the parent kills it.
 func child() {
-	l, err := tls.Listen("tcp", "127.0.0.1:0", selfSigned())
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -121,32 +106,4 @@ func child() {
 	fmt.Printf("ready: %s\n", conn.URL())
 
 	select {} // serve until the parent kills us
-}
-
-// selfSigned returns a TLS config with a fresh self-signed certificate for
-// 127.0.0.1 — the minimum the tunnel's https ingress needs from the origin.
-func selfSigned() *tls.Config {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "libtunnel example"},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{{
-			Certificate: [][]byte{der},
-			PrivateKey:  key,
-		}},
-	}
 }
