@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -108,6 +109,14 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 	spec := t.Spec()
 	if spec == nil {
 		return fmt.Errorf("no spec resolved")
+	}
+
+	// quic-go logs a buffer-size warning straight to the global log package
+	// (bypassing any configured logger) when the kernel caps its 7 MB UDP
+	// buffer request — a throughput note, not an error. Suppress it unless
+	// the host explicitly opted in to seeing it.
+	if _, set := os.LookupEnv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING"); !set {
+		os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
 	}
 
 	// cloudflared registers collectors against the global default registerer;
