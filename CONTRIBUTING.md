@@ -67,7 +67,7 @@ Run a specific example locally:
 
 ```sh
 make run serve
-make run handoff
+make run subprocess
 ```
 
 ## Test layout
@@ -110,7 +110,7 @@ Easy to get wrong from the diff alone:
   example names (`Example_handoff` etc.). See [`v1/example_test.go`](./v1/example_test.go).
 - **e2e builds binaries at runtime**, so the test cache can't see example
   source changes — `make e2e` passes `-count=1` to force a rebuild.
-- **Live examples are gated.** `serve` and `handoff` mint real tunnels from
+- **Live examples are gated.** `serve` and `subprocess` mint real tunnels from
   `api.trycloudflare.com`, which rate-limits — minting from all 12 CI matrix
   cells would trip 429s, so exactly one cell (ubuntu-24.04/stable) sets
   `LIBTUNNEL_E2E_LIVE=1` and the rest skip the live tier. Run it locally too

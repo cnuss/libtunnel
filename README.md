@@ -144,7 +144,7 @@ cmd.Env = append(os.Environ(), entry)
 conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 ```
 
-(Full source: [`examples/handoff/main.go`](./examples/handoff/main.go).)
+(Full source: [`examples/subprocess/main.go`](./examples/subprocess/main.go).)
 
 ## Examples
 
@@ -153,13 +153,13 @@ Self-contained programs in [`./examples`](./examples):
 | Example   | Demonstrates                                                       |
 | --------- | ------------------------------------------------------------------ |
 | `serve`   | Real quick tunnel: serve locally, request the public URL.           |
-| `handoff` | Parent mints a spec; child adopts it via `TUNNEL_SPEC` and serves.  |
+| `subprocess` | Parent mints a spec; child adopts it via `TUNNEL_SPEC` and serves. |
 
 Run one locally:
 
 ```sh
 make run serve
-make run handoff
+make run subprocess
 ```
 
 ## Testing

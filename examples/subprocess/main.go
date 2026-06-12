@@ -1,4 +1,4 @@
-// Command handoff is the canonical parent→child spec handoff: the parent
+// Command subprocess is the canonical parent→child spec handoff: the parent
 // process mints a tunnel spec and passes it to a spawned child through the
 // TUNNEL_SPEC environment variable; the child provides the listener, connects
 // the tunnel, and serves; the parent then requests the child's public URL.

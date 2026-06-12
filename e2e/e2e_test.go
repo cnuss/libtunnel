@@ -84,7 +84,7 @@ func TestExamples(t *testing.T) {
 		verify func(t *testing.T, out string) // optional deeper assertions on the same run
 	}{
 		{"serve", "served: hello from libtunnel", true, nil},
-		{"handoff", "handoff: hello from the child", true, verifySharedHostname},
+		{"subprocess", "handoff: hello from the child", true, verifySharedHostname},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -116,8 +116,8 @@ func capture(out, prefix string) (string, bool) {
 	return "", false
 }
 
-// verifySharedHostname asserts the parent→child spec handoff on the handoff
-// example's output: the parent mints a hostname, the child (a subprocess)
+// verifySharedHostname asserts the parent→child spec handoff on the
+// subprocess example's output: the parent mints a hostname, the child (a subprocess)
 // provides the listener and connects, and both interact with the tunnel
 // under the exact same hostname.
 func verifySharedHostname(t *testing.T, out string) {
