@@ -1,36 +1,57 @@
 package v1_test
 
+// go vet rejects Example funcs bound to parameterized types (ExampleTunnel_*
+// — its example checker hasn't caught up with generics), so the examples here
+// use package-level names instead.
+
 import (
 	"fmt"
+	"net"
+	"net/http"
+	"os"
 
 	"github.com/cnuss/libtunnel"
 )
 
-// New returns an unconfigured Builder. Configure it with the With* methods and
-// finalize with Build.
-func ExampleNew() {
-	res := libtunnel.New[string]().
-		WithName("greeting").
-		WithValue("hello").
-		Build()
+// The full lifecycle: bind a listener, hand it to the tunnel (which lazily
+// starts the edge connection), serve on it, and wait until the tunnel is
+// publicly reachable. Not run as a test — it mints a real quick tunnel.
+func Example() {
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 
-	fmt.Printf("%s = %q\n", res.Name, res.Value)
-	// Output: greeting = "hello"
+	go http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello")
+	}))
+
+	select {
+	case <-conn.TunnelReady():
+		fmt.Println(conn.URL()) // https://<something>.trycloudflare.com/
+	case <-conn.Done():
+		fmt.Println(conn.Err())
+	}
 }
 
-// WithValue sets the payload; the name is optional. Built without WithName, the
-// Result's Name is empty.
-func Example_value() {
-	res := libtunnel.New[int]().WithValue(42).Build()
+// TUNNEL_SPEC is the parent→child handoff channel: a parent process that
+// mints a tunnel exports its spec there automatically, and a child's
+// Cloudflare credential chain adopts it at construction — no API to call.
+// Here the environment is populated by hand to stand in for the parent.
+func Example_handoff() {
+	os.Setenv("TUNNEL_SPEC", `{"hostname":"demo.trycloudflare.com"}`)
+	defer os.Unsetenv("TUNNEL_SPEC")
 
-	fmt.Printf("name=%q value=%d\n", res.Name, res.Value)
-	// Output: name="" value=42
+	t := libtunnel.New(libtunnel.Cloudflare())
+	fmt.Println(t.Hostname())
+	// Output: demo.trycloudflare.com
 }
 
-// The zero value of T is returned when WithValue is never called.
-func Example_zeroValue() {
-	res := libtunnel.New[int]().WithName("count").Build()
+// Getters resolve lazily from the backend's credential chain — here a spec
+// adopted from the environment, so nothing touches the network.
+func Example_lazy() {
+	os.Setenv("TUNNEL_SPEC", `{"hostname":"demo.trycloudflare.com"}`)
+	defer os.Unsetenv("TUNNEL_SPEC")
 
-	fmt.Printf("name=%q value=%d\n", res.Name, res.Value)
-	// Output: name="count" value=0
+	t := libtunnel.New(libtunnel.Cloudflare())
+	fmt.Printf("%s . %s : %d\n", t.Host(), t.Domain(), t.Port())
+	// Output: demo . trycloudflare.com : 443
 }

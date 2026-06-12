@@ -1,0 +1,287 @@
+package v1alpha1_test
+
+import (
+	"context"
+	"crypto/x509"
+	"errors"
+	"net"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	v1 "github.com/cnuss/libtunnel/v1"
+	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
+)
+
+// fakeEngine satisfies the Engine contract without dialing anything: it
+// records the listener it was handed and reports success immediately.
+type fakeEngine struct {
+	got  chan net.Listener
+	spec *cloudflare.Spec
+}
+
+func newFakeEngine(spec *cloudflare.Spec) *fakeEngine {
+	return &fakeEngine{got: make(chan net.Listener, 1), spec: spec}
+}
+
+func (e *fakeEngine) Name() string                            { return "fake" }
+func (e *fakeEngine) Provider() v1.Provider[*cloudflare.Spec] { return v1alpha1.Static(e.spec) }
+func (e *fakeEngine) CACerts() []*x509.Certificate            { return []*x509.Certificate{} }
+func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
+	e.got <- l
+	return nil
+}
+
+// foreignBackend implements v1.Backend but not Engine.
+type foreignBackend struct{}
+
+func (foreignBackend) Name() string { return "foreign" }
+func (foreignBackend) Provider() v1.Provider[*cloudflare.Spec] {
+	return v1alpha1.Static(&cloudflare.Spec{})
+}
+
+var (
+	_ v1alpha1.Engine[*cloudflare.Spec] = (*fakeEngine)(nil)
+	_ v1.Backend[*cloudflare.Spec]      = foreignBackend{}
+)
+
+func listen(t *testing.T) net.Listener {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	return l
+}
+
+func TestLocalGettersDeriveFromListener(t *testing.T) {
+	l := listen(t)
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	conn := tun.WithListener(l)
+
+	addr := l.Addr().(*net.TCPAddr)
+	if got := conn.LocalPort(); got != addr.Port {
+		t.Errorf("LocalPort() = %d, want %d (the listener's port)", got, addr.Port)
+	}
+	if got := conn.LocalIP(); !got.Equal(addr.IP) {
+		t.Errorf("LocalIP() = %v, want %v (the listener's IP)", got, addr.IP)
+	}
+	wantHost := net.JoinHostPort(addr.IP.String(), strconv.Itoa(addr.Port))
+	if got := conn.LocalURL(); got.Host != wantHost || got.Scheme != "http" {
+		t.Errorf("LocalURL() = %v, want http://%s/ (plain listener => http)", got, wantHost)
+	}
+	if got := conn.Listener(); got.Addr().String() != l.Addr().String() {
+		t.Errorf("Listener().Addr() = %v, want %v", got.Addr(), l.Addr())
+	}
+}
+
+func TestLocalGettersBlockUntilListener(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
+
+	port := make(chan int, 1)
+	go func() { port <- tun.LocalPort() }()
+
+	select {
+	case p := <-port:
+		t.Fatalf("LocalPort() = %d before any listener was provided; want it to block", p)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	l := listen(t)
+	tun.WithListener(l)
+
+	select {
+	case p := <-port:
+		if want := l.Addr().(*net.TCPAddr).Port; p != want {
+			t.Errorf("LocalPort() = %d, want %d", p, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("LocalPort() still blocked after WithListener")
+	}
+}
+
+func TestUnspecifiedBindFallsBackToOutboundRouteIP(t *testing.T) {
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
+	conn := tun.WithListener(l)
+
+	ip := conn.LocalIP()
+	if ip == nil {
+		t.Skip("no outbound route available")
+	}
+	if ip.IsUnspecified() {
+		t.Errorf("LocalIP() = %v; want a concrete IP for an unspecified bind", ip)
+	}
+}
+
+func TestSpecGettersDeriveFromProvider(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+
+	if got := tun.Hostname(); got != "demo.trycloudflare.com" {
+		t.Errorf("Hostname() = %q", got)
+	}
+	if got := tun.Host(); got != "demo" {
+		t.Errorf("Host() = %q, want %q", got, "demo")
+	}
+	if got := tun.Domain(); got != "trycloudflare.com" {
+		t.Errorf("Domain() = %q, want %q", got, "trycloudflare.com")
+	}
+	if got := tun.Port(); got != 443 {
+		t.Errorf("Port() = %d, want 443", got)
+	}
+}
+
+// TestListenerCloseClosesTunnel pins the implicit-close contract: closing
+// the tunnel-owned listener (what an http.Server does on Shutdown) closes
+// the tunnel, with ErrClosed as the cause. The caller's original listener
+// dies with it.
+func TestListenerCloseClosesTunnel(t *testing.T) {
+	l := listen(t)
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{})).WithListener(l)
+
+	if err := conn.Listener().Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case <-conn.Done():
+		if !errors.Is(conn.Err(), v1.ErrClosed) {
+			t.Errorf("Err() = %v, want ErrClosed", conn.Err())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed after the listener was closed")
+	}
+
+	if _, err := l.Accept(); err == nil {
+		t.Error("original listener still accepting after the tunnel-owned handle was closed")
+	}
+}
+
+func TestEngineReceivesListener(t *testing.T) {
+	engine := newFakeEngine(&cloudflare.Spec{})
+	l := listen(t)
+	v1alpha1.New(engine).WithListener(l)
+
+	select {
+	case got := <-engine.got:
+		if got != l {
+			t.Errorf("engine received listener %v, want %v", got, l)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine never received the listener")
+	}
+}
+
+// TestTunnelReadyAfterEngineConnects uses a hostname that genuinely resolves
+// (and whose zone has reachable authoritative nameservers) so the readiness
+// poller succeeds — the fake engine supplies the connection half. Needs
+// outbound DNS.
+func TestTunnelReadyAfterEngineConnects(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
+
+	conn := tun.WithListener(listen(t))
+
+	select {
+	case <-conn.TunnelReady():
+	case <-time.After(15 * time.Second):
+		t.Fatal("TunnelReady never closed after the engine connected")
+	}
+}
+
+func TestForeignBackendCancels(t *testing.T) {
+	tun := v1alpha1.New[*cloudflare.Spec](foreignBackend{})
+	tun.WithListener(listen(t))
+
+	select {
+	case <-tun.Done():
+		if tun.Err() == nil {
+			t.Error("Done closed but Err() is nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("foreign backend did not cancel the tunnel")
+	}
+}
+
+// TestDoneSurfacesSpecFailure pins the deadlock fix: a tunnel whose spec can
+// never resolve must report through Done/Err — callers select on Done next
+// to TunnelReady instead of blocking forever.
+func TestDoneSurfacesSpecFailure(t *testing.T) {
+	tun := v1alpha1.New[*cloudflare.Spec](failingEngine{})
+
+	if err := tun.Err(); err != nil {
+		t.Fatalf("Err() = %v before any failure, want nil", err)
+	}
+
+	tun.Hostname() // forces the spec fetch, which fails
+
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "boom") {
+			t.Errorf("Err() = %v, want the provider failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed after the spec fetch failed")
+	}
+
+	select {
+	case <-tun.TunnelReady():
+		t.Error("TunnelReady closed on a failed tunnel")
+	default:
+	}
+}
+
+// failingEngine's provider always errors.
+type failingEngine struct{}
+
+func (failingEngine) Name() string { return "failing" }
+func (failingEngine) Provider() v1.Provider[*cloudflare.Spec] {
+	return failingProvider{}
+}
+func (failingEngine) CACerts() []*x509.Certificate { return nil }
+func (failingEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
+	return nil
+}
+
+type failingProvider struct{}
+
+func (failingProvider) Spec(context.Context) (*cloudflare.Spec, error) {
+	return nil, errors.New("boom")
+}
+
+// FuzzHostnameParsing checks the Host/Domain/Port derivation invariants over
+// arbitrary spec hostnames, through the public getters: the first label plus
+// the remainder reassemble the input, and the port is 443 unless the
+// hostname encodes a valid one.
+func FuzzHostnameParsing(f *testing.F) {
+	f.Add("demo.trycloudflare.com")
+	f.Add("localhost")
+	f.Add("example.com:8443")
+	f.Add("")
+	f.Add(".")
+
+	f.Fuzz(func(t *testing.T, hostname string) {
+		tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: hostname}))
+		defer tun.Cancel(errors.New("fuzz iteration done")) // reap the ctx watcher
+
+		host, domain, port := tun.Host(), tun.Domain(), tun.Port()
+
+		if strings.Contains(hostname, ".") {
+			if host+"."+domain != hostname {
+				t.Errorf("Host/Domain lost data: host=%q domain=%q from %q", host, domain, hostname)
+			}
+		} else if host != hostname {
+			t.Errorf("Host() = %q; want the input when it has no dot", host)
+		}
+		if port < 1 || port > 65535 {
+			t.Errorf("Port() = %d, out of range", port)
+		}
+	})
+}

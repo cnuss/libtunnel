@@ -1,5 +1,10 @@
 .PHONY: all check fmt fmt-check vet build windows test e2e run
 
+# The library is pure Go. Forcing CGO off keeps every build identical across
+# hosts and sidesteps broken toolchains (e.g. windows-11-arm runners ship an
+# x86_64 gcc that can't assemble runtime/cgo's arm64 stubs).
+export CGO_ENABLED = 0
+
 # Default: everything CI runs except the auto-bump release step.
 all: fmt-check vet build windows test e2e
 

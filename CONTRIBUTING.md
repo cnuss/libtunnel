@@ -10,11 +10,17 @@ Deep-link by filename; line numbers will drift.
 
 | Topic                                          | Source                                                           |
 | ---------------------------------------------- | ---------------------------------------------------------------- |
-| Façade (`New`)                                 | [`lib.go`](./lib.go)                                             |
-| Stable interface (`Builder[T]` + `Result[T]`)  | [`v1/v1.go`](./v1/v1.go)                                         |
-| Implementation struct + `New[T]` constructor   | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)                 |
-| Builder methods (`WithName`, `WithValue`, …)   | [`v1alpha1/builder.go`](./v1alpha1/builder.go)                   |
-| Unit tests + fuzz target                       | [`v1alpha1/builder_test.go`](./v1alpha1/builder_test.go)         |
+| Façade (`New`, backends, providers, handoff)   | [`lib.go`](./lib.go)                                             |
+| Stable contract (`Tunnel[T]`, `Connected[T]`, `Provider[T]`, `Backend[T]`, `Spec`) | [`v1/v1.go`](./v1/v1.go) |
+| Cloudflare `Spec` type                         | [`v1alpha1/cloudflare/spec.go`](./v1alpha1/cloudflare/spec.go)   |
+| Core struct + `New` constructor + `Engine` contract | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)            |
+| Lazy getters + `With*` mutators + DNS readiness | [`v1alpha1/tunnel.go`](./v1alpha1/tunnel.go)                     |
+| Generic providers (`Static`, `Env`) + handoff helpers | [`v1alpha1/provider.go`](./v1alpha1/provider.go)          |
+| Cloudflare engine (cloudflared supervisor wiring) | [`v1alpha1/cloudflare/cloudflare.go`](./v1alpha1/cloudflare/cloudflare.go) |
+| Quick-tunnel provider (api.trycloudflare.com)  | [`v1alpha1/cloudflare/quicktunnel.go`](./v1alpha1/cloudflare/quicktunnel.go) |
+| Unit tests + fuzz target                       | [`v1alpha1/tunnel_test.go`](./v1alpha1/tunnel_test.go)           |
+| Live e2e scenarios + helpers                   | [`e2e/live_test.go`](./e2e/live_test.go), [`e2e/util_test.go`](./e2e/util_test.go) |
+| Subprocess handoff unit tests                  | [`lib_test.go`](./lib_test.go)                                   |
 | godoc examples                                 | [`v1/example_test.go`](./v1/example_test.go)                     |
 | e2e harness + runner                           | [`e2e/e2e_test.go`](./e2e/e2e_test.go)                           |
 | Worked examples                                | [`examples/`](./examples)                                        |
@@ -28,37 +34,59 @@ Deep-link by filename; line numbers will drift.
 
 ## Module layout
 
-Three packages, stable/alpha versioning:
+Stable/alpha versioning, with backend engines in alpha subpackages:
 
 ```
-github.com/cnuss/libtunnel           — root façade. Stable surface (New).
-github.com/cnuss/libtunnel/v1        — stable Builder[T] interface + Result[T].
-github.com/cnuss/libtunnel/v1alpha1  — current implementation. May change
-                                   between alpha revisions.
+github.com/cnuss/libtunnel                      — root façade: New, backends,
+                                                  providers, handoff helpers.
+github.com/cnuss/libtunnel/v1                   — stable Tunnel[T]/Connected[T]/
+                                                  Provider[T]/Backend[T] contract.
+github.com/cnuss/libtunnel/v1alpha1             — lazy tunnel core + generic
+                                                  providers. May change between
+                                                  alpha revisions.
+github.com/cnuss/libtunnel/v1alpha1/cloudflare  — the cloudflared quick-tunnel
+                                                  engine + its Spec type.
 ```
 
-Application code imports the root (`libtunnel.New[T]()…`). Code that needs to
-declare types against the interface imports `v1`. Direct access to the
-`BuilderImpl[T]` struct lives in `v1alpha1`. The current `Builder[T]` API is a
-generic starting point — swap it for the real one, keeping the layering.
+Application code imports the root (`libtunnel.New(...)`). Code that needs to
+declare types against the interfaces imports `v1`. Direct access to the
+`TunnelImpl[T]` struct and the `Engine` contract lives in `v1alpha1`.
 
 ## Local development
 
-Requires Go 1.21 or later.
+Requires Go 1.26 or later (cloudflared's floor).
 
 ```sh
 git clone https://github.com/cnuss/libtunnel.git
 cd libtunnel
 make test   # library unit + fuzz tests (fast, in-package)
-make e2e    # builds and runs every example binary
+make e2e    # live tier: real tunnels; skipped unless LIBTUNNEL_E2E_LIVE=1
 ```
 
 Run a specific example locally:
 
 ```sh
-make run basic
-make run named
+make run serve
+make run subprocess
 ```
+
+## Test layout
+
+Three tiers, each with a distinct job — don't blur them:
+
+- **`*_test.go` next to the code** — unit tests: anything with fabricated
+  specs or fakes, however elaborate. Includes fuzz targets, the godoc
+  examples in `v1/example_test.go`, and the subprocess handoff scenarios at
+  the repo root (`lib_test.go` — re-exec'd children adopting fabricated
+  specs, no network).
+- **`examples/`** — real-world, simple-ish API usage written for humans. An
+  example demonstrates; it never asserts. Assertion logic belongs in `e2e/`.
+- **`e2e/`** — **live tunnels only**, gated behind `LIBTUNNEL_E2E_LIVE=1`
+  and not meant for human consumption. The harness builds and runs the
+  example binaries against the real edge and asserts on their output, plus
+  live scenario tests (shared-tunnel subtests, TLS origin, resurrection,
+  concurrent tunnels). If a check can pass without a real tunnel, it is a
+  unit test, not e2e.
 
 ## Before you push
 
@@ -77,11 +105,22 @@ Easy to get wrong from the diff alone:
   copy-pasteable starter; no shared internal package. Don't refactor it into
   one.
 - **godoc example funcs can't bind to generic types.** `go vet` rejects
-  `ExampleBuilder_*` in `v1` because `Builder` is parameterized — its example
+  `ExampleTunnel_*` in `v1` because `Tunnel` is parameterized — its example
   checker hasn't caught up with generics. Work around it with package-level
-  example names (`Example_value` etc.). See [`v1/example_test.go`](./v1/example_test.go).
+  example names (`Example_handoff` etc.). See [`v1/example_test.go`](./v1/example_test.go).
 - **e2e builds binaries at runtime**, so the test cache can't see example
   source changes — `make e2e` passes `-count=1` to force a rebuild.
+- **Live examples are gated.** `serve` and `subprocess` mint real tunnels from
+  `api.trycloudflare.com`, which rate-limits — minting from all 12 CI matrix
+  cells would trip 429s, so exactly one cell (ubuntu-24.04/stable) sets
+  `LIBTUNNEL_E2E_LIVE=1` and the rest skip the live tier. Run it locally too
+  when touching the engine or the examples. A `served: error code: 1033`
+  from a fresh tunnel is edge route propagation lag (more likely with
+  several tunnels minted at once) — rerun before suspecting the code.
+- **cloudflared registers prometheus collectors globally.** The Cloudflare
+  engine swaps `prometheus.DefaultRegisterer` to a noop (under a mutex) for
+  the construction window so host applications' metrics stay clean. Don't
+  "simplify" that away.
 - **Skip-release token must be line-anchored.** The regex in
   [`ci.yml`](./.github/workflows/ci.yml) (`resolve tag` step) is
   `^[[:space:]]*\[skip release\][[:space:]]*$`. Inline prose mentions are safe;
@@ -99,7 +138,8 @@ example is copy-pasteable on its own).
 
 Print a single recognizable line so the e2e harness can assert on it, then add
 a row to the `cases` table in `e2e/e2e_test.go` (name + expected substring) and
-to the README's example table.
+to the README's example table. Mark the case `live: true` if it mints a real
+tunnel — those only run under `LIBTUNNEL_E2E_LIVE=1`.
 
 ## Branch / PR flow
 
@@ -131,7 +171,7 @@ etc.
   changes, e2e tests (`e2e/e2e_test.go`) for example-visible changes.
 - **Keep the README in sync with the façade.** The README mirrors the public
   surface, so any change to it must update the README in the same PR:
-  - a new/changed/removed method on `Builder[T]` (or the `v1` surface) → update
+  - a new/changed/removed method on the `v1` interfaces or the façade → update
     the **API at a glance** block and the **Quick Start** snippet;
   - a new example → add a row to the **Examples** table;
   - a renamed package/version tier → update the **Layout** tree.
