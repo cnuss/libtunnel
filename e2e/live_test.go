@@ -30,9 +30,11 @@ import (
 )
 
 // TestLiveTunnel mints one tunnel and runs every scenario that doesn't need
-// its own tunnel lifecycle against it, in order: plain round trip, parallel
+// its own tunnel lifecycle against it, in order: round trip, parallel
 // requests, a websocket upgrade, and finally an origin bounce (which tears
-// the origin down, so it goes last).
+// the origin down, so it goes last). The listener is TLS (self-signed), so
+// the whole test also covers the https-ingress path — the plain-HTTP path
+// rides with the examples and the other live tests.
 func TestLiveTunnel(t *testing.T) {
 	gateLive(t)
 
@@ -44,7 +46,8 @@ func TestLiveTunnel(t *testing.T) {
 		}
 	}
 
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	tlsConfig := selfSignedTLS(t)
+	l, err := cryptotls.Listen("tcp", "127.0.0.1:0", tlsConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +67,10 @@ func TestLiveTunnel(t *testing.T) {
 
 	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 	go srv.Serve(conn.Listener())
+
+	if got := conn.LocalURL().Scheme; got != "https" {
+		t.Errorf("LocalURL scheme = %q, want https for a TLS listener", got)
+	}
 
 	waitReady(t, conn, 30*time.Second)
 	url := conn.URL().String()
@@ -138,7 +145,7 @@ func TestLiveTunnel(t *testing.T) {
 			t.Error("edge kept serving after the origin died")
 		}
 
-		l2, err := net.Listen("tcp", addr)
+		l2, err := cryptotls.Listen("tcp", addr, tlsConfig)
 		if err != nil {
 			t.Fatalf("rebind %s: %v", addr, err)
 		}
@@ -147,30 +154,6 @@ func TestLiveTunnel(t *testing.T) {
 
 		eventuallyBody(t, url, "after the bounce", 30*time.Second)
 	})
-}
-
-// TestLiveTLSOrigin covers the https-ingress path the plain-HTTP scenarios
-// don't: a TLS listener (self-signed) must be detected and dialed over https
-// by the engine. Needs its own tunnel — the listener type is fixed at
-// WithListener.
-func TestLiveTLSOrigin(t *testing.T) {
-	gateLive(t)
-
-	l, err := cryptotls.Listen("tcp", "127.0.0.1:0", selfSignedTLS(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-
-	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
-	serveBody(conn.Listener(), "hello over tls")
-
-	if got := conn.LocalURL().Scheme; got != "https" {
-		t.Errorf("LocalURL scheme = %q, want https for a TLS listener", got)
-	}
-
-	waitReady(t, conn, 30*time.Second)
-	eventuallyBody(t, conn.URL().String(), "hello over tls", 30*time.Second)
 }
 
 // TestLiveResurrection is the strongest form of the handoff promise: the
