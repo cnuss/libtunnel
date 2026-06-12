@@ -176,6 +176,9 @@ func (t *TunnelImpl[T]) Spec() T {
 		t.log.Info("fetching tunnel spec")
 		spec, err := provider.Spec(t.ctx)
 		if err != nil {
+			// Log synchronously: the async cancel watcher may lose the race
+			// against a caller that exits on the zero value.
+			t.log.Error("unable to fetch tunnel spec", "error", err)
 			t.cancel(fmt.Errorf("unable to fetch tunnel spec: %w", err))
 			return
 		}

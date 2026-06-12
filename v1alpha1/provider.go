@@ -30,8 +30,10 @@ func (p staticProvider[T]) Spec(context.Context) (T, error) {
 	return p.spec, nil
 }
 
-// Env wraps a provider with TUNNEL_SPEC adoption: when the environment
-// carries a spec, it wins; otherwise the wrapped provider resolves one. E is
+// Env wraps a provider with TUNNEL_SPEC handling: when the environment
+// carries a spec, it wins; otherwise the wrapped provider resolves one and
+// the result is exported back into this process's environment, so spawned
+// children inherit the same tunnel identity with no further plumbing. E is
 // the concrete spec struct (e.g. v1.CloudflareSpec) — inferred from the
 // wrapped provider's *E spec type.
 func Env[E any, T interface {
@@ -65,7 +67,16 @@ func (p envProvider[E, T]) Spec(ctx context.Context) (T, error) {
 	if ok {
 		return spec, nil
 	}
-	return p.next.Spec(ctx)
+
+	minted, err := p.next.Spec(ctx)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	// Export the freshly minted spec so children of this process inherit it.
+	// Best effort: a marshal/setenv failure shouldn't fail the tunnel.
+	_ = ExportSpec(minted)
+	return minted, nil
 }
 
 // SpecEnviron encodes spec as a "TUNNEL_SPEC=<json>" entry for a child

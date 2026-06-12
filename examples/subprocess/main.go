@@ -29,21 +29,16 @@ func main() {
 	parent()
 }
 
-// parent mints a spec (without ever connecting), hands it to a spawned child
-// through the environment, and requests the child's public URL once the
-// child reports the tunnel ready.
+// parent mints a spec (without ever connecting) and requests the child's
+// public URL once the child reports the tunnel ready. Minting exports the
+// spec into this process's environment (TUNNEL_SPEC), so the spawned child
+// inherits the tunnel identity with no plumbing at all.
 func parent() {
 	t := libtunnel.New(libtunnel.Cloudflare())
 	spec := t.Spec()
 	fmt.Printf("minted: %s\n", spec.Hostname)
 
-	entry, err := libtunnel.SpecEnviron(spec)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	cmd := exec.Command(os.Args[0], "child")
-	cmd.Env = append(os.Environ(), entry)
 	cmd.Stderr = os.Stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

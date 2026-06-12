@@ -4,9 +4,8 @@
 //
 // The package is split into these pieces:
 //
-//   - libtunnel (this package) — thin façade exposing New, the backend and
-//     provider constructors, and the spec↔environment handoff helpers. Stable
-//     surface for application code.
+//   - libtunnel (this package) — thin façade exposing New and the backend
+//     constructors. Stable surface for application code.
 //   - github.com/cnuss/libtunnel/v1 — the stable Tunnel/Connected/Provider/
 //     Backend interfaces and spec types. Application code that wants to
 //     declare types against the contract imports this.
@@ -51,23 +50,8 @@ func Cloudflare() v1.Backend[*v1.CloudflareSpec] {
 }
 
 // SpecEnv is the environment variable carrying a JSON-encoded spec across a
-// process boundary — the parent→child handoff channel.
+// process boundary — the parent→child handoff channel. There is nothing to
+// call: the Cloudflare credential chain adopts a spec found here at
+// construction, and exports a freshly minted one, so spawned children (or a
+// re-exec) inherit the same tunnel identity automatically.
 const SpecEnv = v1alpha1.SpecEnv
-
-// ExportSpec publishes spec into this process's own environment so re-exec'd
-// or spawned children inherit it and Env-wrapped providers adopt it.
-func ExportSpec[T v1.Spec](spec T) error {
-	return v1alpha1.ExportSpec(spec)
-}
-
-// SpecEnviron encodes spec as a "TUNNEL_SPEC=<json>" entry for a child
-// process's exec.Cmd.Env.
-func SpecEnviron[T v1.Spec](spec T) (string, error) {
-	return v1alpha1.SpecEnviron(spec)
-}
-
-// SpecFromEnv decodes TUNNEL_SPEC into the caller-allocated spec, reporting
-// whether the variable was present.
-func SpecFromEnv[T v1.Spec](spec T) (bool, error) {
-	return v1alpha1.SpecFromEnv(spec)
-}

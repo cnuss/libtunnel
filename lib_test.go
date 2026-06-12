@@ -7,6 +7,7 @@ package libtunnel_test
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/cnuss/libtunnel"
 	v1 "github.com/cnuss/libtunnel/v1"
+	"github.com/cnuss/libtunnel/v1alpha1"
 )
 
 // roleEnv selects a child role inside a re-exec'd test binary.
@@ -57,7 +59,7 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 		AccountTag: "tag",
 		Secret:     []byte("secret"),
 	}
-	entry, err := libtunnel.SpecEnviron(spec)
+	entry, err := v1alpha1.SpecEnviron(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,22 +80,24 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 	}
 }
 
-// TestExportSpecReExec covers the re-exec (daemonize) handoff path: the
-// parent publishes the spec into its own environment with ExportSpec — no
-// explicit exec.Cmd.Env entry — and a re-exec'd child inherits and adopts it.
-func TestExportSpecReExec(t *testing.T) {
+// TestReExecInheritsSpec covers the re-exec (daemonize) handoff path: the
+// spec sits in this process's own environment — no explicit exec.Cmd.Env
+// entry — and a re-exec'd child inherits and adopts it. (In a live parent
+// the Cloudflare chain puts it there automatically on mint.)
+func TestReExecInheritsSpec(t *testing.T) {
 	if role() == "reexec-child" {
 		reportSpec()
 		return
 	}
 
-	t.Setenv(libtunnel.SpecEnv, "") // register restore before mutating the env
 	spec := &v1.CloudflareSpec{Hostname: "reexec.trycloudflare.com"}
-	if err := libtunnel.ExportSpec(spec); err != nil {
+	entry, err := v1alpha1.SpecEnviron(spec)
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv(libtunnel.SpecEnv, strings.TrimPrefix(entry, libtunnel.SpecEnv+"="))
 
-	out, err := reexec("TestExportSpecReExec", roleEnv+"=reexec-child").CombinedOutput()
+	out, err := reexec("TestReExecInheritsSpec", roleEnv+"=reexec-child").CombinedOutput()
 	t.Logf("child output:\n%s", out)
 	if err != nil {
 		t.Fatalf("child failed: %v", err)
@@ -125,7 +129,7 @@ func TestHandoffChain(t *testing.T) {
 	}
 
 	spec := &v1.CloudflareSpec{Hostname: "chain.trycloudflare.com"}
-	entry, err := libtunnel.SpecEnviron(spec)
+	entry, err := v1alpha1.SpecEnviron(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,21 +150,17 @@ func TestHandoffChain(t *testing.T) {
 }
 
 // TestMalformedSpecEnv pins the failure path: a child handed a corrupt
-// TUNNEL_SPEC must fail loudly — SpecFromEnv errors, and the tunnel built on
-// the same environment resolves to nothing.
+// TUNNEL_SPEC must fail loudly — the tunnel resolves to nothing and the
+// cancellation cause names the parse failure on the child's logger.
 func TestMalformedSpecEnv(t *testing.T) {
 	if role() == "malformed-child" {
-		spec := &v1.CloudflareSpec{}
-		ok, err := libtunnel.SpecFromEnv(spec)
-		fmt.Printf("specfromenv ok=%t err=%v\n", ok, err)
-
-		tun := libtunnel.New(libtunnel.Cloudflare())
+		logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+		tun := libtunnel.New(libtunnel.Cloudflare()).WithLogger(logger)
 		fmt.Printf("hostname=%q\n", tun.Hostname())
-
-		if err == nil {
-			os.Exit(0) // unexpected: parent will flag the zero exit
+		if tun.Hostname() == "" {
+			os.Exit(3)
 		}
-		os.Exit(3)
+		os.Exit(0) // unexpected: parent will flag the zero exit
 	}
 
 	cmd := reexec("TestMalformedSpecEnv", roleEnv+"=malformed-child", libtunnel.SpecEnv+"={this is not json")
@@ -170,7 +170,7 @@ func TestMalformedSpecEnv(t *testing.T) {
 		t.Fatal("child exited 0 with a corrupt TUNNEL_SPEC; want a loud failure")
 	}
 	if want := "unable to parse TUNNEL_SPEC"; !strings.Contains(string(out), want) {
-		t.Errorf("child output does not contain %q", want)
+		t.Errorf("child output does not contain %q (the cancellation cause)", want)
 	}
 	if want := `hostname=""`; !strings.Contains(string(out), want) {
 		t.Errorf("child output does not contain %q — a corrupt spec must not resolve a hostname", want)
@@ -187,7 +187,7 @@ func TestSpecHostnameWithPort(t *testing.T) {
 	}
 
 	spec := &v1.CloudflareSpec{Hostname: "scenario.trycloudflare.com:8443"}
-	entry, err := libtunnel.SpecEnviron(spec)
+	entry, err := v1alpha1.SpecEnviron(spec)
 	if err != nil {
 		t.Fatal(err)
 	}

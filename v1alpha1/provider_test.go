@@ -173,3 +173,20 @@ func (e loggerEngine) CACerts() []*x509.Certificate              { return nil }
 func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*v1.CloudflareSpec], l net.Listener) error {
 	return nil
 }
+
+func TestEnvProviderExportsMintedSpec(t *testing.T) {
+	t.Setenv(v1alpha1.SpecEnv, "")
+
+	next := &trackingProvider{spec: &v1.CloudflareSpec{Hostname: "minted.trycloudflare.com"}}
+	if _, err := v1alpha1.Env[v1.CloudflareSpec](next).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	adopted := &v1.CloudflareSpec{}
+	if ok, err := v1alpha1.SpecFromEnv(adopted); err != nil || !ok {
+		t.Fatalf("SpecFromEnv = (%t, %v) after a mint; want the spec exported", ok, err)
+	}
+	if adopted.Hostname != "minted.trycloudflare.com" {
+		t.Errorf("exported Hostname = %q, want the minted spec", adopted.Hostname)
+	}
+}

@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 
 	"github.com/cnuss/libtunnel"
-	v1 "github.com/cnuss/libtunnel/v1"
 )
 
 // The full lifecycle: bind a listener, hand it to the tunnel (which lazily
@@ -28,31 +28,24 @@ func Example() {
 	fmt.Println(conn.URL()) // https://<something>.trycloudflare.com/
 }
 
-// A spec round-trips through the environment: the parent exports it, the
-// child adopts it. This is the TUNNEL_SPEC parent→child handoff.
+// TUNNEL_SPEC is the parent→child handoff channel: a parent process that
+// mints a tunnel exports its spec there automatically, and a child's
+// Cloudflare credential chain adopts it at construction — no API to call.
+// Here the environment is populated by hand to stand in for the parent.
 func Example_handoff() {
-	parent := &v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}
-	if err := libtunnel.ExportSpec(parent); err != nil {
-		panic(err)
-	}
+	os.Setenv(libtunnel.SpecEnv, `{"hostname":"demo.trycloudflare.com"}`)
+	defer os.Unsetenv(libtunnel.SpecEnv)
 
-	child := &v1.CloudflareSpec{}
-	ok, err := libtunnel.SpecFromEnv(child)
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Printf("adopted=%t hostname=%s\n", ok, child.Hostname)
-	// Output: adopted=true hostname=demo.trycloudflare.com
+	t := libtunnel.New(libtunnel.Cloudflare())
+	fmt.Println(t.Hostname())
+	// Output: demo.trycloudflare.com
 }
 
 // Getters resolve lazily from the backend's credential chain — here a spec
 // adopted from the environment, so nothing touches the network.
 func Example_lazy() {
-	spec := &v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}
-	if err := libtunnel.ExportSpec(spec); err != nil {
-		panic(err)
-	}
+	os.Setenv(libtunnel.SpecEnv, `{"hostname":"demo.trycloudflare.com"}`)
+	defer os.Unsetenv(libtunnel.SpecEnv)
 
 	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Printf("%s . %s : %d\n", t.Host(), t.Domain(), t.Port())

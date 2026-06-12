@@ -26,6 +26,7 @@ import (
 	"golang.org/x/net/websocket"
 
 	"github.com/cnuss/libtunnel"
+	"github.com/cnuss/libtunnel/v1alpha1"
 )
 
 // TestLiveTunnel mints one tunnel and runs every scenario that doesn't need
@@ -38,7 +39,7 @@ func TestLiveTunnel(t *testing.T) {
 	// Reuse the preflight mint: hand its spec to this tunnel through the
 	// environment (the Cloudflare chain adopts TUNNEL_SPEC before minting).
 	if preflightSpec != nil {
-		if entry, err := libtunnel.SpecEnviron(preflightSpec); err == nil {
+		if entry, err := v1alpha1.SpecEnviron(preflightSpec); err == nil {
 			t.Setenv(libtunnel.SpecEnv, strings.TrimPrefix(entry, libtunnel.SpecEnv+"="))
 		}
 	}
@@ -183,20 +184,18 @@ func TestLiveResurrection(t *testing.T) {
 	}
 	gateLive(t)
 
+	// Minting exports the spec into this process's environment, so the
+	// spawned children inherit the tunnel identity with no plumbing.
 	spec := libtunnel.New(libtunnel.Cloudflare()).Spec()
 	if spec == nil || spec.Hostname == "" {
 		t.Fatal("failed to mint a spec")
 	}
 	t.Logf("minted: %s", spec.Hostname)
-	entry, err := libtunnel.SpecEnviron(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
 	url := "https://" + spec.Hostname + "/"
 
 	spawn := func(body string) (kill func()) {
 		t.Helper()
-		cmd := reexec("TestLiveResurrection", roleEnv+"=live-serve-child", "LIBTUNNEL_E2E_BODY="+body, entry)
+		cmd := reexec("TestLiveResurrection", roleEnv+"=live-serve-child", "LIBTUNNEL_E2E_BODY="+body)
 		cmd.Stderr = os.Stderr
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {

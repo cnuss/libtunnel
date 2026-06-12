@@ -120,25 +120,23 @@ func Cloudflare() v1.Backend[*v1.CloudflareSpec] // in-process cloudflared engin
                                                  // adopts TUNNEL_SPEC, else mints
                                                  // an anonymous quick tunnel
 
-// parent→child handoff
+// parent→child handoff — no API: minting exports TUNNEL_SPEC, construction
+// adopts it
 const SpecEnv = "TUNNEL_SPEC"
-func ExportSpec[T v1.Spec](spec T) error            // os.Setenv for re-exec
-func SpecEnviron[T v1.Spec](spec T) (string, error) // entry for exec.Cmd.Env
-func SpecFromEnv[T v1.Spec](spec T) (bool, error)   // child-side read
 ```
 
 ## Parent→child handoff
 
-`TUNNEL_SPEC` is a first-class handoff channel: a parent process mints a
-tunnel spec, a child process receives it through the environment, provides
-the listener, and the tunnel connects under the same hostname — no second
-quick-tunnel resolution.
+`TUNNEL_SPEC` is a first-class handoff channel with nothing to call: when
+the Cloudflare credential chain mints a spec it exports it into the
+process's environment, and at construction it adopts one found there. A
+spawned child (or a re-exec) therefore connects under the same hostname —
+no second quick-tunnel resolution, no plumbing.
 
 ```go
-// parent: mint and hand off (never connects itself)
-spec := libtunnel.New(libtunnel.Cloudflare()).Spec()
-entry, _ := libtunnel.SpecEnviron(spec)
-cmd.Env = append(os.Environ(), entry)
+// parent: minting exports TUNNEL_SPEC as a side effect (never connects itself)
+libtunnel.New(libtunnel.Cloudflare()).Spec()
+cmd := exec.Command(os.Args[0], "child") // inherits the environment
 
 // child: the Cloudflare credential chain finds TUNNEL_SPEC and adopts it
 conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
