@@ -31,46 +31,23 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
-// New returns an unstarted tunnel on the given backend, drawing credentials
-// from the given provider. T is the backend's spec type and is inferred:
+// New returns an unstarted tunnel on the given backend, which also supplies
+// the credential chain. T is the backend's spec type and is inferred:
 //
-//	libtunnel.New(libtunnel.Cloudflare(), libtunnel.QuickTunnel())
+//	libtunnel.New(libtunnel.Cloudflare())
 //
 // Configure the result with With* methods; WithListener starts the
 // connection.
-func New[T v1.Spec](backend v1.Backend[T], provider v1.Provider[T]) v1.Tunnel[T] {
-	return v1alpha1.New(backend, provider)
+func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel[T] {
+	return v1alpha1.New(backend)
 }
 
 // Cloudflare returns the Cloudflare backend: an in-process cloudflared
-// quick-tunnel engine (no cloudflared binary required).
+// quick-tunnel engine (no cloudflared binary required). Its credential chain
+// adopts TUNNEL_SPEC from the environment when a parent process handed one
+// off, and mints an anonymous *.trycloudflare.com quick tunnel otherwise.
 func Cloudflare() v1.Backend[*v1.CloudflareSpec] {
 	return cloudflare.New()
-}
-
-// QuickTunnel returns a provider that mints an anonymous *.trycloudflare.com
-// tunnel, retrying with linear backoff until its context is done. Set Log on
-// the returned provider to surface retry warnings.
-func QuickTunnel() *cloudflare.QuickTunnelProvider {
-	return cloudflare.QuickTunnel()
-}
-
-// Env wraps a provider with TUNNEL_SPEC adoption: when the environment
-// carries a spec (a parent process exported one), it wins; otherwise the
-// wrapped provider resolves a fresh one. This is the child side of the
-// parent→child handoff:
-//
-//	libtunnel.New(libtunnel.Cloudflare(), libtunnel.Env(libtunnel.QuickTunnel()))
-func Env[E any, T interface {
-	*E
-	v1.Spec
-}](next v1.Provider[T]) v1.Provider[T] {
-	return v1alpha1.Env(next)
-}
-
-// Static returns a provider that yields the given spec verbatim.
-func Static[T v1.Spec](spec T) v1.Provider[T] {
-	return v1alpha1.Static(spec)
 }
 
 // SpecEnv is the environment variable carrying a JSON-encoded spec across a

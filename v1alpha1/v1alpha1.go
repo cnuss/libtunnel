@@ -35,14 +35,14 @@ type Engine[T v1.Spec] interface {
 	WithListener(t *TunnelImpl[T], l net.Listener) error
 }
 
-// New returns an unstarted tunnel for the given backend and provider. The
-// root libtunnel.New façade wraps this and returns the v1.Tunnel[T]
-// interface.
+// New returns an unstarted tunnel for the given backend, which also supplies
+// the credential provider. The root libtunnel.New façade wraps this and
+// returns the v1.Tunnel[T] interface.
 //
 // The backend must implement this package's Engine contract (backends from
 // façade constructors such as libtunnel.Cloudflare() do); a foreign Backend
 // cancels the tunnel on first use.
-func New[T v1.Spec](backend v1.Backend[T], provider v1.Provider[T]) *TunnelImpl[T] {
+func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	ctx, cancel := context.WithCancelCause(context.Background())
 
 	t := &TunnelImpl[T]{
@@ -50,7 +50,6 @@ func New[T v1.Spec](backend v1.Backend[T], provider v1.Provider[T]) *TunnelImpl[
 		cancel:           cancel,
 		log:              slog.New(slog.DiscardHandler),
 		backend:          backend,
-		provider:         provider,
 		listenerProvided: make(chan struct{}),
 		tunnelReady:      make(chan struct{}),
 		hostnameReady:    make(chan struct{}),
@@ -76,9 +75,8 @@ type TunnelImpl[T v1.Spec] struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	log      *slog.Logger
-	backend  v1.Backend[T]
-	provider v1.Provider[T]
+	log     *slog.Logger
+	backend v1.Backend[T]
 
 	listenerOnce     sync.Once
 	listener         net.Listener

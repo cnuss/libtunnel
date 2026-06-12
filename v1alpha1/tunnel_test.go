@@ -15,15 +15,17 @@ import (
 // fakeEngine satisfies the Engine contract without dialing anything: it
 // records the listener it was handed and reports success immediately.
 type fakeEngine struct {
-	got chan net.Listener
+	got  chan net.Listener
+	spec *v1.CloudflareSpec
 }
 
-func newFakeEngine() *fakeEngine {
-	return &fakeEngine{got: make(chan net.Listener, 1)}
+func newFakeEngine(spec *v1.CloudflareSpec) *fakeEngine {
+	return &fakeEngine{got: make(chan net.Listener, 1), spec: spec}
 }
 
-func (e *fakeEngine) Name() string                 { return "fake" }
-func (e *fakeEngine) CACerts() []*x509.Certificate { return []*x509.Certificate{} }
+func (e *fakeEngine) Name() string                              { return "fake" }
+func (e *fakeEngine) Provider() v1.Provider[*v1.CloudflareSpec] { return Static(e.spec) }
+func (e *fakeEngine) CACerts() []*x509.Certificate              { return []*x509.Certificate{} }
 func (e *fakeEngine) WithListener(t *TunnelImpl[*v1.CloudflareSpec], l net.Listener) error {
 	e.got <- l
 	return nil
@@ -32,7 +34,8 @@ func (e *fakeEngine) WithListener(t *TunnelImpl[*v1.CloudflareSpec], l net.Liste
 // foreignBackend implements v1.Backend but not Engine.
 type foreignBackend struct{}
 
-func (foreignBackend) Name() string { return "foreign" }
+func (foreignBackend) Name() string                              { return "foreign" }
+func (foreignBackend) Provider() v1.Provider[*v1.CloudflareSpec] { return Static(&v1.CloudflareSpec{}) }
 
 func listen(t *testing.T) net.Listener {
 	t.Helper()
@@ -46,7 +49,7 @@ func listen(t *testing.T) net.Listener {
 
 func TestLocalGettersDeriveFromListener(t *testing.T) {
 	l := listen(t)
-	tun := New(newFakeEngine(), Static(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
+	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
 	conn := tun.WithListener(l)
 
 	addr := l.Addr().(*net.TCPAddr)
@@ -66,7 +69,7 @@ func TestLocalGettersDeriveFromListener(t *testing.T) {
 }
 
 func TestLocalGettersBlockUntilListener(t *testing.T) {
-	tun := New(newFakeEngine(), Static(&v1.CloudflareSpec{}))
+	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{}))
 
 	port := make(chan int, 1)
 	go func() { port <- tun.LocalPort() }()
@@ -97,7 +100,7 @@ func TestUnspecifiedBindFallsBackToOutboundRouteIP(t *testing.T) {
 	}
 	defer l.Close()
 
-	tun := New(newFakeEngine(), Static(&v1.CloudflareSpec{}))
+	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{}))
 	conn := tun.WithListener(l)
 
 	ip := conn.LocalIP()
@@ -110,7 +113,7 @@ func TestUnspecifiedBindFallsBackToOutboundRouteIP(t *testing.T) {
 }
 
 func TestSpecGettersDeriveFromProvider(t *testing.T) {
-	tun := New(newFakeEngine(), Static(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
+	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
 
 	if got := tun.Hostname(); got != "demo.trycloudflare.com" {
 		t.Errorf("Hostname() = %q", got)
@@ -127,9 +130,9 @@ func TestSpecGettersDeriveFromProvider(t *testing.T) {
 }
 
 func TestEngineReceivesListener(t *testing.T) {
-	engine := newFakeEngine()
+	engine := newFakeEngine(&v1.CloudflareSpec{})
 	l := listen(t)
-	New(engine, Static(&v1.CloudflareSpec{})).WithListener(l)
+	New[*v1.CloudflareSpec](engine).WithListener(l)
 
 	select {
 	case got := <-engine.got:
@@ -142,7 +145,7 @@ func TestEngineReceivesListener(t *testing.T) {
 }
 
 func TestTunnelReadyAfterEngineConnects(t *testing.T) {
-	tun := New(newFakeEngine(), Static(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
+	tun := New[*v1.CloudflareSpec](newFakeEngine(&v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}))
 	// Pre-resolve hostname readiness so the test doesn't poll real DNS for a
 	// fabricated hostname.
 	tun.hostnameReadyOnce.Do(func() { close(tun.hostnameReady) })
@@ -157,7 +160,7 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 }
 
 func TestForeignBackendCancels(t *testing.T) {
-	tun := New(foreignBackend{}, Static(&v1.CloudflareSpec{}))
+	tun := New[*v1.CloudflareSpec](foreignBackend{})
 	tun.WithListener(listen(t))
 
 	select {

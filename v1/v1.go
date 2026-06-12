@@ -34,14 +34,19 @@ type Provider[T Spec] interface {
 	Spec(ctx context.Context) (T, error)
 }
 
-// Backend selects the tunnel transport engine and fixes the spec type T.
-// Backends are opaque: obtain one from a façade constructor
-// (libtunnel.Cloudflare()). The engine contract beyond Name is alpha-internal
-// — v1alpha1 type-asserts for its real interface — so custom Backend
-// implementations outside this module are not supported.
+// Backend selects the tunnel transport engine, fixes the spec type T, and
+// supplies the credential chain specs are drawn from. Backends are opaque:
+// obtain one from a façade constructor (libtunnel.Cloudflare()). The engine
+// contract beyond these methods is alpha-internal — v1alpha1 type-asserts for
+// its real interface — so custom Backend implementations outside this module
+// are not supported.
 type Backend[T Spec] interface {
 	// Name identifies the backend (e.g. "cloudflare").
 	Name() string
+	// Provider is the credential chain this backend draws specs from. For
+	// Cloudflare: adopt TUNNEL_SPEC from the environment when present,
+	// otherwise mint an anonymous quick tunnel.
+	Provider() Provider[T]
 }
 
 // Connected is the post-WithListener phase of a tunnel: the edge connection
@@ -60,8 +65,9 @@ type Connected[T Spec] interface {
 	LocalPort() int
 	// LocalHost is the machine's hostname, truncated at the first dot.
 	LocalHost() string
-	// LocalURL is https://<LocalIP>:<LocalPort>/. Blocks until a listener is
-	// provided.
+	// LocalURL is <scheme>://<LocalIP>:<LocalPort>/, where the scheme follows
+	// the listener (https when it terminates TLS, http otherwise). Blocks
+	// until a listener is provided.
 	LocalURL() *url.URL
 	// Listener returns the listener provided via WithListener, blocking until
 	// one arrives.

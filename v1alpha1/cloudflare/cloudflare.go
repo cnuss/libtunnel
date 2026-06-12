@@ -59,6 +59,14 @@ func (b *Backend) Name() string {
 	return "cloudflare"
 }
 
+// Provider is the Cloudflare credential chain: adopt TUNNEL_SPEC from the
+// environment when a parent process handed one off, otherwise mint an
+// anonymous quick tunnel from api.trycloudflare.com. Mutators for named
+// tunnels / other endpoints will hang off Cloudflare() when they exist.
+func (b *Backend) Provider() v1.Provider[*v1.CloudflareSpec] {
+	return v1alpha1.Env(QuickTunnel())
+}
+
 // CACerts returns the Mozilla CA bundle plus the Cloudflare origin roots —
 // the trust set cloudflared uses for its edge TLS connections.
 func (b *Backend) CACerts() []*x509.Certificate {

@@ -33,7 +33,7 @@ func main() {
 // through the environment, and requests the child's public URL once the
 // child reports the tunnel ready.
 func parent() {
-	t := libtunnel.New(libtunnel.Cloudflare(), libtunnel.QuickTunnel())
+	t := libtunnel.New(libtunnel.Cloudflare())
 	spec := t.Spec()
 	fmt.Printf("minted: %s\n", spec.Hostname)
 
@@ -84,16 +84,16 @@ func parent() {
 	fmt.Printf("handoff: %s\n", body)
 }
 
-// child adopts the spec from the environment (the Env provider finds
-// TUNNEL_SPEC, so the QuickTunnel fallback is never consulted), provides the
-// listener, and serves until the parent kills it.
+// child adopts the spec from the environment (the Cloudflare credential
+// chain finds TUNNEL_SPEC before minting anything), provides the listener,
+// and serves until the parent kills it.
 func child() {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	conn := libtunnel.New(libtunnel.Cloudflare(), libtunnel.Env(libtunnel.QuickTunnel())).WithListener(l)
+	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 
 	go func() {
 		err := http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

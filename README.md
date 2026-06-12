@@ -36,7 +36,7 @@ import (
 func main() {
 	l, _ := net.Listen("tcp", "127.0.0.1:0") // you own the bind
 
-	conn := libtunnel.New(libtunnel.Cloudflare(), libtunnel.QuickTunnel()).
+	conn := libtunnel.New(libtunnel.Cloudflare()).
 		WithListener(l) // lazily starts the edge connection
 
 	go http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -108,15 +108,17 @@ type Connected[T Spec] interface {
 }
 
 type Provider[T Spec] interface { Spec(ctx context.Context) (T, error) }
-type Backend[T Spec] interface { Name() string } // opaque; engines are alpha-internal
+type Backend[T Spec] interface { // opaque; the engine contract is alpha-internal
+    Name() string
+    Provider() Provider[T] // the backend's credential chain
+}
 type Spec interface { GetHostname() string }
 
 // façade
-func New[T v1.Spec](backend v1.Backend[T], provider v1.Provider[T]) v1.Tunnel[T]
-func Cloudflare() v1.Backend[*v1.CloudflareSpec] // in-process cloudflared engine
-func QuickTunnel() *cloudflare.QuickTunnelProvider // mints *.trycloudflare.com
-func Env[...](next v1.Provider[T]) v1.Provider[T] // adopt TUNNEL_SPEC, else next
-func Static[T v1.Spec](spec T) v1.Provider[T]     // replay known credentials
+func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel[T]
+func Cloudflare() v1.Backend[*v1.CloudflareSpec] // in-process cloudflared engine;
+                                                 // adopts TUNNEL_SPEC, else mints
+                                                 // an anonymous quick tunnel
 
 // parent→child handoff
 const SpecEnv = "TUNNEL_SPEC"
@@ -134,13 +136,12 @@ quick-tunnel resolution.
 
 ```go
 // parent: mint and hand off (never connects itself)
-spec := libtunnel.New(libtunnel.Cloudflare(), libtunnel.QuickTunnel()).Spec()
+spec := libtunnel.New(libtunnel.Cloudflare()).Spec()
 entry, _ := libtunnel.SpecEnviron(spec)
 cmd.Env = append(os.Environ(), entry)
 
-// child: adopt and connect
-conn := libtunnel.New(libtunnel.Cloudflare(), libtunnel.Env(libtunnel.QuickTunnel())).
-	WithListener(l)
+// child: the Cloudflare credential chain finds TUNNEL_SPEC and adopts it
+conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 ```
 
 (Full source: [`examples/handoff/main.go`](./examples/handoff/main.go).)
@@ -151,7 +152,7 @@ Self-contained programs in [`./examples`](./examples):
 
 | Example   | Demonstrates                                                       |
 | --------- | ------------------------------------------------------------------ |
-| `serve`   | Real quick tunnel: serve HTTPS locally, request the public URL.     |
+| `serve`   | Real quick tunnel: serve locally, request the public URL.           |
 | `handoff` | Parent mints a spec; child adopts it via `TUNNEL_SPEC` and serves.  |
 
 Run one locally:

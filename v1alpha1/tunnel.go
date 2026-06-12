@@ -160,17 +160,12 @@ func (t *TunnelImpl[T]) LocalURL() *url.URL {
 	return t.localURL
 }
 
-// Spec returns the resolved tunnel spec, fetching it from the configured
-// provider (or the backend's default chain) on first use.
+// Spec returns the resolved tunnel spec, fetching it from the backend's
+// provider chain on first use.
 func (t *TunnelImpl[T]) Spec() T {
 	t.specOnce.Do(func() {
-		if t.provider == nil {
-			t.cancel(fmt.Errorf("no provider configured"))
-			return
-		}
-
 		t.log.Info("fetching tunnel spec")
-		spec, err := t.provider.Spec(t.ctx)
+		spec, err := t.backend.Provider().Spec(t.ctx)
 		if err != nil {
 			t.cancel(fmt.Errorf("unable to fetch tunnel spec: %w", err))
 			return

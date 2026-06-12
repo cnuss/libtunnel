@@ -18,7 +18,7 @@ import (
 // publicly reachable. Not run as a test — it mints a real quick tunnel.
 func Example() {
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
-	conn := libtunnel.New(libtunnel.Cloudflare(), libtunnel.QuickTunnel()).WithListener(l)
+	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 
 	go http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "hello")
@@ -46,15 +46,15 @@ func Example_handoff() {
 	// Output: adopted=true hostname=demo.trycloudflare.com
 }
 
-// Getters resolve lazily from the provider — here a spec adopted from the
-// environment, so nothing touches the network.
+// Getters resolve lazily from the backend's credential chain — here a spec
+// adopted from the environment, so nothing touches the network.
 func Example_lazy() {
 	spec := &v1.CloudflareSpec{Hostname: "demo.trycloudflare.com"}
 	if err := libtunnel.ExportSpec(spec); err != nil {
 		panic(err)
 	}
 
-	t := libtunnel.New(libtunnel.Cloudflare(), libtunnel.Env(libtunnel.QuickTunnel()))
+	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Printf("%s . %s : %d\n", t.Host(), t.Domain(), t.Port())
 	// Output: demo . trycloudflare.com : 443
 }

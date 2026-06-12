@@ -25,7 +25,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	conn := libtunnel.New(libtunnel.Cloudflare(), libtunnel.QuickTunnel()).WithListener(l)
+	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 
 	go func() {
 		err := http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

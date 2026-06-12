@@ -62,11 +62,11 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 	}
 }
 
-// handoffChild is the child role: build a tunnel whose Env provider adopts
-// TUNNEL_SPEC, then report the identity it resolved. The QuickTunnel fallback
-// is never consulted, so nothing dials out.
+// handoffChild is the child role: build a tunnel whose credential chain
+// adopts TUNNEL_SPEC, then report the identity it resolved. The quick-tunnel
+// fallback is never consulted, so nothing dials out.
 func handoffChild() {
-	tun := libtunnel.New(libtunnel.Cloudflare(), libtunnel.Env(libtunnel.QuickTunnel()))
+	tun := libtunnel.New(libtunnel.Cloudflare())
 
 	fmt.Printf("child hostname: %s\n", tun.Hostname())
 	fmt.Printf("child host=%s domain=%s port=%d\n", tun.Host(), tun.Domain(), tun.Port())

@@ -109,7 +109,9 @@ Easy to get wrong from the diff alone:
   `api.trycloudflare.com`, which rate-limits — 12 CI matrix cells minting
   concurrently would trip 429s. The e2e harness skips them unless
   `LIBTUNNEL_E2E_LIVE=1`; run that once locally when touching the engine or
-  the examples.
+  the examples. A `served: error code: 1033` from a fresh tunnel is edge
+  route propagation lag (more likely with several tunnels minted at once) —
+  rerun the case before suspecting the code.
 - **cloudflared registers prometheus collectors globally.** The Cloudflare
   engine swaps `prometheus.DefaultRegisterer` to a noop (under a mutex) for
   the construction window so host applications' metrics stay clean. Don't
