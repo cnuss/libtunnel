@@ -65,7 +65,7 @@ func TestLiveTunnel(t *testing.T) {
 	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 	go srv.Serve(conn.Listener())
 
-	waitReady(t, conn.TunnelReady(), 30*time.Second)
+	waitReady(t, conn, 30*time.Second)
 	url := conn.URL().String()
 
 	t.Run("RoundTrip", func(t *testing.T) {
@@ -169,7 +169,7 @@ func TestLiveTLSOrigin(t *testing.T) {
 		t.Errorf("LocalURL scheme = %q, want https for a TLS listener", got)
 	}
 
-	waitReady(t, conn.TunnelReady(), 30*time.Second)
+	waitReady(t, conn, 30*time.Second)
 	eventuallyBody(t, conn.URL().String(), "hello over tls", 30*time.Second)
 }
 
@@ -238,6 +238,9 @@ func liveServeChild() {
 	serveBody(conn.Listener(), os.Getenv("LIBTUNNEL_E2E_BODY"))
 	select {
 	case <-conn.TunnelReady():
+	case <-conn.Done():
+		fmt.Printf("tunnel failed: %v\n", conn.Err())
+		os.Exit(3)
 	case <-time.After(30 * time.Second):
 		fmt.Println("tunnel never became ready")
 		os.Exit(3)
@@ -283,6 +286,9 @@ func TestLiveTwoTunnels(t *testing.T) {
 
 			select {
 			case <-conn.TunnelReady():
+			case <-conn.Done():
+				errs <- fmt.Errorf("%s: tunnel failed: %w", body, conn.Err())
+				return
 			case <-time.After(30 * time.Second):
 				errs <- fmt.Errorf("%s: tunnel not ready after 30s", body)
 				return

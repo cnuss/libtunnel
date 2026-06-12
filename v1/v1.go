@@ -92,8 +92,15 @@ type Connected[T Spec] interface {
 	Spec() T
 
 	// TunnelReady is closed when the edge connection is up and the hostname
-	// resolves publicly — the tunnel is reachable end to end.
+	// resolves publicly — the tunnel is reachable end to end. It is never
+	// closed on failure: select on Done alongside it.
 	TunnelReady() <-chan struct{}
+	// Done is closed when the tunnel fails or shuts down. Waits on
+	// TunnelReady/HostnameReady should select on Done too, or a failed
+	// tunnel blocks them forever.
+	Done() <-chan struct{}
+	// Err reports why the tunnel ended (nil while it is alive).
+	Err() error
 	// HostnameReady is closed when the hostname resolves on the zone's
 	// authoritative nameservers — polled directly, so recursive resolvers'
 	// negative caches never delay readiness.

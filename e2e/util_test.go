@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
@@ -92,13 +93,14 @@ func paceLive() {
 	lastLiveStart = time.Now()
 }
 
-// waitReady waits for TunnelReady with a deadline. A tunnel that fails
-// internally (rate-limited mint, dead supervisor) never closes TunnelReady,
-// so an unbounded wait would hang the whole suite.
-func waitReady(t *testing.T, ready <-chan struct{}, d time.Duration) {
+// waitReady waits for TunnelReady with a deadline, failing fast when the
+// tunnel dies first (Done) or never readies within d.
+func waitReady(t *testing.T, conn v1.Connected[*cloudflare.Spec], d time.Duration) {
 	t.Helper()
 	select {
-	case <-ready:
+	case <-conn.TunnelReady():
+	case <-conn.Done():
+		t.Fatalf("tunnel failed: %v", conn.Err())
 	case <-time.After(d):
 		t.Fatalf("tunnel not ready after %v (rate-limited mint or dead connection?)", d)
 	}

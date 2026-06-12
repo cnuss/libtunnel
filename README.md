@@ -27,6 +27,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 
@@ -43,8 +44,12 @@ func main() {
 		fmt.Fprint(w, "hello from libtunnel")
 	}))
 
-	<-conn.TunnelReady()
-	fmt.Println(conn.URL()) // https://<something>.trycloudflare.com/
+	select {
+	case <-conn.TunnelReady():
+		fmt.Println(conn.URL()) // https://<something>.trycloudflare.com/
+	case <-conn.Done():
+		log.Fatal(conn.Err())
+	}
 }
 ```
 
@@ -104,6 +109,8 @@ type Connected[T Spec] interface {
 
     TunnelReady() <-chan struct{}   // connection up + hostname resolves
     HostnameReady() <-chan struct{} // hostname resolves on authoritative NS
+    Done() <-chan struct{}          // tunnel failed or shut down
+    Err() error                     // why (nil while alive)
 }
 
 type Provider[T Spec] interface { Spec(ctx context.Context) (T, error) }

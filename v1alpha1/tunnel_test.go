@@ -175,13 +175,59 @@ func TestForeignBackendCancels(t *testing.T) {
 	tun.WithListener(listen(t))
 
 	select {
-	case <-tun.Context().Done():
-		if cause := context.Cause(tun.Context()); cause == nil {
-			t.Error("context canceled without a cause")
+	case <-tun.Done():
+		if tun.Err() == nil {
+			t.Error("Done closed but Err() is nil")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("foreign backend did not cancel the tunnel")
 	}
+}
+
+// TestDoneSurfacesSpecFailure pins the deadlock fix: a tunnel whose spec can
+// never resolve must report through Done/Err — callers select on Done next
+// to TunnelReady instead of blocking forever.
+func TestDoneSurfacesSpecFailure(t *testing.T) {
+	tun := v1alpha1.New[*cloudflare.Spec](failingEngine{})
+
+	if err := tun.Err(); err != nil {
+		t.Fatalf("Err() = %v before any failure, want nil", err)
+	}
+
+	tun.Hostname() // forces the spec fetch, which fails
+
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "boom") {
+			t.Errorf("Err() = %v, want the provider failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed after the spec fetch failed")
+	}
+
+	select {
+	case <-tun.TunnelReady():
+		t.Error("TunnelReady closed on a failed tunnel")
+	default:
+	}
+}
+
+// failingEngine's provider always errors.
+type failingEngine struct{}
+
+func (failingEngine) Name() string { return "failing" }
+func (failingEngine) Provider() v1.Provider[*cloudflare.Spec] {
+	return failingProvider{}
+}
+func (failingEngine) CACerts() []*x509.Certificate { return nil }
+func (failingEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
+	return nil
+}
+
+type failingProvider struct{}
+
+func (failingProvider) Spec(context.Context) (*cloudflare.Spec, error) {
+	return nil, errors.New("boom")
 }
 
 // FuzzHostnameParsing checks the Host/Domain/Port derivation invariants over

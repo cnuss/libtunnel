@@ -97,7 +97,11 @@ func child() {
 		log.Fatal(err)
 	}()
 
-	<-conn.TunnelReady()
+	select {
+	case <-conn.TunnelReady():
+	case <-conn.Done():
+		log.Fatal(conn.Err())
+	}
 	fmt.Printf("ready: %s\n", conn.URL())
 
 	select {} // serve until the parent kills us

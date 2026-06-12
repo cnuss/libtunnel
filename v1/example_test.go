@@ -24,8 +24,12 @@ func Example() {
 		fmt.Fprint(w, "hello")
 	}))
 
-	<-conn.TunnelReady()
-	fmt.Println(conn.URL()) // https://<something>.trycloudflare.com/
+	select {
+	case <-conn.TunnelReady():
+		fmt.Println(conn.URL()) // https://<something>.trycloudflare.com/
+	case <-conn.Done():
+		fmt.Println(conn.Err())
+	}
 }
 
 // TUNNEL_SPEC is the parent→child handoff channel: a parent process that

@@ -113,6 +113,16 @@ func (t *TunnelImpl[T]) Context() context.Context {
 	return t.ctx
 }
 
+// Done implements v1.Connected: closed when the tunnel fails or shuts down.
+func (t *TunnelImpl[T]) Done() <-chan struct{} {
+	return t.ctx.Done()
+}
+
+// Err implements v1.Connected: the cancellation cause, nil while alive.
+func (t *TunnelImpl[T]) Err() error {
+	return context.Cause(t.ctx)
+}
+
 // Cancel records cause and cancels the tunnel's context. Exposed for Engine
 // implementations in subpackages.
 func (t *TunnelImpl[T]) Cancel(cause error) {

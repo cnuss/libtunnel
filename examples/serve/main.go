@@ -46,13 +46,14 @@ func main() {
 
 	fmt.Printf("local: %s\n", conn.LocalURL())
 
-	// HostnameReady fires once the hostname resolves on the zone's
-	// authoritative nameservers; TunnelReady once the edge connection is up
-	// too — the tunnel is then reachable end to end.
-	<-conn.HostnameReady()
-	fmt.Printf("hostname: %s\n", conn.Hostname())
-
-	<-conn.TunnelReady()
+	// TunnelReady fires when the edge connection is up and the hostname
+	// resolves publicly; Done fires if the tunnel fails instead — always
+	// select on both, or a failed tunnel blocks forever.
+	select {
+	case <-conn.TunnelReady():
+	case <-conn.Done():
+		log.Fatal(conn.Err())
+	}
 	fmt.Printf("✓ tunneled %s to %s\n", conn.LocalURL(), conn.URL())
 
 	resp, err := http.Get(conn.URL().String())
