@@ -1,0 +1,143 @@
+// Command handoff is the canonical parent→child spec handoff: the parent
+// process mints a tunnel spec and passes it to a spawned child through the
+// TUNNEL_SPEC environment variable; the child provides the listener, connects
+// the tunnel, and serves; the parent then requests the child's public URL.
+//
+// It needs network access (it mints a tunnel from api.trycloudflare.com); the
+// e2e harness only runs it when LIBTUNNEL_E2E_LIVE=1.
+package main
+
+import (
+	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/cnuss/libtunnel"
+)
+
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "child" {
+		child()
+		return
+	}
+	parent()
+}
+
+// parent mints a spec (without ever connecting), hands it to a spawned child
+// through the environment, and requests the child's public URL once the
+// child reports the tunnel ready.
+func parent() {
+	t := libtunnel.New(libtunnel.Cloudflare(), libtunnel.QuickTunnel())
+	spec := t.Spec()
+	fmt.Printf("minted: %s\n", spec.Hostname)
+
+	entry, err := libtunnel.SpecEnviron(spec)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "child")
+	cmd.Env = append(os.Environ(), entry)
+	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		log.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+
+	// The child prints "ready: <url>" once the tunnel is reachable.
+	var publicURL string
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		fmt.Printf("child: %s\n", line)
+		if u, ok := strings.CutPrefix(line, "ready: "); ok {
+			publicURL = u
+			break
+		}
+	}
+	if publicURL == "" {
+		log.Fatal("child exited before the tunnel became ready")
+	}
+
+	resp, err := http.Get(publicURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("handoff: %s\n", body)
+}
+
+// child adopts the spec from the environment (the Env provider finds
+// TUNNEL_SPEC, so the QuickTunnel fallback is never consulted), provides the
+// listener, and serves until the parent kills it.
+func child() {
+	l, err := tls.Listen("tcp", "127.0.0.1:0", selfSigned())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	conn := libtunnel.New(libtunnel.Cloudflare(), libtunnel.Env(libtunnel.QuickTunnel())).WithListener(l)
+
+	go func() {
+		err := http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "hello from the child")
+		}))
+		log.Fatal(err)
+	}()
+
+	<-conn.TunnelReady()
+	fmt.Printf("ready: %s\n", conn.URL())
+
+	select {} // serve until the parent kills us
+}
+
+// selfSigned returns a TLS config with a fresh self-signed certificate for
+// 127.0.0.1 — the minimum the tunnel's https ingress needs from the origin.
+func selfSigned() *tls.Config {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "libtunnel example"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{der},
+			PrivateKey:  key,
+		}},
+	}
+}

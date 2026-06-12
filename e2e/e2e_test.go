@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -64,13 +65,18 @@ func TestExamples(t *testing.T) {
 	cases := []struct {
 		name string
 		want string
+		live bool // mints a real tunnel; gated behind LIBTUNNEL_E2E_LIVE=1
 	}{
-		{"basic", "greeting: hello world"},
-		{"named", "widget: {ID:7"},
+		{"offline", "domain: trycloudflare.com", false},
+		{"serve", "served: hello from libtunnel", true},
+		{"handoff", "handoff: hello from the child", true},
 	}
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.live && os.Getenv("LIBTUNNEL_E2E_LIVE") != "1" {
+				t.Skip("live example (mints a real quick tunnel); set LIBTUNNEL_E2E_LIVE=1 to run")
+			}
 			t.Parallel()
 			assertExample(t, tc.name, tc.want)
 		})
