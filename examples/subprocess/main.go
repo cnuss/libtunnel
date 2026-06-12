@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/cnuss/libtunnel"
 )
@@ -70,18 +71,33 @@ func parent() {
 	}
 
 	// Both processes share the tunnel identity: the parent can reach the
-	// child through the hostname it minted itself.
-	resp, err := http.Get("https://" + spec.Hostname + "/")
+	// child through the hostname it minted itself. The first request can race
+	// propagation (this machine's resolver and the edge route may lag the
+	// authoritative servers by a few seconds), so retry briefly.
+	body, err := fetch("https://" + spec.Hostname + "/")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	fmt.Printf("handoff: %s\n", body)
+}
+
+// fetch GETs url, retrying for up to 30 seconds until it answers 200.
+func fetch(url string) (string, error) {
+	var lastErr error
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Second) {
+		resp, err := http.Get(url)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return string(body), nil
+		}
+		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	return "", fmt.Errorf("%s never answered: %w", url, lastErr)
 }
 
 // child adopts the spec from the environment (the Cloudflare credential

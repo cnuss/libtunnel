@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/cnuss/libtunnel"
 )
@@ -56,15 +57,32 @@ func main() {
 	}
 	fmt.Printf("✓ tunneled %s to %s\n", conn.LocalURL(), conn.URL())
 
-	resp, err := http.Get(conn.URL().String())
+	// The first request can race propagation: TunnelReady proves the
+	// authoritative nameservers serve the record, but this machine's own
+	// resolver and the edge route may lag a few seconds behind. Retry briefly
+	// — real clients hitting a fresh tunnel face the same window.
+	body, err := fetch(conn.URL().String())
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	fmt.Printf("served: %s\n", body)
+}
+
+// fetch GETs url, retrying for up to 30 seconds until it answers 200.
+func fetch(url string) (string, error) {
+	var lastErr error
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Second) {
+		resp, err := http.Get(url)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return string(body), nil
+		}
+		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	return "", fmt.Errorf("%s never answered: %w", url, lastErr)
 }
