@@ -25,6 +25,11 @@ const quickTunnelURL = "https://api.trycloudflare.com/tunnel"
 // chain when the context expires first.
 var ErrRateLimited = errors.New("quick tunnel rate limited")
 
+// ErrMintRejected marks a mint the API definitively refused (success=false on
+// a non-5xx response). Retrying cannot fix it, so Spec returns immediately
+// instead of backing off.
+var ErrMintRejected = errors.New("quick tunnel mint rejected")
+
 // QuickTunnelProvider mints an anonymous *.trycloudflare.com tunnel from the
 // quick-tunnel API, retrying with linear backoff until the context is done.
 type QuickTunnelProvider struct {
@@ -120,6 +125,11 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			for _, e := range data.Errors {
 				errorMessages = append(errorMessages, fmt.Sprintf("%d: %s", e.Code, e.Message))
 			}
+			// A parsed success=false on a non-5xx response is the API saying
+			// no, not the API having a bad moment — retrying can't fix it.
+			if resp.StatusCode < http.StatusInternalServerError {
+				return nil, fmt.Errorf("%w: %s", ErrMintRejected, strings.Join(errorMessages, "; "))
+			}
 			return nil, fmt.Errorf("tunnel credentials request failed: %s", strings.Join(errorMessages, "; "))
 		}
 		return &data.Result, nil
@@ -130,6 +140,9 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		spec, err := fetch()
 		if err == nil {
 			return spec, nil
+		}
+		if errors.Is(err, ErrMintRejected) {
+			return nil, err
 		}
 		if errors.Is(err, ErrRateLimited) {
 			log.Warn("quick tunnel rate limited, retrying...", "error", err, "nextAttemptIn", sleep+time.Second)

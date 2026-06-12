@@ -20,7 +20,9 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel[T] {
 	select {
 	case <-t.listenerProvided:
 	default:
-		t.log = log
+		if log != nil {
+			t.log.Store(log)
+		}
 	}
 	return t
 }
@@ -31,7 +33,7 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel[T] {
 // v1.Connected carries no mutators — there is nothing left to configure.
 func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected[T] {
 	t.listenerOnce.Do(func() {
-		t.log.Info("configuring tunnel with local listener", "address", l.Addr().String())
+		t.Logger().Info("configuring tunnel with local listener", "address", l.Addr().String())
 		t.listener = l
 		close(t.listenerProvided)
 
@@ -42,20 +44,20 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected[T] {
 		}
 
 		go func() {
-			t.log.Info("starting tunnel with local listener")
+			t.Logger().Info("starting tunnel with local listener")
 			if err := engine.WithListener(t, l); err != nil {
 				t.cancel(fmt.Errorf("backend %q connect: %w", engine.Name(), err))
 				return
 			}
 
-			t.log.Info("tunnel connected, waiting for DNS")
+			t.Logger().Info("tunnel connected, waiting for DNS")
 			select {
 			case <-t.ctx.Done():
 				return
 			case <-t.HostnameReady():
 			}
 
-			t.log.Info("tunnel is ready")
+			t.Logger().Info("tunnel is ready")
 			close(t.tunnelReady)
 		}()
 	})
@@ -68,9 +70,17 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected[T] {
 // stays caller-owned, so closing that restarts the origin while the tunnel
 // persists.
 func (t *TunnelImpl[T]) Listener() net.Listener {
-	<-await(t.ctx, t.listenerProvided)
-	if t.listener == nil {
-		return nil
+	select {
+	case <-t.listenerProvided:
+	case <-t.ctx.Done():
+		// The listener field is only safe to read once listenerProvided is
+		// closed (the close is the happens-before edge for the write), so a
+		// cancellation wake re-checks instead of reading the field.
+		select {
+		case <-t.listenerProvided:
+		default:
+			return nil
+		}
 	}
 	return tunnelListener[T]{Listener: t.listener, t: t}
 }
@@ -129,7 +139,7 @@ func (t *TunnelImpl[T]) LocalIP() net.IP {
 			return
 		}
 
-		t.log.Info("listener bound to unspecified address, determining outbound-route IP")
+		t.Logger().Info("listener bound to unspecified address, determining outbound-route IP")
 		conn, err := net.Dial("udp", "1.1.1.1:53")
 		if err != nil {
 			t.cancel(fmt.Errorf("unable to get local IP: %w", err))
@@ -137,7 +147,7 @@ func (t *TunnelImpl[T]) LocalIP() net.IP {
 		}
 		defer conn.Close()
 		t.localIP = conn.LocalAddr().(*net.UDPAddr).IP
-		t.log.Info("determined local IP for tunnel", "localIP", t.localIP.String())
+		t.Logger().Info("determined local IP for tunnel", "localIP", t.localIP.String())
 	})
 	return t.localIP
 }
@@ -187,20 +197,20 @@ func (t *TunnelImpl[T]) Spec() T {
 		// tunnel's logger here — they're built by the backend before any
 		// WithLogger call, so the logger is threaded late.
 		if pl, ok := provider.(interface{ SetLogger(*slog.Logger) }); ok {
-			pl.SetLogger(t.log)
+			pl.SetLogger(t.Logger())
 		}
 
-		t.log.Info("fetching tunnel spec")
+		t.Logger().Info("fetching tunnel spec")
 		spec, err := provider.Spec(t.ctx)
 		if err != nil {
 			// Log synchronously: the async cancel watcher may lose the race
 			// against a caller that exits on the zero value.
-			t.log.Error("unable to fetch tunnel spec", "error", err)
+			t.Logger().Error("unable to fetch tunnel spec", "error", err)
 			t.cancel(fmt.Errorf("unable to fetch tunnel spec: %w", err))
 			return
 		}
 		t.spec = spec
-		t.log.Info("fetched tunnel spec", "hostname", spec.GetHostname())
+		t.Logger().Info("fetched tunnel spec", "hostname", spec.GetHostname())
 	})
 	return t.spec
 }
@@ -229,15 +239,26 @@ func (t *TunnelImpl[T]) Port() int {
 }
 
 // URL is https://<Hostname>/. It blocks until the hostname resolves on the
-// zone's authoritative nameservers.
+// zone's authoritative nameservers. Returns nil if the tunnel is canceled
+// before that happens, per the v1 contract's zero-value-on-cancel rule.
 func (t *TunnelImpl[T]) URL() *url.URL {
 	t.urlOnce.Do(func() {
 		hostname := t.Hostname()
-		<-await(t.ctx, t.HostnameReady())
-		t.url = &url.URL{
-			Scheme: "https",
-			Host:   hostname,
-			Path:   "/",
+		select {
+		case <-t.ctx.Done():
+		case <-t.HostnameReady():
+		}
+		// Build only if the hostname actually resolved — a cancellation wake
+		// leaves the zero value. Re-checking (rather than branching on which
+		// case fired) also covers both channels being ready at once.
+		select {
+		case <-t.HostnameReady():
+			t.url = &url.URL{
+				Scheme: "https",
+				Host:   hostname,
+				Path:   "/",
+			}
+		default:
 		}
 	})
 	return t.url
@@ -252,7 +273,7 @@ func (t *TunnelImpl[T]) CACerts() []*x509.Certificate {
 			return
 		}
 		t.caCerts = engine.CACerts()
-		t.log.Info("loaded CA certificates for tunnel", "numCACerts", len(t.caCerts))
+		t.Logger().Info("loaded CA certificates for tunnel", "numCACerts", len(t.caCerts))
 	})
 	return t.caCerts
 }
@@ -272,8 +293,10 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	t.hostnameReadyOnce.Do(func() {
 		// authServers resolves the zone's authoritative nameservers to ip:53
 		// endpoints. Run once up front and stashed; NS records are stable.
+		// DNS queries take bare names, so any :port the spec's hostname
+		// carries (the v1 contract allows host:port) is stripped first.
 		authServers := func() []string {
-			ns, err := net.DefaultResolver.LookupNS(t.ctx, t.Domain())
+			ns, err := net.DefaultResolver.LookupNS(t.ctx, dnsName(t.Domain()))
 			if err != nil {
 				return nil
 			}
@@ -298,14 +321,14 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 				if ips = authServers(); len(ips) > 0 {
 					break
 				}
-				t.log.Debug("no authoritative nameservers discovered yet, retrying", "domain", t.Domain())
+				t.Logger().Debug("no authoritative nameservers discovered yet, retrying", "domain", t.Domain())
 				select {
 				case <-t.ctx.Done():
 					return
 				case <-time.After(time.Second):
 				}
 			}
-			t.log.Debug("discovered authoritative nameservers", "domain", t.Domain(), "servers", ips)
+			t.Logger().Debug("discovered authoritative nameservers", "domain", t.Domain(), "servers", ips)
 
 			d := net.Dialer{Timeout: 5 * time.Second}
 			// target is the authoritative server the next query goes to —
@@ -319,18 +342,19 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 				},
 			}
 
+			host := dnsName(t.Hostname())
 			for attempt := 1; ; attempt++ {
 				target = ips[time.Now().UnixNano()%int64(len(ips))]
-				t.log.Debug("querying authoritative nameserver", "hostname", t.Hostname(), "server", target, "attempt", attempt)
+				t.Logger().Debug("querying authoritative nameserver", "hostname", host, "server", target, "attempt", attempt)
 
 				started := time.Now()
 				ctx, cancel := context.WithTimeout(t.ctx, 5*time.Second)
-				addrs, err := r.LookupHost(ctx, t.Hostname())
+				addrs, err := r.LookupHost(ctx, host)
 				cancel()
-				t.log.Debug("authoritative query answered", "hostname", t.Hostname(), "server", target, "attempt", attempt, "took", time.Since(started), "addrs", addrs, "error", err)
+				t.Logger().Debug("authoritative query answered", "hostname", host, "server", target, "attempt", attempt, "took", time.Since(started), "addrs", addrs, "error", err)
 
 				if err == nil && len(addrs) > 0 {
-					t.log.Info("hostname resolved on authoritative nameservers", "hostname", t.Hostname(), "addrs", addrs, "attempts", attempt)
+					t.Logger().Info("hostname resolved on authoritative nameservers", "hostname", host, "addrs", addrs, "attempts", attempt)
 					close(t.hostnameReady)
 					return
 				}
@@ -358,6 +382,15 @@ func domainOf(hostname string) string {
 	return domain
 }
 
+// dnsName strips any :port from hostname: DNS queries take bare names, while
+// the v1 contract allows GetHostname to carry host:port.
+func dnsName(hostname string) string {
+	if host, _, err := net.SplitHostPort(hostname); err == nil {
+		return host
+	}
+	return hostname
+}
+
 // portOf returns the port encoded in hostname, or 443 when absent, unparsable,
 // or out of range.
 func portOf(hostname string) int {
@@ -382,18 +415,4 @@ func IsTLS(l net.Listener) bool {
 		return t.TLS()
 	}
 	return fmt.Sprintf("%T", l) == "*tls.listener"
-}
-
-// await bridges a receive on ch with cancellation: the returned channel
-// closes when ch yields or ctx is done, whichever comes first.
-func await[E any](ctx context.Context, ch <-chan E) <-chan struct{} {
-	out := make(chan struct{})
-	go func() {
-		defer close(out)
-		select {
-		case <-ctx.Done():
-		case <-ch:
-		}
-	}()
-	return out
 }

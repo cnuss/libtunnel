@@ -238,6 +238,20 @@ func TestDoneSurfacesSpecFailure(t *testing.T) {
 	}
 }
 
+// TestURLReturnsNilWhenCanceled pins the v1 zero-value-on-cancel contract for
+// URL: a tunnel canceled before the hostname resolves must yield nil, not a
+// non-nil URL with an empty host that defeats callers' nil checks.
+func TestURLReturnsNilWhenCanceled(t *testing.T) {
+	tun := v1alpha1.New[*cloudflare.Spec](failingEngine{})
+
+	if u := tun.URL(); u != nil {
+		t.Errorf("URL() = %v after the spec fetch failed, want nil", u)
+	}
+	if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("Err() = %v, want the provider failure", err)
+	}
+}
+
 // failingEngine's provider always errors.
 type failingEngine struct{}
 

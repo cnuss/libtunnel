@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"sync"
+	"sync/atomic"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 )
@@ -48,19 +49,19 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	t := &TunnelImpl[T]{
 		ctx:              ctx,
 		cancel:           cancel,
-		log:              slog.New(slog.DiscardHandler),
 		backend:          backend,
 		listenerProvided: make(chan struct{}),
 		tunnelReady:      make(chan struct{}),
 		hostnameReady:    make(chan struct{}),
 	}
+	t.log.Store(slog.New(slog.DiscardHandler))
 
 	// Surface why the tunnel context was canceled. cancel is a
 	// CancelCauseFunc, so every t.Cancel(err) records a cause that
 	// context.Cause reports here when Done fires.
 	go func() {
 		<-ctx.Done()
-		t.log.Warn("tunnel context canceled", "cause", context.Cause(ctx))
+		t.Logger().Warn("tunnel context canceled", "cause", context.Cause(ctx))
 	}()
 
 	return t
@@ -75,7 +76,9 @@ type TunnelImpl[T v1.Spec] struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	log     *slog.Logger
+	// log is atomic: WithLogger can race the goroutines New and WithListener
+	// spawn, which read it through Logger.
+	log     atomic.Pointer[slog.Logger]
 	backend v1.Backend[T]
 
 	listenerOnce     sync.Once
@@ -132,5 +135,5 @@ func (t *TunnelImpl[T]) Cancel(cause error) {
 // Logger is the tunnel's logger (never nil; silent by default). Exposed for
 // Engine implementations in subpackages.
 func (t *TunnelImpl[T]) Logger() *slog.Logger {
-	return t.log
+	return t.log.Load()
 }

@@ -18,10 +18,14 @@
 // trigger that starts the edge connection.
 //
 //	l, _ := net.Listen("tcp", "127.0.0.1:0")
-//	conn := libtunnel.New(libtunnel.Cloudflare(), libtunnel.QuickTunnel()).WithListener(l)
+//	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 //	go server.Serve(conn.Listener())
-//	<-conn.TunnelReady()
-//	fmt.Println(conn.URL()) // public https://<hostname>/
+//	select {
+//	case <-conn.TunnelReady():
+//		fmt.Println(conn.URL()) // public https://<hostname>/
+//	case <-conn.Done():
+//		log.Fatal(conn.Err()) // TunnelReady never closes on failure
+//	}
 package libtunnel
 
 import (

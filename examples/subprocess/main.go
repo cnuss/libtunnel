@@ -36,6 +36,11 @@ func main() {
 func parent() {
 	t := libtunnel.New(libtunnel.Cloudflare())
 	spec := t.Spec()
+	if spec == nil {
+		// Spec returns the zero value when minting fails (e.g. a malformed
+		// TUNNEL_SPEC already in the environment); Err carries the cause.
+		log.Fatalf("unable to mint a tunnel spec: %v", t.Err())
+	}
 	fmt.Printf("minted: %s\n", spec.Hostname)
 
 	cmd := exec.Command(os.Args[0], "child")
