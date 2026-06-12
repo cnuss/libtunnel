@@ -110,7 +110,10 @@ type TunnelImpl[T v1.Spec] struct {
 	caCerts     []*x509.Certificate
 
 	hostnameReadyOnce sync.Once
-	hostnameReady     chan struct{}
+	// hostnameReadyClose guards the close: two readiness rungs (authoritative
+	// :53 and DoH) race to report first.
+	hostnameReadyClose sync.Once
+	hostnameReady      chan struct{}
 
 	tunnelReady chan struct{}
 }
