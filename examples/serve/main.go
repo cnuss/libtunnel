@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
 
 	"github.com/cnuss/libtunnel"
 )
@@ -25,7 +27,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
+	// Unset, the tunnel is silent. Info shows the tunnel lifecycle; Debug
+	// would add cloudflared's internals.
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	conn := libtunnel.New(libtunnel.Cloudflare()).
+		WithLogger(logger).
+		WithListener(l)
 
 	go func() {
 		err := http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
