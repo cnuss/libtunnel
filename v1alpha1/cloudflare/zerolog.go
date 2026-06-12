@@ -1,6 +1,7 @@
 package cloudflare
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"strings"
@@ -24,8 +25,15 @@ func (w slogWriter) Write(p []byte) (int, error) {
 }
 
 // zerologger bridges the tunnel's slog.Logger into the *zerolog.Logger
-// cloudflared's plumbing requires.
+// cloudflared's plumbing requires. When the handler won't accept debug
+// records (the silent default), it returns a disabled logger so cloudflared's
+// per-event JSON serialization is skipped instead of encoded and discarded —
+// this sits on the proxy hot path.
 func zerologger(log *slog.Logger) *zerolog.Logger {
+	if !log.Enabled(context.Background(), slog.LevelDebug) {
+		l := zerolog.Nop()
+		return &l
+	}
 	l := zerolog.New(slogWriter{log: log}).With().Str("component", "tunnel").Logger()
 	return &l
 }

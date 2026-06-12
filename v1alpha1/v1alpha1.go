@@ -9,9 +9,9 @@ package v1alpha1
 import (
 	"context"
 	"crypto/x509"
+	"fmt"
 	"log/slog"
 	"net"
-	"net/url"
 	"sync"
 	"sync/atomic"
 
@@ -56,6 +56,16 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	}
 	t.log.Store(slog.New(slog.DiscardHandler))
 
+	// Establish the backend→engine relationship once, here, instead of
+	// re-asserting at every engine-touching getter: a foreign backend cancels
+	// the tunnel immediately with one consistent cause, and everything else
+	// just checks t.engine.
+	if engine, ok := backend.(Engine[T]); ok {
+		t.engine = engine
+	} else {
+		cancel(fmt.Errorf("backend %q does not implement the v1alpha1 engine contract", backend.Name()))
+	}
+
 	// Surface why the tunnel context was canceled. cancel is a
 	// CancelCauseFunc, so every t.Cancel(err) records a cause that
 	// context.Cause reports here when Done fires.
@@ -80,6 +90,9 @@ type TunnelImpl[T v1.Spec] struct {
 	// spawn, which read it through Logger.
 	log     atomic.Pointer[slog.Logger]
 	backend v1.Backend[T]
+	// engine is backend asserted to the alpha contract, established once in
+	// New. Nil means a foreign backend — the tunnel is born canceled.
+	engine Engine[T]
 
 	listenerOnce     sync.Once
 	listener         net.Listener
@@ -89,17 +102,9 @@ type TunnelImpl[T v1.Spec] struct {
 	localIP       net.IP
 	localHostOnce sync.Once
 	localHost     string
-	localURLOnce  sync.Once
-	localURL      *url.URL
 
 	specOnce sync.Once
 	spec     T
-
-	hostnameOnce sync.Once
-	hostname     string
-
-	urlOnce sync.Once
-	url     *url.URL
 
 	caCertsOnce sync.Once
 	caCerts     []*x509.Certificate

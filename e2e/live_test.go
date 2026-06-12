@@ -200,7 +200,7 @@ func TestLiveResurrection(t *testing.T) {
 		for scanner.Scan() {
 			line := scanner.Text()
 			t.Logf("child[%s]: %s", body, line)
-			if strings.HasPrefix(line, "ready: ") {
+			if strings.HasPrefix(line, readyPrefix) {
 				return func() { cmd.Process.Kill(); cmd.Wait() }
 			}
 		}
@@ -237,7 +237,7 @@ func liveServeChild() {
 		fmt.Println("tunnel never became ready")
 		os.Exit(3)
 	}
-	fmt.Printf("ready: %s\n", conn.URL())
+	fmt.Printf("%s%s\n", readyPrefix, conn.URL())
 	select {} // serve until the parent kills us
 }
 
@@ -279,28 +279,15 @@ func TestLiveTwoTunnels(t *testing.T) {
 			// 60s, not the usual 30s: with the self-export guard both tunnels
 			// always mint for real, and two simultaneous mints can draw a
 			// rate-limit backoff before the connect + DNS wait even starts.
-			select {
-			case <-conn.TunnelReady():
-			case <-conn.Done():
-				errs <- fmt.Errorf("%s: tunnel failed: %w", body, conn.Err())
-				return
-			case <-time.After(60 * time.Second):
-				errs <- fmt.Errorf("%s: tunnel not ready after 60s", body)
+			if err := readyErr(conn, 60*time.Second); err != nil {
+				errs <- fmt.Errorf("%s: %w", body, err)
 				return
 			}
 			// Retry briefly: TunnelReady proves a public resolver sees the
 			// hostname, but this host's own resolver can lag a few seconds.
-			deadline := time.Now().Add(30 * time.Second)
-			for {
-				got, code, err := getBody(conn.URL().String())
-				if err == nil && code == http.StatusOK && got == body {
-					return
-				}
-				if time.Now().After(deadline) {
-					errs <- fmt.Errorf("%s: body=%q code=%d err=%v", body, got, code, err)
-					return
-				}
-				time.Sleep(2 * time.Second)
+			if err := eventuallyBodyErr(conn.URL().String(), body, 30*time.Second); err != nil {
+				errs <- fmt.Errorf("%s: %w", body, err)
+				return
 			}
 		}(tc.bind, tc.body)
 	}

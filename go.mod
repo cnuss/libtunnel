@@ -5,7 +5,6 @@ go 1.26
 require (
 	github.com/breml/rootcerts v0.3.5
 	github.com/cloudflare/cloudflared v0.0.0-20260415224023-df54d2771019
-	github.com/dustin/go-humanize v1.0.1
 	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1
