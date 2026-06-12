@@ -288,9 +288,19 @@ func TestLiveTwoTunnels(t *testing.T) {
 				errs <- fmt.Errorf("%s: tunnel not ready after 30s", body)
 				return
 			}
-			got, code, err := getBody(conn.URL().String())
-			if err != nil || code != http.StatusOK || got != body {
-				errs <- fmt.Errorf("%s: body=%q code=%d err=%v", body, got, code, err)
+			// Retry briefly: TunnelReady proves a public resolver sees the
+			// hostname, but this host's own resolver can lag a few seconds.
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				got, code, err := getBody(conn.URL().String())
+				if err == nil && code == http.StatusOK && got == body {
+					return
+				}
+				if time.Now().After(deadline) {
+					errs <- fmt.Errorf("%s: body=%q code=%d err=%v", body, got, code, err)
+					return
+				}
+				time.Sleep(2 * time.Second)
 			}
 		}(tc.bind, tc.body)
 	}
