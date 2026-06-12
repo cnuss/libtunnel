@@ -13,7 +13,7 @@ Deep-link by filename; line numbers will drift.
 | Façade (`New`, backends, providers, handoff)   | [`lib.go`](./lib.go)                                             |
 | Stable contract (`Tunnel[T]`, `Connected[T]`, `Provider[T]`, `Backend[T]`, `CloudflareSpec`) | [`v1/v1.go`](./v1/v1.go) |
 | Core struct + `New` constructor + `Engine` contract | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)            |
-| Lazy getters + `With*` mutators + NS polling   | [`v1alpha1/tunnel.go`](./v1alpha1/tunnel.go)                     |
+| Lazy getters + `With*` mutators + DNS readiness | [`v1alpha1/tunnel.go`](./v1alpha1/tunnel.go)                     |
 | Generic providers (`Static`, `Env`) + handoff helpers | [`v1alpha1/provider.go`](./v1alpha1/provider.go)          |
 | Cloudflare engine (cloudflared supervisor wiring) | [`v1alpha1/cloudflare/cloudflare.go`](./v1alpha1/cloudflare/cloudflare.go) |
 | Quick-tunnel provider (api.trycloudflare.com)  | [`v1alpha1/cloudflare/quicktunnel.go`](./v1alpha1/cloudflare/quicktunnel.go) |

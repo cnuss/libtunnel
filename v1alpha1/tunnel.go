@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -164,8 +165,16 @@ func (t *TunnelImpl[T]) LocalURL() *url.URL {
 // provider chain on first use.
 func (t *TunnelImpl[T]) Spec() T {
 	t.specOnce.Do(func() {
+		provider := t.backend.Provider()
+		// Providers that can log (retry warnings, rate limits) pick up the
+		// tunnel's logger here — they're built by the backend before any
+		// WithLogger call, so the logger is threaded late.
+		if pl, ok := provider.(interface{ SetLogger(*slog.Logger) }); ok {
+			pl.SetLogger(t.log)
+		}
+
 		t.log.Info("fetching tunnel spec")
-		spec, err := t.backend.Provider().Spec(t.ctx)
+		spec, err := provider.Spec(t.ctx)
 		if err != nil {
 			t.cancel(fmt.Errorf("unable to fetch tunnel spec: %w", err))
 			return
@@ -234,63 +243,57 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 	return t.tunnelReady
 }
 
-// HostnameReady starts (on first use) a poller that watches the zone's
-// authoritative nameservers and closes the returned channel once the tunnel
-// hostname resolves there. Polling the authoritative servers directly avoids
-// waiting out negative-cache TTLs on local resolvers.
+// publicResolvers are well-known anycast recursive resolvers. The
+// HostnameReady poller consumes one per attempt and never returns to it, so
+// a resolver that has already cached a negative answer for the hostname is
+// left behind instead of wedging the wait. Public recursives also work on
+// networks that intercept DNS or block direct authoritative queries.
+var publicResolvers = []string{
+	"1.1.1.1:53",         // Cloudflare
+	"8.8.8.8:53",         // Google
+	"9.9.9.9:53",         // Quad9
+	"208.67.222.222:53",  // OpenDNS
+	"1.0.0.1:53",         // Cloudflare secondary
+	"8.8.4.4:53",         // Google secondary
+	"149.112.112.112:53", // Quad9 secondary
+	"208.67.220.220:53",  // OpenDNS secondary
+	"94.140.14.14:53",    // AdGuard
+	"76.76.2.0:53",       // Control D
+}
+
+// HostnameReady starts (on first use) a poller that walks a fleet of public
+// resolvers — one query per resolver, sleeping a second between attempts —
+// and closes the returned channel once the tunnel hostname resolves. When
+// the fleet is exhausted without an answer, the tunnel is canceled with a
+// descriptive cause: the hostname is considered never coming.
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	t.hostnameReadyOnce.Do(func() {
-		// authServers resolves the zone's authoritative nameservers to ip:53
-		// endpoints. Run once up front and stashed; NS records are stable.
-		authServers := func() []string {
-			ns, err := net.DefaultResolver.LookupNS(t.ctx, t.Domain())
-			if err != nil {
-				return nil
-			}
-
-			ips := make([]string, 0, len(ns))
-			for _, record := range ns {
-				hostIPs, err := net.DefaultResolver.LookupHost(t.ctx, record.Host)
-				if err != nil {
-					continue
-				}
-				for _, ip := range hostIPs {
-					ips = append(ips, net.JoinHostPort(ip, "53"))
-				}
-			}
-			return ips
-		}
-
 		go func() {
-			// Discover the authoritative servers once, retrying until available.
-			var ips []string
-			for {
-				if ips = authServers(); len(ips) > 0 {
-					break
-				}
-				select {
-				case <-t.ctx.Done():
-					return
-				case <-time.After(time.Second):
-				}
-			}
+			remaining := slices.Clone(publicResolvers)
 
 			d := net.Dialer{Timeout: 5 * time.Second}
+			// target is the resolver the next query goes to — captured so
+			// the custom Dial and the logs name the same server.
+			var target string
 			r := &net.Resolver{
 				PreferGo: true,
 				Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-					// randomize across all authoritative servers instead of always picking the first one
-					return d.DialContext(ctx, network, ips[time.Now().UnixNano()%int64(len(ips))])
+					return d.DialContext(ctx, network, target)
 				},
 			}
 
-			for {
+			for attempt := 1; len(remaining) > 0; attempt++ {
+				target, remaining = remaining[0], remaining[1:]
+				t.log.Debug("querying public resolver", "hostname", t.Hostname(), "server", target, "attempt", attempt)
+
+				started := time.Now()
 				ctx, cancel := context.WithTimeout(t.ctx, 5*time.Second)
 				addrs, err := r.LookupHost(ctx, t.Hostname())
 				cancel()
+				t.log.Debug("public resolver answered", "hostname", t.Hostname(), "server", target, "attempt", attempt, "took", time.Since(started), "addrs", addrs, "error", err)
 
 				if err == nil && len(addrs) > 0 {
-					t.log.Info("hostname resolved on authoritative nameservers", "hostname", t.Hostname(), "addrs", addrs)
+					t.log.Info("hostname resolved", "hostname", t.Hostname(), "addrs", addrs, "resolver", target, "attempts", attempt)
 					close(t.hostnameReady)
 					return
 				}
@@ -301,6 +304,8 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 				case <-time.After(time.Second):
 				}
 			}
+
+			t.cancel(fmt.Errorf("hostname %q did not resolve on any of %d public resolvers", t.Hostname(), len(publicResolvers)))
 		}()
 	})
 	return t.hostnameReady

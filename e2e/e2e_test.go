@@ -74,10 +74,14 @@ func TestExamples(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.live && os.Getenv("LIBTUNNEL_E2E_LIVE") != "1" {
-				t.Skip("live example (mints a real quick tunnel); set LIBTUNNEL_E2E_LIVE=1 to run")
+			if tc.live {
+				if os.Getenv("LIBTUNNEL_E2E_LIVE") != "1" {
+					t.Skip("live example (mints a real quick tunnel); set LIBTUNNEL_E2E_LIVE=1 to run")
+				}
+				// No t.Parallel, and paced: live cases mint real tunnels,
+				// and burst minting invites 429s and edge-propagation races.
+				paceLive()
 			}
-			t.Parallel()
 			assertExample(t, tc.name, tc.want)
 		})
 	}
@@ -103,6 +107,7 @@ func TestHandoffSharedHostname(t *testing.T) {
 		t.Skip("live example (mints a real quick tunnel); set LIBTUNNEL_E2E_LIVE=1 to run")
 	}
 
+	paceLive()
 	r := newRunner(t, "handoff")
 	out, code := r.run(t)
 	if code != 0 {

@@ -27,7 +27,6 @@ import (
 	"github.com/cloudflare/cloudflared/signal"
 	"github.com/cloudflare/cloudflared/supervisor"
 	"github.com/cloudflare/cloudflared/tlsconfig"
-	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -122,11 +121,19 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*v1.CloudflareSpec], l net
 			cfg, _ := client.NewConfig(cloudflaredVersion, fmt.Sprintf("%s_%s", runtime.GOOS, runtime.GOARCH), featureSelector)
 			return cfg
 		}(),
-		GracePeriod:     60 * time.Second, // TODO(partial): what is a good default here?
-		Region:          "",
-		EdgeIPVersion:   allregions.Auto,
-		HAConnections:   1,
-		Tags:            []pogs.Tag{{Name: "ID", Value: spec.ID}}, // TODO(experimental): reuse tunnel ID as connector ID; cloudflared normally generates a fresh UUID per process
+		// cloudflared's own default (its --grace-period flag): how long the
+		// supervisor waits for in-flight requests on graceful shutdown — and
+		// ctx.Done is wired as the graceful-shutdown signal below, so this
+		// bounds teardown after a cancel. Max accepted is 3m.
+		GracePeriod:   30 * time.Second,
+		Region:        "",
+		EdgeIPVersion: allregions.Auto,
+		HAConnections: 1,
+		// No tags, matching cloudflared's quick-tunnel default. (Tags never
+		// were the connector ID — client.NewConfig mints a fresh random UUID
+		// for that; tags only become Cf-Warp-Tag-* headers injected into
+		// every request hitting the origin.)
+		Tags:            nil,
 		Log:             log,
 		LogTransport:    log,
 		Observer:        connection.NewObserver(log, log),

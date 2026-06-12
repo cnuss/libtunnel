@@ -3,6 +3,7 @@ package cloudflare
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,11 @@ import (
 // quickTunnelURL is the public endpoint that mints anonymous quick tunnels.
 const quickTunnelURL = "https://api.trycloudflare.com/tunnel"
 
+// ErrRateLimited marks a quick-tunnel mint rejected with HTTP 429. The
+// provider retries through it with backoff; it surfaces in the returned error
+// chain when the context expires first.
+var ErrRateLimited = errors.New("quick tunnel rate limited")
+
 // QuickTunnelProvider mints an anonymous *.trycloudflare.com tunnel from the
 // quick-tunnel API, retrying with linear backoff until the context is done.
 type QuickTunnelProvider struct {
@@ -34,6 +40,14 @@ func QuickTunnel() *QuickTunnelProvider {
 }
 
 var _ v1.Provider[*v1.CloudflareSpec] = (*QuickTunnelProvider)(nil)
+
+// SetLogger adopts the tunnel's logger so retry warnings (rate limits
+// especially) surface through it. An explicitly set Log wins.
+func (p *QuickTunnelProvider) SetLogger(log *slog.Logger) {
+	if p.Log == nil {
+		p.Log = log
+	}
+}
 
 // Spec implements v1.Provider. It blocks until credentials are minted or ctx
 // is done, backing off linearly between attempts (the API rate-limits).
@@ -79,12 +93,12 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*v1.CloudflareSpec, err
 			retryAfter := resp.Header.Get("Retry-After")
 			if secs, err := strconv.Atoi(retryAfter); err == nil {
 				now := time.Now()
-				return nil, fmt.Errorf("tunnel rate limit resets in %s", humanize.RelTime(now.Add(time.Duration(secs)*time.Second), now, "", ""))
+				return nil, fmt.Errorf("%w: resets in %s", ErrRateLimited, humanize.RelTime(now.Add(time.Duration(secs)*time.Second), now, "", ""))
 			}
 			if retryAfter != "" {
-				return nil, fmt.Errorf("tunnel rate limit hit (HTTP 429): Retry-After=%s", retryAfter)
+				return nil, fmt.Errorf("%w (HTTP 429): Retry-After=%s", ErrRateLimited, retryAfter)
 			}
-			return nil, fmt.Errorf("tunnel rate limit hit (HTTP 429): no rate-limit headers returned")
+			return nil, fmt.Errorf("%w (HTTP 429): no rate-limit headers returned", ErrRateLimited)
 		}
 
 		type response struct {
@@ -117,12 +131,18 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*v1.CloudflareSpec, err
 		if err == nil {
 			return spec, nil
 		}
-		log.Warn("failed to fetch tunnel spec, retrying...", "error", err)
+		if errors.Is(err, ErrRateLimited) {
+			log.Warn("quick tunnel rate limited, retrying...", "error", err, "nextAttemptIn", sleep+time.Second)
+		} else {
+			log.Warn("failed to fetch tunnel spec, retrying...", "error", err)
+		}
 
 		sleep += 1 * time.Second
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			// Keep the last fetch failure in the chain so callers can see
+			// (and errors.Is) why minting never succeeded.
+			return nil, errors.Join(ctx.Err(), err)
 		case <-time.After(sleep):
 		}
 	}

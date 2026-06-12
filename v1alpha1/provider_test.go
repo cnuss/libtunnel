@@ -2,6 +2,9 @@ package v1alpha1_test
 
 import (
 	"context"
+	"crypto/x509"
+	"log/slog"
+	"net"
 	"testing"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -122,4 +125,51 @@ func TestStaticProvider(t *testing.T) {
 	if got != want {
 		t.Errorf("Static yielded %+v, want the exact spec passed in", got)
 	}
+}
+
+// loggingProvider records the logger handed down by the tunnel core.
+type loggingProvider struct {
+	trackingProvider
+	log *slog.Logger
+}
+
+func (p *loggingProvider) SetLogger(log *slog.Logger) { p.log = log }
+
+func TestTunnelThreadsLoggerIntoProvider(t *testing.T) {
+	want := slog.New(slog.DiscardHandler)
+	provider := &loggingProvider{trackingProvider: trackingProvider{spec: &v1.CloudflareSpec{Hostname: "x.y"}}}
+
+	v1alpha1.New(loggerEngine{provider}).WithLogger(want).Spec()
+
+	if provider.log != want {
+		t.Errorf("provider received logger %p, want the tunnel's %p", provider.log, want)
+	}
+}
+
+func TestEnvProviderForwardsLogger(t *testing.T) {
+	t.Setenv(v1alpha1.SpecEnv, "")
+	want := slog.New(slog.DiscardHandler)
+	inner := &loggingProvider{trackingProvider: trackingProvider{spec: &v1.CloudflareSpec{}}}
+
+	wrapped := v1alpha1.Env[v1.CloudflareSpec](inner)
+	if pl, ok := wrapped.(interface{ SetLogger(*slog.Logger) }); !ok {
+		t.Fatal("Env provider does not forward SetLogger")
+	} else {
+		pl.SetLogger(want)
+	}
+	if inner.log != want {
+		t.Errorf("wrapped provider received logger %p, want %p", inner.log, want)
+	}
+}
+
+// loggerEngine is a minimal engine whose provider is injected.
+type loggerEngine struct {
+	provider v1.Provider[*v1.CloudflareSpec]
+}
+
+func (e loggerEngine) Name() string                              { return "logger-fake" }
+func (e loggerEngine) Provider() v1.Provider[*v1.CloudflareSpec] { return e.provider }
+func (e loggerEngine) CACerts() []*x509.Certificate              { return nil }
+func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*v1.CloudflareSpec], l net.Listener) error {
+	return nil
 }

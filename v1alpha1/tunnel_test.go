@@ -197,3 +197,22 @@ func FuzzHostnameParsing(f *testing.F) {
 		}
 	})
 }
+
+func TestHostnameReadyBailsWhenFleetExhausted(t *testing.T) {
+	saved := publicResolvers
+	publicResolvers = []string{"127.0.0.1:1", "127.0.0.1:1"} // nothing listens here
+	t.Cleanup(func() { publicResolvers = saved })
+
+	tun := New(newFakeEngine(&v1.CloudflareSpec{Hostname: "never.trycloudflare.com"}))
+	tun.HostnameReady()
+
+	select {
+	case <-tun.Context().Done():
+		cause := context.Cause(tun.Context())
+		if cause == nil || !strings.Contains(cause.Error(), "did not resolve on any of") {
+			t.Errorf("cancel cause = %v, want fleet-exhausted message", cause)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("tunnel was not canceled after the resolver fleet was exhausted")
+	}
+}

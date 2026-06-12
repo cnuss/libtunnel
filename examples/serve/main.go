@@ -27,10 +27,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Unset, the tunnel is silent. Error keeps the output quiet; Info would
-	// show the tunnel lifecycle, Debug adds cloudflared's internals.
+	// Unset, the tunnel is silent. Info shows the tunnel lifecycle (including
+	// rate-limit retry warnings); Debug adds cloudflared's internals.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelError,
+		Level: slog.LevelInfo,
 	}))
 
 	conn := libtunnel.New(libtunnel.Cloudflare()).

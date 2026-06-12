@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -45,6 +46,13 @@ type envProvider[E any, T interface {
 	v1.Spec
 }] struct {
 	next v1.Provider[T]
+}
+
+// SetLogger forwards the tunnel's logger to the wrapped provider.
+func (p envProvider[E, T]) SetLogger(log *slog.Logger) {
+	if pl, ok := p.next.(interface{ SetLogger(*slog.Logger) }); ok {
+		pl.SetLogger(log)
+	}
 }
 
 func (p envProvider[E, T]) Spec(ctx context.Context) (T, error) {

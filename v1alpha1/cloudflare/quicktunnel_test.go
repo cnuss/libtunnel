@@ -2,8 +2,11 @@ package cloudflare
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -92,5 +95,27 @@ func TestQuickTunnelHonorsContext(t *testing.T) {
 
 	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(ctx); err == nil {
 		t.Fatal("Spec returned nil error although the API never succeeds and ctx expired")
+	}
+}
+
+func TestQuickTunnelSurfacesRateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	_, err := (&QuickTunnelProvider{URL: srv.URL, Log: log}).Spec(ctx)
+	if !errors.Is(err, ErrRateLimited) {
+		t.Errorf("err = %v, want errors.Is(_, ErrRateLimited)", err)
+	}
+	if !strings.Contains(buf.String(), "quick tunnel rate limited") {
+		t.Errorf("no rate-limit warning logged; log output:\n%s", buf.String())
 	}
 }
