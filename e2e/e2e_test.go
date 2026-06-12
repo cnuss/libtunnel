@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	"net/url"
 	"os"
 	"os/exec"
@@ -8,7 +9,13 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
+
+// runTimeout bounds a single example run. A wedged example (e.g. a
+// rate-limited mint retrying forever) must fail its own test, not time the
+// whole suite out.
+const runTimeout = 120 * time.Second
 
 // runner builds one example binary, then runs it. The harness builds at test
 // time (not via `go build ./...`) so example source changes are always picked
@@ -31,10 +38,13 @@ func newRunner(t *testing.T, name string) *runner {
 }
 
 // run executes the built example with args and returns (output, exitCode).
-// exitCode is -1 if the process could not be started.
+// exitCode is -1 if the process could not be started or was killed by the
+// run timeout.
 func (r *runner) run(t *testing.T, args ...string) (string, int) {
 	t.Helper()
-	out, err := exec.Command(r.bin, args...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, r.bin, args...).CombinedOutput()
 	code := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -43,6 +53,9 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 			code = -1
 		}
 	}
+	if ctx.Err() != nil {
+		t.Errorf("%s did not finish within %v", r.name, runTimeout)
+	}
 	t.Logf("$ %s %s (exit %d)\n%s", r.name, strings.Join(args, " "), code, out)
 	return string(out), code
 }
@@ -50,7 +63,7 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 // assertExample builds an example, runs it, and checks the exit code is 0 and
 // stdout contains want. Each example added under examples/ should get a row in
 // the table below.
-func assertExample(t *testing.T, name, want string) {
+func assertExample(t *testing.T, name, want string) string {
 	t.Helper()
 	r := newRunner(t, name)
 	out, code := r.run(t)
@@ -60,16 +73,18 @@ func assertExample(t *testing.T, name, want string) {
 	if !strings.Contains(out, want) {
 		t.Errorf("%s output %q does not contain %q", name, out, want)
 	}
+	return out
 }
 
 func TestExamples(t *testing.T) {
 	cases := []struct {
-		name string
-		want string
-		live bool // mints a real tunnel; gated behind LIBTUNNEL_E2E_LIVE=1
+		name   string
+		want   string
+		live   bool                           // mints a real tunnel; gated behind LIBTUNNEL_E2E_LIVE=1
+		verify func(t *testing.T, out string) // optional deeper assertions on the same run
 	}{
-		{"serve", "served: hello from libtunnel", true},
-		{"handoff", "handoff: hello from the child", true},
+		{"serve", "served: hello from libtunnel", true, nil},
+		{"handoff", "handoff: hello from the child", true, verifySharedHostname},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -82,7 +97,10 @@ func TestExamples(t *testing.T) {
 				// and burst minting invites 429s and edge-propagation races.
 				paceLive()
 			}
-			assertExample(t, tc.name, tc.want)
+			out := assertExample(t, tc.name, tc.want)
+			if tc.verify != nil {
+				tc.verify(t, out)
+			}
 		})
 	}
 }
@@ -98,21 +116,12 @@ func capture(out, prefix string) (string, bool) {
 	return "", false
 }
 
-// TestHandoffSharedHostname runs the handoff example and asserts the
-// parent→child spec handoff end to end: the parent mints a hostname, the
-// child (a subprocess) provides the listener and connects, and both interact
-// with the tunnel under the exact same hostname.
-func TestHandoffSharedHostname(t *testing.T) {
-	if os.Getenv("LIBTUNNEL_E2E_LIVE") != "1" {
-		t.Skip("live example (mints a real quick tunnel); set LIBTUNNEL_E2E_LIVE=1 to run")
-	}
-
-	paceLive()
-	r := newRunner(t, "handoff")
-	out, code := r.run(t)
-	if code != 0 {
-		t.Fatalf("handoff exited %d, want 0", code)
-	}
+// verifySharedHostname asserts the parent→child spec handoff on the handoff
+// example's output: the parent mints a hostname, the child (a subprocess)
+// provides the listener and connects, and both interact with the tunnel
+// under the exact same hostname.
+func verifySharedHostname(t *testing.T, out string) {
+	t.Helper()
 
 	minted, ok := capture(out, "minted: ")
 	if !ok {
@@ -129,11 +138,5 @@ func TestHandoffSharedHostname(t *testing.T) {
 	}
 	if childURL.Hostname() != minted {
 		t.Errorf("child connected under %q, want the parent's minted hostname %q", childURL.Hostname(), minted)
-	}
-
-	// The parent fetched through its own handle on the minted hostname; the
-	// served body proves the same tunnel carried both processes' traffic.
-	if want := "handoff: hello from the child"; !strings.Contains(out, want) {
-		t.Errorf("output does not contain %q — the parent's request through the shared hostname failed", want)
 	}
 }
