@@ -123,10 +123,24 @@ func waitReady(t *testing.T, conn v1.Connected[*cloudflare.Spec], d time.Duratio
 	}
 }
 
+// v4Client dials IPv4 only: some CI runners (macos-26) have no IPv6 egress,
+// and a resolver that answers AAAA for a fresh tunnel hostname — while
+// negative-caching the A record for the zone's 1800s SOA minimum — makes
+// every dual-stack dial fail "no route to host" persistently. The harness
+// asserts tunnel behavior, not the runner's IPv6 stack; the edge is
+// dual-homed, so IPv4 always works where the runners live.
+var v4Client = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, "tcp4", addr)
+		},
+	},
+}
+
 // getBody requests url once and returns the body.
 func getBody(url string) (string, int, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(url)
+	resp, err := v4Client.Get(url)
 	if err != nil {
 		return "", 0, err
 	}
