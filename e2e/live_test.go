@@ -66,7 +66,12 @@ func TestLiveTunnel(t *testing.T) {
 	srv := &http.Server{Handler: mux}
 
 	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
-	go srv.Serve(conn.Listener())
+	// Serve the original listener: the bounce below restarts the origin and
+	// the tunnel must persist. (Serving conn.Listener() would tie the tunnel
+	// to the server's lifetime — that teardown is exercised at the end.)
+	go srv.Serve(l)
+	// Free the hostname when done — TestLiveResurrection reuses this spec.
+	defer conn.Listener().Close()
 
 	if got := conn.LocalURL().Scheme; got != "https" {
 		t.Errorf("LocalURL scheme = %q, want https for a TLS listener", got)
@@ -167,13 +172,20 @@ func TestLiveResurrection(t *testing.T) {
 	}
 	gateLive(t)
 
-	// Minting exports the spec into this process's environment, so the
-	// spawned children inherit the tunnel identity with no plumbing.
+	// Reuse the preflight spec instead of minting: TestLiveTunnel closed its
+	// tunnel, so the hostname is free, and resolving it here exports it into
+	// this process's environment — the spawned children inherit the tunnel
+	// identity with no plumbing.
+	if preflightSpec != nil {
+		if entry, err := v1alpha1.SpecEnviron(preflightSpec); err == nil {
+			t.Setenv(v1alpha1.SpecEnv, strings.TrimPrefix(entry, v1alpha1.SpecEnv+"="))
+		}
+	}
 	spec := libtunnel.New(libtunnel.Cloudflare()).Spec()
 	if spec == nil || spec.Hostname == "" {
 		t.Fatal("failed to mint a spec")
 	}
-	t.Logf("minted: %s", spec.Hostname)
+	t.Logf("spec: %s", spec.Hostname)
 	url := "https://" + spec.Hostname + "/"
 
 	spawn := func(body string) (kill func()) {

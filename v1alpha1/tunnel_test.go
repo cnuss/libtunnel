@@ -73,8 +73,8 @@ func TestLocalGettersDeriveFromListener(t *testing.T) {
 	if got := conn.LocalURL(); got.Host != wantHost || got.Scheme != "http" {
 		t.Errorf("LocalURL() = %v, want http://%s/ (plain listener => http)", got, wantHost)
 	}
-	if got := conn.Listener(); got != l {
-		t.Errorf("Listener() = %v, want the provided listener", got)
+	if got := conn.Listener(); got.Addr().String() != l.Addr().String() {
+		t.Errorf("Listener().Addr() = %v, want %v", got.Addr(), l.Addr())
 	}
 }
 
@@ -136,6 +136,32 @@ func TestSpecGettersDeriveFromProvider(t *testing.T) {
 	}
 	if got := tun.Port(); got != 443 {
 		t.Errorf("Port() = %d, want 443", got)
+	}
+}
+
+// TestListenerCloseClosesTunnel pins the implicit-close contract: closing
+// the tunnel-owned listener (what an http.Server does on Shutdown) closes
+// the tunnel, with ErrClosed as the cause. The caller's original listener
+// dies with it.
+func TestListenerCloseClosesTunnel(t *testing.T) {
+	l := listen(t)
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{})).WithListener(l)
+
+	if err := conn.Listener().Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case <-conn.Done():
+		if !errors.Is(conn.Err(), v1.ErrClosed) {
+			t.Errorf("Err() = %v, want ErrClosed", conn.Err())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed after the listener was closed")
+	}
+
+	if _, err := l.Accept(); err == nil {
+		t.Error("original listener still accepting after the tunnel-owned handle was closed")
 	}
 }
 

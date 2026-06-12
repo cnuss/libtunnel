@@ -11,10 +11,15 @@ package v1
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"log/slog"
 	"net"
 	"net/url"
 )
+
+// ErrClosed is the Err result of a tunnel shut down deliberately — by
+// closing the listener returned from Connected.Listener.
+var ErrClosed = errors.New("tunnel closed")
 
 // Spec is the credential/identity set a Provider yields. Each backend defines
 // a concrete spec type (cloudflare.Spec for the Cloudflare backend); the core
@@ -69,8 +74,12 @@ type Connected[T Spec] interface {
 	// the listener (https when it terminates TLS, http otherwise). Blocks
 	// until a listener is provided.
 	LocalURL() *url.URL
-	// Listener returns the listener provided via WithListener, blocking until
-	// one arrives.
+	// Listener returns a tunnel-owned view of the listener provided via
+	// WithListener, blocking until one arrives. Closing it closes the tunnel
+	// too (Done fires, Err reports ErrClosed) — so an http.Server serving on
+	// it tears the tunnel down on Shutdown/Close. To restart the origin
+	// while the tunnel persists, close the original listener handed to
+	// WithListener instead and rebind the same address.
 	Listener() net.Listener
 
 	// Host is the first label of Hostname.

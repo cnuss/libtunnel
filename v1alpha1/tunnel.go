@@ -62,11 +62,29 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected[T] {
 	return t
 }
 
-// Listener returns the provided listener, blocking until WithListener is
-// called or the tunnel context is canceled (then nil).
+// Listener returns a tunnel-owned view of the provided listener, blocking
+// until WithListener is called or the tunnel context is canceled (then nil).
+// Closing the returned listener closes the tunnel; the original listener
+// stays caller-owned, so closing that restarts the origin while the tunnel
+// persists.
 func (t *TunnelImpl[T]) Listener() net.Listener {
 	<-await(t.ctx, t.listenerProvided)
-	return t.listener
+	if t.listener == nil {
+		return nil
+	}
+	return tunnelListener[T]{Listener: t.listener, t: t}
+}
+
+// tunnelListener ties the tunnel's lifetime to the listener handle handed to
+// callers: an http.Server shutting down on it tears the tunnel down too.
+type tunnelListener[T v1.Spec] struct {
+	net.Listener
+	t *TunnelImpl[T]
+}
+
+func (l tunnelListener[T]) Close() error {
+	l.t.cancel(v1.ErrClosed)
+	return l.Listener.Close()
 }
 
 // LocalPort is the listener's bound port. Blocks until a listener is
