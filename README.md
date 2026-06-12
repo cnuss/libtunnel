@@ -138,6 +138,12 @@ process's environment, and at construction it adopts one found there. A
 spawned child (or a re-exec) therefore connects under the same hostname —
 no second quick-tunnel resolution, no plumbing.
 
+Two guardrails keep the channel safe: a process never re-adopts a spec it
+exported itself (a second tunnel in the same process mints its own identity
+instead of inheriting the first one's), and the exported value is tagged
+with the backend that minted it, so a child running a different backend
+fails loudly instead of silently unmarshaling a foreign spec.
+
 ```go
 // parent: minting exports TUNNEL_SPEC as a side effect (never connects itself)
 libtunnel.New(libtunnel.Cloudflare()).Spec()

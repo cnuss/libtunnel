@@ -41,7 +41,7 @@ func TestLiveTunnel(t *testing.T) {
 	// Reuse the preflight mint: hand its spec to this tunnel through the
 	// environment (the Cloudflare chain adopts TUNNEL_SPEC before minting).
 	if preflightSpec != nil {
-		if entry, err := v1alpha1.SpecEnviron(preflightSpec); err == nil {
+		if entry, err := v1alpha1.SpecEnviron("cloudflare", preflightSpec); err == nil {
 			t.Setenv(v1alpha1.SpecEnv, strings.TrimPrefix(entry, v1alpha1.SpecEnv+"="))
 		}
 	}
@@ -276,13 +276,16 @@ func TestLiveTwoTunnels(t *testing.T) {
 				return
 			}
 
+			// 60s, not the usual 30s: with the self-export guard both tunnels
+			// always mint for real, and two simultaneous mints can draw a
+			// rate-limit backoff before the connect + DNS wait even starts.
 			select {
 			case <-conn.TunnelReady():
 			case <-conn.Done():
 				errs <- fmt.Errorf("%s: tunnel failed: %w", body, conn.Err())
 				return
-			case <-time.After(30 * time.Second):
-				errs <- fmt.Errorf("%s: tunnel not ready after 30s", body)
+			case <-time.After(60 * time.Second):
+				errs <- fmt.Errorf("%s: tunnel not ready after 60s", body)
 				return
 			}
 			// Retry briefly: TunnelReady proves a public resolver sees the

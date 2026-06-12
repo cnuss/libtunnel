@@ -15,7 +15,7 @@ import (
 // the tunnel with a descriptive cause instead of registering the zero UUID
 // with the edge. Runs offline — the ID check fires before any network use.
 func TestWithListenerRejectsMalformedSpecID(t *testing.T) {
-	t.Setenv("TUNNEL_SPEC", `{"id":"not-a-uuid","hostname":"x.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}`)
+	t.Setenv("TUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
