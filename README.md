@@ -103,7 +103,7 @@ type Connected[T Spec] interface {
     Spec() T
 
     TunnelReady() <-chan struct{}   // connection up + hostname resolves
-    HostnameReady() <-chan struct{} // hostname resolves on a public resolver
+    HostnameReady() <-chan struct{} // hostname resolves on authoritative NS
 }
 
 type Provider[T Spec] interface { Spec(ctx context.Context) (T, error) }

@@ -155,10 +155,11 @@ func TestEngineReceivesListener(t *testing.T) {
 }
 
 // TestTunnelReadyAfterEngineConnects uses a hostname that genuinely resolves
-// (Cloudflare's own) so the public-resolver readiness poller succeeds — the
-// fake engine supplies the connection half. Needs outbound DNS.
+// (and whose zone has reachable authoritative nameservers) so the readiness
+// poller succeeds — the fake engine supplies the connection half. Needs
+// outbound DNS.
 func TestTunnelReadyAfterEngineConnects(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "one.one.one.one"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
 
 	conn := tun.WithListener(listen(t))
 
@@ -166,25 +167,6 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 	case <-conn.TunnelReady():
 	case <-time.After(15 * time.Second):
 		t.Fatal("TunnelReady never closed after the engine connected")
-	}
-}
-
-// TestHostnameReadyBailsWhenNeverResolving feeds a hostname that cannot
-// exist (.invalid is reserved): the poller must walk its whole resolver
-// fleet and then cancel the tunnel with a descriptive cause rather than wait
-// forever. Needs outbound DNS; takes ~10s (one attempt per fleet member).
-func TestHostnameReadyBailsWhenNeverResolving(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "never.invalid"}))
-	tun.HostnameReady()
-
-	select {
-	case <-tun.Context().Done():
-		cause := context.Cause(tun.Context())
-		if cause == nil || !strings.Contains(cause.Error(), "did not resolve on any of") {
-			t.Errorf("cancel cause = %v, want fleet-exhausted message", cause)
-		}
-	case <-time.After(90 * time.Second):
-		t.Fatal("tunnel was not canceled after the resolver fleet was exhausted")
 	}
 }
 

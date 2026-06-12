@@ -81,8 +81,8 @@ type Connected[T Spec] interface {
 	Domain() string
 	// Port is the port encoded in Hostname, or 443 when absent.
 	Port() int
-	// URL is https://<Hostname>/. It blocks until the hostname resolves
-	// publicly (see HostnameReady).
+	// URL is https://<Hostname>/. It blocks until the hostname resolves on
+	// the zone's authoritative nameservers (see HostnameReady).
 	URL() *url.URL
 	// CACerts returns the trust roots the backend uses for its edge
 	// connections.
@@ -94,10 +94,9 @@ type Connected[T Spec] interface {
 	// TunnelReady is closed when the edge connection is up and the hostname
 	// resolves publicly — the tunnel is reachable end to end.
 	TunnelReady() <-chan struct{}
-	// HostnameReady is closed when the hostname resolves on a public
-	// resolver. The poller walks a fleet of well-known resolvers, consuming
-	// one per attempt; if the whole fleet is exhausted without an answer,
-	// the tunnel is canceled — the hostname is considered never coming.
+	// HostnameReady is closed when the hostname resolves on the zone's
+	// authoritative nameservers — polled directly, so recursive resolvers'
+	// negative caches never delay readiness.
 	HostnameReady() <-chan struct{}
 }
 
