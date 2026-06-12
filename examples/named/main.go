@@ -5,7 +5,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/cnuss/golib"
+	"github.com/cnuss/libtunnel"
 )
 
 type widget struct {
@@ -14,7 +14,7 @@ type widget struct {
 }
 
 func main() {
-	res := golib.New[widget]().
+	res := libtunnel.New[widget]().
 		WithName("widget").
 		WithValue(widget{ID: 7, Tags: []string{"alpha", "beta"}}).
 		Build()
