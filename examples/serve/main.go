@@ -45,6 +45,12 @@ func main() {
 	}()
 
 	fmt.Printf("local: %s\n", conn.LocalURL())
+
+	// HostnameReady fires once the hostname resolves on the zone's
+	// authoritative nameservers; TunnelReady once the edge connection is up
+	// too — the tunnel is then reachable end to end.
+	<-conn.HostnameReady()
+	fmt.Printf("hostname: %s\n", conn.Hostname())
 	<-conn.TunnelReady()
 	fmt.Printf("public: %s\n", conn.URL())
 
