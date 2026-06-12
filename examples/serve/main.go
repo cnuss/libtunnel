@@ -51,8 +51,9 @@ func main() {
 	// too — the tunnel is then reachable end to end.
 	<-conn.HostnameReady()
 	fmt.Printf("hostname: %s\n", conn.Hostname())
+
 	<-conn.TunnelReady()
-	fmt.Printf("public: %s\n", conn.URL())
+	fmt.Printf("✓ tunneled %s to %s\n", conn.LocalURL(), conn.URL())
 
 	resp, err := http.Get(conn.URL().String())
 	if err != nil {
