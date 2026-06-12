@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# The library is pure Go. Forcing CGO off keeps every matrix cell building the
+# same artifacts and sidesteps broken host toolchains — windows-11-arm runners
+# ship an x86_64 gcc that can't assemble runtime/cgo's arm64 stubs.
+env:
+  CGO_ENABLED: "0"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
