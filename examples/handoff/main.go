@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -63,21 +64,29 @@ func parent() {
 	defer cmd.Process.Kill()
 
 	// The child prints "ready: <url>" once the tunnel is reachable.
-	var publicURL string
+	var childURL string
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		line := scanner.Text()
 		fmt.Printf("child: %s\n", line)
 		if u, ok := strings.CutPrefix(line, "ready: "); ok {
-			publicURL = u
+			childURL = u
 			break
 		}
 	}
-	if publicURL == "" {
+	if childURL == "" {
 		log.Fatal("child exited before the tunnel became ready")
 	}
 
-	resp, err := http.Get(publicURL)
+	// The child must have connected under the exact hostname the parent
+	// minted — that's the point of the handoff.
+	if u, err := url.Parse(childURL); err != nil || u.Hostname() != spec.Hostname {
+		log.Fatalf("child connected under %q, want the minted hostname %q", childURL, spec.Hostname)
+	}
+
+	// Request through the parent's own handle on the hostname, not the
+	// child's echo: both processes share the same tunnel identity.
+	resp, err := http.Get("https://" + spec.Hostname + "/")
 	if err != nil {
 		log.Fatal(err)
 	}

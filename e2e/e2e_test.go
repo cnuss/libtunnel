@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,7 +70,6 @@ func TestExamples(t *testing.T) {
 	}{
 		{"offline", "domain: trycloudflare.com", false},
 		{"serve", "served: hello from libtunnel", true},
-		{"handoff", "handoff: hello from the child", true},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -80,5 +80,55 @@ func TestExamples(t *testing.T) {
 			t.Parallel()
 			assertExample(t, tc.name, tc.want)
 		})
+	}
+}
+
+// capture returns the remainder of the first output line starting with
+// prefix, and whether one was found.
+func capture(out, prefix string) (string, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), prefix); ok {
+			return rest, true
+		}
+	}
+	return "", false
+}
+
+// TestHandoffSharedHostname runs the handoff example and asserts the
+// parent→child spec handoff end to end: the parent mints a hostname, the
+// child (a subprocess) provides the listener and connects, and both interact
+// with the tunnel under the exact same hostname.
+func TestHandoffSharedHostname(t *testing.T) {
+	if os.Getenv("LIBTUNNEL_E2E_LIVE") != "1" {
+		t.Skip("live example (mints a real quick tunnel); set LIBTUNNEL_E2E_LIVE=1 to run")
+	}
+
+	r := newRunner(t, "handoff")
+	out, code := r.run(t)
+	if code != 0 {
+		t.Fatalf("handoff exited %d, want 0", code)
+	}
+
+	minted, ok := capture(out, "minted: ")
+	if !ok {
+		t.Fatalf("parent never printed the minted hostname:\n%s", out)
+	}
+
+	ready, ok := capture(out, "child: ready: ")
+	if !ok {
+		t.Fatalf("child never reported the tunnel ready:\n%s", out)
+	}
+	childURL, err := url.Parse(ready)
+	if err != nil {
+		t.Fatalf("child ready line %q is not a URL: %v", ready, err)
+	}
+	if childURL.Hostname() != minted {
+		t.Errorf("child connected under %q, want the parent's minted hostname %q", childURL.Hostname(), minted)
+	}
+
+	// The parent fetched through its own handle on the minted hostname; the
+	// served body proves the same tunnel carried both processes' traffic.
+	if want := "handoff: hello from the child"; !strings.Contains(out, want) {
+		t.Errorf("output does not contain %q — the parent's request through the shared hostname failed", want)
 	}
 }
