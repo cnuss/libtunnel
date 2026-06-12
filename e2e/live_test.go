@@ -40,7 +40,7 @@ func TestLiveTunnel(t *testing.T) {
 	// environment (the Cloudflare chain adopts TUNNEL_SPEC before minting).
 	if preflightSpec != nil {
 		if entry, err := v1alpha1.SpecEnviron(preflightSpec); err == nil {
-			t.Setenv(libtunnel.SpecEnv, strings.TrimPrefix(entry, libtunnel.SpecEnv+"="))
+			t.Setenv(v1alpha1.SpecEnv, strings.TrimPrefix(entry, v1alpha1.SpecEnv+"="))
 		}
 	}
 

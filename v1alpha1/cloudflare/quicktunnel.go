@@ -39,7 +39,7 @@ func QuickTunnel() *QuickTunnelProvider {
 	return &QuickTunnelProvider{}
 }
 
-var _ v1.Provider[*v1.CloudflareSpec] = (*QuickTunnelProvider)(nil)
+var _ v1.Provider[*Spec] = (*QuickTunnelProvider)(nil)
 
 // SetLogger adopts the tunnel's logger so retry warnings (rate limits
 // especially) surface through it. An explicitly set Log wins.
@@ -51,7 +51,7 @@ func (p *QuickTunnelProvider) SetLogger(log *slog.Logger) {
 
 // Spec implements v1.Provider. It blocks until credentials are minted or ctx
 // is done, backing off linearly between attempts (the API rate-limits).
-func (p *QuickTunnelProvider) Spec(ctx context.Context) (*v1.CloudflareSpec, error) {
+func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	log := p.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -70,7 +70,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*v1.CloudflareSpec, err
 		Timeout: 15 * time.Second,
 	}
 
-	fetch := func() (*v1.CloudflareSpec, error) {
+	fetch := func() (*Spec, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
@@ -107,7 +107,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*v1.CloudflareSpec, err
 				Code    int    `json:"code"`
 				Message string `json:"message"`
 			} `json:"errors"`
-			Result v1.CloudflareSpec `json:"result"`
+			Result Spec `json:"result"`
 		}
 
 		var data response

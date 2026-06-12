@@ -61,13 +61,12 @@ Three packages, stable/alpha versioning:
 github.com/cnuss/libtunnel                      — root façade: New, backends,
                                                   providers, handoff helpers.
 github.com/cnuss/libtunnel/v1                   — stable Tunnel[T]/Connected[T]/
-                                                  Provider[T]/Backend[T] contract
-                                                  + CloudflareSpec.
+                                                  Provider[T]/Backend[T] contract.
 github.com/cnuss/libtunnel/v1alpha1             — lazy tunnel core + generic
                                                   providers. May change between
                                                   alpha revisions.
 github.com/cnuss/libtunnel/v1alpha1/cloudflare  — the cloudflared quick-tunnel
-                                                  engine.
+                                                  engine + its Spec type.
 ```
 
 Application code imports the root (`libtunnel.New(...)`). Code that needs to
@@ -116,13 +115,12 @@ type Spec interface { GetHostname() string }
 
 // façade
 func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel[T]
-func Cloudflare() v1.Backend[*v1.CloudflareSpec] // in-process cloudflared engine;
+func Cloudflare() v1.Backend[*cloudflare.Spec]   // in-process cloudflared engine;
                                                  // adopts TUNNEL_SPEC, else mints
                                                  // an anonymous quick tunnel
 
-// parent→child handoff — no API: minting exports TUNNEL_SPEC, construction
-// adopts it
-const SpecEnv = "TUNNEL_SPEC"
+// parent→child handoff — no API: minting exports the TUNNEL_SPEC env var,
+// construction adopts it
 ```
 
 ## Parent→child handoff

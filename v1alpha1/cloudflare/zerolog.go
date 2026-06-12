@@ -1,6 +1,7 @@
 package cloudflare
 
 import (
+	"io"
 	"log/slog"
 	"strings"
 
@@ -14,6 +15,8 @@ import (
 type slogWriter struct {
 	log *slog.Logger
 }
+
+var _ io.Writer = slogWriter{}
 
 func (w slogWriter) Write(p []byte) (int, error) {
 	w.log.Debug(strings.TrimRight(string(p), "\n"))

@@ -11,7 +11,8 @@ Deep-link by filename; line numbers will drift.
 | Topic                                          | Source                                                           |
 | ---------------------------------------------- | ---------------------------------------------------------------- |
 | Façade (`New`, backends, providers, handoff)   | [`lib.go`](./lib.go)                                             |
-| Stable contract (`Tunnel[T]`, `Connected[T]`, `Provider[T]`, `Backend[T]`, `CloudflareSpec`) | [`v1/v1.go`](./v1/v1.go) |
+| Stable contract (`Tunnel[T]`, `Connected[T]`, `Provider[T]`, `Backend[T]`, `Spec`) | [`v1/v1.go`](./v1/v1.go) |
+| Cloudflare `Spec` type                         | [`v1alpha1/cloudflare/spec.go`](./v1alpha1/cloudflare/spec.go)   |
 | Core struct + `New` constructor + `Engine` contract | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)            |
 | Lazy getters + `With*` mutators + DNS readiness | [`v1alpha1/tunnel.go`](./v1alpha1/tunnel.go)                     |
 | Generic providers (`Static`, `Env`) + handoff helpers | [`v1alpha1/provider.go`](./v1alpha1/provider.go)          |
@@ -39,13 +40,12 @@ Stable/alpha versioning, with backend engines in alpha subpackages:
 github.com/cnuss/libtunnel                      — root façade: New, backends,
                                                   providers, handoff helpers.
 github.com/cnuss/libtunnel/v1                   — stable Tunnel[T]/Connected[T]/
-                                                  Provider[T]/Backend[T] contract
-                                                  + CloudflareSpec.
+                                                  Provider[T]/Backend[T] contract.
 github.com/cnuss/libtunnel/v1alpha1             — lazy tunnel core + generic
                                                   providers. May change between
                                                   alpha revisions.
 github.com/cnuss/libtunnel/v1alpha1/cloudflare  — the cloudflared quick-tunnel
-                                                  engine.
+                                                  engine + its Spec type.
 ```
 
 Application code imports the root (`libtunnel.New(...)`). Code that needs to

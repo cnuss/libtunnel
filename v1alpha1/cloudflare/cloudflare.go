@@ -51,7 +51,13 @@ func New() *Backend {
 	return &Backend{}
 }
 
-var _ v1alpha1.Engine[*v1.CloudflareSpec] = (*Backend)(nil)
+var (
+	_ v1.Backend[*Spec]      = (*Backend)(nil)
+	_ v1alpha1.Engine[*Spec] = (*Backend)(nil)
+	// One TunnelImpl serves both phases of the v1 contract.
+	_ v1.Tunnel[*Spec]    = (*v1alpha1.TunnelImpl[*Spec])(nil)
+	_ v1.Connected[*Spec] = (*v1alpha1.TunnelImpl[*Spec])(nil)
+)
 
 // Name implements v1.Backend.
 func (b *Backend) Name() string {
@@ -62,7 +68,7 @@ func (b *Backend) Name() string {
 // environment when a parent process handed one off, otherwise mint an
 // anonymous quick tunnel from api.trycloudflare.com. Mutators for named
 // tunnels / other endpoints will hang off Cloudflare() when they exist.
-func (b *Backend) Provider() v1.Provider[*v1.CloudflareSpec] {
+func (b *Backend) Provider() v1.Provider[*Spec] {
 	return v1alpha1.Env(QuickTunnel())
 }
 
@@ -96,7 +102,7 @@ func (b *Backend) CACerts() []*x509.Certificate {
 // until the first edge connection is up; the supervisor keeps running in the
 // background for the tunnel's lifetime, reporting fatal errors through
 // t.Cancel.
-func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*v1.CloudflareSpec], l net.Listener) error {
+func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) error {
 	ctx := t.Context()
 	log := zerologger(t.Logger())
 	spec := t.Spec()
@@ -233,6 +239,11 @@ type noopImpl struct {
 	origins.Metrics
 	prometheus.Registerer
 }
+
+var (
+	_ origins.Metrics       = (*noopImpl)(nil)
+	_ prometheus.Registerer = (*noopImpl)(nil)
+)
 
 func noop() *noopImpl {
 	return &noopImpl{}

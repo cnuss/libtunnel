@@ -107,11 +107,6 @@ type TunnelImpl[T v1.Spec] struct {
 	tunnelReady chan struct{}
 }
 
-var (
-	_ v1.Tunnel[*v1.CloudflareSpec]    = (*TunnelImpl[*v1.CloudflareSpec])(nil)
-	_ v1.Connected[*v1.CloudflareSpec] = (*TunnelImpl[*v1.CloudflareSpec])(nil)
-)
-
 // Context is the tunnel's lifetime context, canceled (with cause) on any
 // fatal tunnel error. Exposed for Engine implementations in subpackages.
 func (t *TunnelImpl[T]) Context() context.Context {

@@ -43,15 +43,10 @@ func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel[T] {
 
 // Cloudflare returns the Cloudflare backend: an in-process cloudflared
 // quick-tunnel engine (no cloudflared binary required). Its credential chain
-// adopts TUNNEL_SPEC from the environment when a parent process handed one
-// off, and mints an anonymous *.trycloudflare.com quick tunnel otherwise.
-func Cloudflare() v1.Backend[*v1.CloudflareSpec] {
+// adopts a spec from the TUNNEL_SPEC environment variable when a parent
+// process handed one off, mints an anonymous *.trycloudflare.com quick
+// tunnel otherwise, and exports a freshly minted spec back into the
+// environment so spawned children inherit the same tunnel identity.
+func Cloudflare() v1.Backend[*cloudflare.Spec] {
 	return cloudflare.New()
 }
-
-// SpecEnv is the environment variable carrying a JSON-encoded spec across a
-// process boundary — the parent→child handoff channel. There is nothing to
-// call: the Cloudflare credential chain adopts a spec found here at
-// construction, and exports a freshly minted one, so spawned children (or a
-// re-exec) inherit the same tunnel identity automatically.
-const SpecEnv = v1alpha1.SpecEnv

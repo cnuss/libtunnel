@@ -33,8 +33,8 @@ func Example() {
 // Cloudflare credential chain adopts it at construction — no API to call.
 // Here the environment is populated by hand to stand in for the parent.
 func Example_handoff() {
-	os.Setenv(libtunnel.SpecEnv, `{"hostname":"demo.trycloudflare.com"}`)
-	defer os.Unsetenv(libtunnel.SpecEnv)
+	os.Setenv("TUNNEL_SPEC", `{"hostname":"demo.trycloudflare.com"}`)
+	defer os.Unsetenv("TUNNEL_SPEC")
 
 	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Println(t.Hostname())
@@ -44,8 +44,8 @@ func Example_handoff() {
 // Getters resolve lazily from the backend's credential chain — here a spec
 // adopted from the environment, so nothing touches the network.
 func Example_lazy() {
-	os.Setenv(libtunnel.SpecEnv, `{"hostname":"demo.trycloudflare.com"}`)
-	defer os.Unsetenv(libtunnel.SpecEnv)
+	os.Setenv("TUNNEL_SPEC", `{"hostname":"demo.trycloudflare.com"}`)
+	defer os.Unsetenv("TUNNEL_SPEC")
 
 	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Printf("%s . %s : %d\n", t.Host(), t.Domain(), t.Port())

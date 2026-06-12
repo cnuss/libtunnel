@@ -14,8 +14,8 @@ import (
 	"testing"
 
 	"github.com/cnuss/libtunnel"
-	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
 // roleEnv selects a child role inside a re-exec'd test binary.
@@ -52,7 +52,7 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 		return
 	}
 
-	spec := &v1.CloudflareSpec{
+	spec := &cloudflare.Spec{
 		ID:         "00000000-0000-0000-0000-000000000000",
 		Name:       "lib-scenario",
 		Hostname:   "scenario.trycloudflare.com",
@@ -90,12 +90,12 @@ func TestReExecInheritsSpec(t *testing.T) {
 		return
 	}
 
-	spec := &v1.CloudflareSpec{Hostname: "reexec.trycloudflare.com"}
+	spec := &cloudflare.Spec{Hostname: "reexec.trycloudflare.com"}
 	entry, err := v1alpha1.SpecEnviron(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(libtunnel.SpecEnv, strings.TrimPrefix(entry, libtunnel.SpecEnv+"="))
+	t.Setenv(v1alpha1.SpecEnv, strings.TrimPrefix(entry, v1alpha1.SpecEnv+"="))
 
 	out, err := reexec("TestReExecInheritsSpec", roleEnv+"=reexec-child").CombinedOutput()
 	t.Logf("child output:\n%s", out)
@@ -128,7 +128,7 @@ func TestHandoffChain(t *testing.T) {
 		return
 	}
 
-	spec := &v1.CloudflareSpec{Hostname: "chain.trycloudflare.com"}
+	spec := &cloudflare.Spec{Hostname: "chain.trycloudflare.com"}
 	entry, err := v1alpha1.SpecEnviron(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +163,7 @@ func TestMalformedSpecEnv(t *testing.T) {
 		os.Exit(0) // unexpected: parent will flag the zero exit
 	}
 
-	cmd := reexec("TestMalformedSpecEnv", roleEnv+"=malformed-child", libtunnel.SpecEnv+"={this is not json")
+	cmd := reexec("TestMalformedSpecEnv", roleEnv+"=malformed-child", v1alpha1.SpecEnv+"={this is not json")
 	out, err := cmd.CombinedOutput()
 	t.Logf("child output:\n%s", out)
 	if err == nil {
@@ -186,7 +186,7 @@ func TestSpecHostnameWithPort(t *testing.T) {
 		return
 	}
 
-	spec := &v1.CloudflareSpec{Hostname: "scenario.trycloudflare.com:8443"}
+	spec := &cloudflare.Spec{Hostname: "scenario.trycloudflare.com:8443"}
 	entry, err := v1alpha1.SpecEnviron(spec)
 	if err != nil {
 		t.Fatal(err)

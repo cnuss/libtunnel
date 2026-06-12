@@ -16,6 +16,19 @@ import (
 // adopts it through Env and connects with the same hostname and credentials.
 const SpecEnv = "TUNNEL_SPEC"
 
+// assertSpec is a minimal v1.Spec used only by the compile-time interface
+// assertions below — this package cannot import a real backend's spec type
+// without creating a cycle.
+type assertSpec struct{}
+
+func (*assertSpec) GetHostname() string { return "" }
+
+var (
+	_ v1.Spec                  = (*assertSpec)(nil)
+	_ v1.Provider[*assertSpec] = staticProvider[*assertSpec]{}
+	_ v1.Provider[*assertSpec] = envProvider[assertSpec, *assertSpec]{}
+)
+
 // Static returns a provider that yields the given spec verbatim. Useful for
 // replaying known credentials (tests, fixed tunnels).
 func Static[T v1.Spec](spec T) v1.Provider[T] {
@@ -34,7 +47,7 @@ func (p staticProvider[T]) Spec(context.Context) (T, error) {
 // carries a spec, it wins; otherwise the wrapped provider resolves one and
 // the result is exported back into this process's environment, so spawned
 // children inherit the same tunnel identity with no further plumbing. E is
-// the concrete spec struct (e.g. v1.CloudflareSpec) — inferred from the
+// the concrete spec struct (e.g. cloudflare.Spec) — inferred from the
 // wrapped provider's *E spec type.
 func Env[E any, T interface {
 	*E

@@ -24,8 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cnuss/libtunnel"
-	v1 "github.com/cnuss/libtunnel/v1"
+	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
@@ -53,7 +52,7 @@ func gateLive(t *testing.T) {
 	if err := preflight(); err != nil {
 		t.Fatalf("live preflight failed (skipping the expensive part): %v", err)
 	}
-	t.Setenv(libtunnel.SpecEnv, "")
+	t.Setenv(v1alpha1.SpecEnv, "")
 	paceLive()
 }
 
@@ -65,7 +64,7 @@ func gateLive(t *testing.T) {
 var (
 	preflightOnce sync.Once
 	preflightErr  error
-	preflightSpec *v1.CloudflareSpec
+	preflightSpec *cloudflare.Spec
 )
 
 func preflight() error {

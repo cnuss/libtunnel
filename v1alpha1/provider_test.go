@@ -9,10 +9,11 @@ import (
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
 func TestSpecEnvironRoundTrip(t *testing.T) {
-	spec := &v1.CloudflareSpec{
+	spec := &cloudflare.Spec{
 		ID:         "id-1",
 		Name:       "name-1",
 		Hostname:   "demo.trycloudflare.com",
@@ -30,7 +31,7 @@ func TestSpecEnvironRoundTrip(t *testing.T) {
 
 	t.Setenv(v1alpha1.SpecEnv, entry[len(v1alpha1.SpecEnv)+1:])
 
-	adopted := &v1.CloudflareSpec{}
+	adopted := &cloudflare.Spec{}
 	ok, err := v1alpha1.SpecFromEnv(adopted)
 	if err != nil {
 		t.Fatal(err)
@@ -45,12 +46,12 @@ func TestSpecEnvironRoundTrip(t *testing.T) {
 
 func TestExportSpec(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "") // restore after the test
-	spec := &v1.CloudflareSpec{Hostname: "exported.trycloudflare.com"}
+	spec := &cloudflare.Spec{Hostname: "exported.trycloudflare.com"}
 	if err := v1alpha1.ExportSpec(spec); err != nil {
 		t.Fatal(err)
 	}
 
-	adopted := &v1.CloudflareSpec{}
+	adopted := &cloudflare.Spec{}
 	if ok, err := v1alpha1.SpecFromEnv(adopted); err != nil || !ok {
 		t.Fatalf("SpecFromEnv = (%t, %v) after ExportSpec; want (true, nil)", ok, err)
 	}
@@ -61,14 +62,14 @@ func TestExportSpec(t *testing.T) {
 
 func TestSpecFromEnvAbsent(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "")
-	if ok, err := v1alpha1.SpecFromEnv(&v1.CloudflareSpec{}); ok || err != nil {
+	if ok, err := v1alpha1.SpecFromEnv(&cloudflare.Spec{}); ok || err != nil {
 		t.Errorf("SpecFromEnv = (%t, %v) with no env; want (false, nil)", ok, err)
 	}
 }
 
 func TestSpecFromEnvMalformed(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "{not json")
-	if ok, err := v1alpha1.SpecFromEnv(&v1.CloudflareSpec{}); err == nil {
+	if ok, err := v1alpha1.SpecFromEnv(&cloudflare.Spec{}); err == nil {
 		t.Errorf("SpecFromEnv = (%t, nil) with malformed env; want an error", ok)
 	}
 }
@@ -76,19 +77,25 @@ func TestSpecFromEnvMalformed(t *testing.T) {
 // trackingProvider records whether it was consulted.
 type trackingProvider struct {
 	called bool
-	spec   *v1.CloudflareSpec
+	spec   *cloudflare.Spec
 }
 
-func (p *trackingProvider) Spec(context.Context) (*v1.CloudflareSpec, error) {
+func (p *trackingProvider) Spec(context.Context) (*cloudflare.Spec, error) {
 	p.called = true
 	return p.spec, nil
 }
+
+var (
+	_ v1.Provider[*cloudflare.Spec]     = (*trackingProvider)(nil)
+	_ v1.Provider[*cloudflare.Spec]     = (*loggingProvider)(nil)
+	_ v1alpha1.Engine[*cloudflare.Spec] = loggerEngine{}
+)
 
 func TestEnvProviderAdoptsEnvironment(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, `{"hostname":"fromenv.trycloudflare.com"}`)
 
 	next := &trackingProvider{}
-	spec, err := v1alpha1.Env[v1.CloudflareSpec](next).Spec(context.Background())
+	spec, err := v1alpha1.Env[cloudflare.Spec](next).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,8 +110,8 @@ func TestEnvProviderAdoptsEnvironment(t *testing.T) {
 func TestEnvProviderFallsBack(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "")
 
-	next := &trackingProvider{spec: &v1.CloudflareSpec{Hostname: "minted.trycloudflare.com"}}
-	spec, err := v1alpha1.Env[v1.CloudflareSpec](next).Spec(context.Background())
+	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "minted.trycloudflare.com"}}
+	spec, err := v1alpha1.Env[cloudflare.Spec](next).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +124,7 @@ func TestEnvProviderFallsBack(t *testing.T) {
 }
 
 func TestStaticProvider(t *testing.T) {
-	want := &v1.CloudflareSpec{Hostname: "static.trycloudflare.com"}
+	want := &cloudflare.Spec{Hostname: "static.trycloudflare.com"}
 	got, err := v1alpha1.Static(want).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +144,7 @@ func (p *loggingProvider) SetLogger(log *slog.Logger) { p.log = log }
 
 func TestTunnelThreadsLoggerIntoProvider(t *testing.T) {
 	want := slog.New(slog.DiscardHandler)
-	provider := &loggingProvider{trackingProvider: trackingProvider{spec: &v1.CloudflareSpec{Hostname: "x.y"}}}
+	provider := &loggingProvider{trackingProvider: trackingProvider{spec: &cloudflare.Spec{Hostname: "x.y"}}}
 
 	v1alpha1.New(loggerEngine{provider}).WithLogger(want).Spec()
 
@@ -149,9 +156,9 @@ func TestTunnelThreadsLoggerIntoProvider(t *testing.T) {
 func TestEnvProviderForwardsLogger(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "")
 	want := slog.New(slog.DiscardHandler)
-	inner := &loggingProvider{trackingProvider: trackingProvider{spec: &v1.CloudflareSpec{}}}
+	inner := &loggingProvider{trackingProvider: trackingProvider{spec: &cloudflare.Spec{}}}
 
-	wrapped := v1alpha1.Env[v1.CloudflareSpec](inner)
+	wrapped := v1alpha1.Env[cloudflare.Spec](inner)
 	if pl, ok := wrapped.(interface{ SetLogger(*slog.Logger) }); !ok {
 		t.Fatal("Env provider does not forward SetLogger")
 	} else {
@@ -164,25 +171,25 @@ func TestEnvProviderForwardsLogger(t *testing.T) {
 
 // loggerEngine is a minimal engine whose provider is injected.
 type loggerEngine struct {
-	provider v1.Provider[*v1.CloudflareSpec]
+	provider v1.Provider[*cloudflare.Spec]
 }
 
-func (e loggerEngine) Name() string                              { return "logger-fake" }
-func (e loggerEngine) Provider() v1.Provider[*v1.CloudflareSpec] { return e.provider }
-func (e loggerEngine) CACerts() []*x509.Certificate              { return nil }
-func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*v1.CloudflareSpec], l net.Listener) error {
+func (e loggerEngine) Name() string                            { return "logger-fake" }
+func (e loggerEngine) Provider() v1.Provider[*cloudflare.Spec] { return e.provider }
+func (e loggerEngine) CACerts() []*x509.Certificate            { return nil }
+func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }
 
 func TestEnvProviderExportsMintedSpec(t *testing.T) {
 	t.Setenv(v1alpha1.SpecEnv, "")
 
-	next := &trackingProvider{spec: &v1.CloudflareSpec{Hostname: "minted.trycloudflare.com"}}
-	if _, err := v1alpha1.Env[v1.CloudflareSpec](next).Spec(context.Background()); err != nil {
+	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "minted.trycloudflare.com"}}
+	if _, err := v1alpha1.Env[cloudflare.Spec](next).Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	adopted := &v1.CloudflareSpec{}
+	adopted := &cloudflare.Spec{}
 	if ok, err := v1alpha1.SpecFromEnv(adopted); err != nil || !ok {
 		t.Fatalf("SpecFromEnv = (%t, %v) after a mint; want the spec exported", ok, err)
 	}
