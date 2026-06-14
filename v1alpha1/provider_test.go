@@ -170,7 +170,7 @@ func TestTunnelThreadsLoggerIntoProvider(t *testing.T) {
 	want := slog.New(slog.DiscardHandler)
 	provider := &loggingProvider{trackingProvider: trackingProvider{spec: &cloudflare.Spec{Hostname: "x.y"}}}
 
-	v1alpha1.New(loggerEngine{provider}).WithLogger(want).Spec()
+	v1alpha1.New(loggerEngine{provider}).WithLogger(want).Hostname() // forces the spec fetch
 
 	if provider.log != want {
 		t.Errorf("provider received logger %p, want the tunnel's %p", provider.log, want)

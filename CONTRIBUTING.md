@@ -11,7 +11,7 @@ Deep-link by filename; line numbers will drift.
 | Topic                                          | Source                                                           |
 | ---------------------------------------------- | ---------------------------------------------------------------- |
 | Façade (`New`, backends, providers, handoff)   | [`lib.go`](./lib.go)                                             |
-| Stable contract (`Tunnel[T]`, `Connected[T]`, `Provider[T]`, `Backend[T]`, `Spec`) | [`v1/v1.go`](./v1/v1.go) |
+| Stable contract (`Tunnel`, `Tunneled`, `Provider[T]`, `Backend[T]`, `Spec`) | [`v1/v1.go`](./v1/v1.go) |
 | Cloudflare `Spec` type                         | [`v1alpha1/cloudflare/spec.go`](./v1alpha1/cloudflare/spec.go)   |
 | Core struct + `New` constructor + `Engine` contract | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)            |
 | Lazy getters + `With*` mutators + DNS readiness | [`v1alpha1/tunnel.go`](./v1alpha1/tunnel.go)                     |
@@ -39,7 +39,7 @@ Stable/alpha versioning, with backend engines in alpha subpackages:
 ```
 github.com/cnuss/libtunnel                      — root façade: New, backends,
                                                   providers, handoff helpers.
-github.com/cnuss/libtunnel/v1                   — stable Tunnel[T]/Connected[T]/
+github.com/cnuss/libtunnel/v1                   — stable Tunnel/Tunneled +
                                                   Provider[T]/Backend[T] contract.
 github.com/cnuss/libtunnel/v1alpha1             — lazy tunnel core + generic
                                                   providers. May change between
