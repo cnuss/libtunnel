@@ -73,8 +73,11 @@ func TestLiveTunnel(t *testing.T) {
 	// Free the hostname when done — TestLiveResurrection reuses this spec.
 	defer conn.Listener().Close()
 
-	if got := conn.LocalURL().Scheme; got != "https" {
-		t.Errorf("LocalURL scheme = %q, want https for a TLS listener", got)
+	// LocalURL is the local bind address — always http, regardless of the
+	// origin's TLS (declared on the backend via WithTLS). The public URL below
+	// carries the real scheme.
+	if got := conn.LocalURL().Scheme; got != "http" {
+		t.Errorf("LocalURL scheme = %q, want http (local bind address)", got)
 	}
 
 	waitReady(t, conn, 30*time.Second)
