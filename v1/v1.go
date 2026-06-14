@@ -124,6 +124,11 @@ type Tunnel[T Spec] interface {
 
 	// WithLogger sets the logger. Unset, the tunnel is silent.
 	WithLogger(log *slog.Logger) Tunnel[T]
+	// WithContext threads a caller context into URL: once set, URL waits for
+	// the tunnel to be reachable end to end (TunnelReady), honoring the
+	// context, instead of only for the hostname to resolve — and returns nil
+	// if the context is done first. Unset (or nil), URL waits on DNS alone.
+	WithContext(ctx context.Context) Tunnel[T]
 	// WithListener provides the local listener and lazily starts the edge
 	// connection. It is the terminal mutator: the returned Connected carries
 	// no further configuration surface. The tunnel infers the origin scheme

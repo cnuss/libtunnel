@@ -196,6 +196,55 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 	}
 }
 
+// TestWithContextURLWaitsForTunnelReady pins WithContext's upgrade: with a
+// caller context set, URL blocks until TunnelReady (not DNS alone) and then
+// returns the public URL. Needs outbound DNS (same as
+// TestTunnelReadyAfterEngineConnects).
+func TestWithContextURLWaitsForTunnelReady(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})).
+		WithContext(context.Background())
+	conn := tun.WithListener(listen(t))
+
+	got := make(chan string, 1)
+	go func() {
+		if u := conn.URL(); u != nil {
+			got <- u.String()
+		} else {
+			got <- ""
+		}
+	}()
+
+	select {
+	case u := <-got:
+		if u != "https://www.cloudflare.com/" {
+			t.Errorf("URL() = %q, want https://www.cloudflare.com/", u)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("URL never returned after the engine connected")
+	}
+}
+
+// TestWithContextURLReturnsNilOnContextCancel pins that the caller's context
+// caps URL's wait without killing the tunnel: a canceled context yields nil
+// from URL, but the tunnel stays alive (Err stays nil). The .invalid hostname
+// never resolves, so TunnelReady never fires — only the canceled context can
+// unblock URL, making the nil deterministic.
+func TestWithContextURLReturnsNilOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // caller gives up immediately; the tunnel is still coming up
+
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "never.resolves.invalid"})).
+		WithContext(ctx)
+	conn := tun.WithListener(listen(t))
+
+	if u := conn.URL(); u != nil {
+		t.Errorf("URL() = %v with a canceled context, want nil", u)
+	}
+	if err := tun.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil — the caller's context must not cancel the tunnel", err)
+	}
+}
+
 func TestForeignBackendCancels(t *testing.T) {
 	tun := v1alpha1.New[*cloudflare.Spec](foreignBackend{})
 	tun.WithListener(listen(t))

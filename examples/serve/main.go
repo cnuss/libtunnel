@@ -7,6 +7,8 @@
 package main
 
 import (
+	"cmp"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +22,11 @@ import (
 )
 
 func main() {
+	// One context governs everything below: tunnel readiness (via WithContext)
+	// and the proof-of-round-trip fetch share this single deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
 	// You own the bind. The tunnel infers everything else from the listener —
 	// including whether the origin speaks TLS (wrap with tls.NewListener and
 	// the ingress switches to https automatically).
@@ -34,55 +41,65 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	conn := libtunnel.New(libtunnel.Cloudflare()).
+	// WithContext upgrades URL from "the hostname resolves" to "the tunnel is
+	// reachable end to end": URL then blocks until TunnelReady, honoring ctx.
+	tun := libtunnel.New(libtunnel.Cloudflare()).
 		WithLogger(logger).
+		WithContext(ctx).
 		WithListener(l)
 
 	go func() {
-		err := http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := http.Serve(tun.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "hello from libtunnel")
 		}))
 		log.Fatal(err)
 	}()
 
-	fmt.Printf("local: %s\n", conn.LocalURL())
+	fmt.Printf("local: %s\n", tun.LocalURL())
 
-	// TunnelReady fires when the edge connection is up and the hostname
-	// resolves publicly; Done fires if the tunnel fails instead — always
-	// select on both, or a failed tunnel blocks forever.
-	select {
-	case <-conn.TunnelReady():
-	case <-conn.Done():
-		log.Fatal(conn.Err())
+	// URL returns nil if the tunnel failed or the deadline elapsed first —
+	// Err() reports a tunnel failure, ctx.Err() a timeout.
+	url := tun.URL()
+	if url == nil {
+		log.Fatal(cmp.Or(tun.Err(), ctx.Err()))
 	}
-	fmt.Printf("✓ tunneled %s to %s\n", conn.LocalURL(), conn.URL())
+	fmt.Printf("✓ tunneled %s to %s\n", tun.LocalURL(), url)
 
 	// The first request can race propagation: TunnelReady proves the
 	// authoritative nameservers serve the record, but this machine's own
-	// resolver and the edge route may lag a few seconds behind. Retry briefly
-	// — real clients hitting a fresh tunnel face the same window.
-	body, err := fetch(conn.URL().String())
+	// resolver and the edge route may lag a few seconds behind. Retry — the
+	// same ctx bounds the wait, so it shares the deadline with readiness above.
+	body, err := fetch(ctx, url.String())
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("served: %s\n", body)
 }
 
-// fetch GETs url, retrying for up to 30 seconds until it answers 200.
-func fetch(url string) (string, error) {
+// fetch GETs url, retrying until it answers 200 or ctx is done.
+func fetch(ctx context.Context, url string) (string, error) {
 	var lastErr error
-	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Second) {
-		resp, err := http.Get(url)
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return "", err
+		}
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			lastErr = err
-			continue
+		} else {
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err == nil && resp.StatusCode == http.StatusOK {
+				return string(body), nil
+			}
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
 		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err == nil && resp.StatusCode == http.StatusOK {
-			return string(body), nil
+
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("%s never answered: %w", url, cmp.Or(lastErr, ctx.Err()))
+		case <-time.After(2 * time.Second):
 		}
-		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
 	}
-	return "", fmt.Errorf("%s never answered: %w", url, lastErr)
 }
