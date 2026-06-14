@@ -38,7 +38,7 @@ type Engine[T v1.Spec] interface {
 
 // New returns an unstarted tunnel for the given backend, which also supplies
 // the credential provider. The root libtunnel.New façade wraps this and
-// returns the v1.Tunnel[T] interface.
+// returns the non-generic v1.Tunnel interface.
 //
 // The backend must implement this package's Engine contract (backends from
 // façade constructors such as libtunnel.Cloudflare() do); a foreign Backend

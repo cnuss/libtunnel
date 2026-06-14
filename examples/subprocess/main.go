@@ -36,13 +36,15 @@ func main() {
 // inherits the tunnel identity with no plumbing at all.
 func parent() {
 	t := libtunnel.New(libtunnel.Cloudflare())
-	spec := t.Spec()
-	if spec == nil {
-		// Spec returns the zero value when minting fails (e.g. a malformed
-		// TUNNEL_SPEC already in the environment); Err carries the cause.
+	hostname := t.Hostname()
+	if hostname == "" {
+		// Hostname forces the mint and returns "" when it fails (e.g. a
+		// malformed TUNNEL_SPEC already in the environment); Err carries the
+		// cause. Minting exports the spec into the environment as a side
+		// effect, so the spawned child inherits it.
 		log.Fatalf("unable to mint a tunnel spec: %v", t.Err())
 	}
-	fmt.Printf("minted: %s\n", spec.Hostname)
+	fmt.Printf("minted: %s\n", hostname)
 
 	cmd := exec.Command(os.Args[0], "child")
 	cmd.Stderr = os.Stderr
@@ -74,7 +76,7 @@ func parent() {
 	// child through the hostname it minted itself. The first request can race
 	// propagation (this machine's resolver and the edge route may lag the
 	// authoritative servers by a few seconds), so retry briefly.
-	body, err := fetch("https://" + spec.Hostname + "/")
+	body, err := fetch("https://" + hostname + "/")
 	if err != nil {
 		log.Fatal(err)
 	}

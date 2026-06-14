@@ -35,13 +35,16 @@ import (
 )
 
 // New returns an unstarted tunnel on the given backend, which also supplies
-// the credential chain. T is the backend's spec type and is inferred:
+// the credential chain. T is the backend's spec type, inferred from the
+// backend and used only to wire the credential chain — it does not appear in
+// the returned type, so the tunnel reference is non-generic and storable
+// without threading the spec type through caller code:
 //
 //	libtunnel.New(libtunnel.Cloudflare())
 //
 // Configure the result with With* methods; WithListener starts the
 // connection.
-func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel[T] {
+func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel {
 	return v1alpha1.New(backend)
 }
 

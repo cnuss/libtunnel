@@ -8,7 +8,7 @@ agent-specific framing.
 
 1. [README.md](./README.md) — what the library does + public surface
 2. [CONTRIBUTING.md](./CONTRIBUTING.md) — layout, dev loop, conventions, PR flow
-3. [`v1/v1.go`](./v1/v1.go) — public `Tunnel[T]`/`Connected[T]`/`Provider[T]`/`Backend[T]` contract
+3. [`v1/v1.go`](./v1/v1.go) — public `Tunnel`/`Connected` + `Provider[T]`/`Backend[T]` contract
 4. [`examples/serve/main.go`](./examples/serve/main.go) — minimal live call site
 
 ## Before you touch anything

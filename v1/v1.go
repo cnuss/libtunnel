@@ -59,7 +59,11 @@ type Backend[T Spec] interface {
 // All getters are lazy and resolve on first use; getters that need state that
 // is not yet available block until it is (or until the tunnel's context is
 // canceled), in which case they return zero values.
-type Connected[T Spec] interface {
+//
+// It is non-generic: the backend spec type is a construction-time detail that
+// does not outlive New, so callers can store a tunnel reference without
+// threading the spec type through their own code.
+type Connected interface {
 	// LocalIP is the listener's bound IP. A listener bound to an unspecified
 	// address (0.0.0.0 / ::) falls back to the outbound-route IP, discovered
 	// with a UDP dial that sends no packets. Blocks until a listener is
@@ -96,9 +100,6 @@ type Connected[T Spec] interface {
 	// CACerts returns the trust roots the backend uses for its edge
 	// connections.
 	CACerts() []*x509.Certificate
-	// Spec returns the resolved tunnel spec, fetching it from the Provider on
-	// first use.
-	Spec() T
 
 	// TunnelReady is closed when the edge connection is up and the hostname
 	// resolves publicly — the tunnel is reachable end to end. It is never
@@ -118,22 +119,23 @@ type Connected[T Spec] interface {
 
 // Tunnel is the configurable phase returned by libtunnel.New. All Connected
 // observers work here too (they resolve lazily); the mutators disappear once
-// WithListener narrows the type to Connected.
-type Tunnel[T Spec] interface {
-	Connected[T]
+// WithListener narrows the type to Connected. Like Connected, it is
+// non-generic — the spec type does not outlive construction.
+type Tunnel interface {
+	Connected
 
 	// WithLogger sets the logger. Unset, the tunnel is silent.
-	WithLogger(log *slog.Logger) Tunnel[T]
+	WithLogger(log *slog.Logger) Tunnel
 	// WithContext threads a caller context into URL: once set, URL waits for
 	// the tunnel to be reachable end to end (TunnelReady), honoring the
 	// context, instead of only for the hostname to resolve — and returns nil
 	// if the context is done first. Unset (or nil), URL waits on DNS alone.
-	WithContext(ctx context.Context) Tunnel[T]
+	WithContext(ctx context.Context) Tunnel
 	// WithListener provides the local listener and lazily starts the edge
 	// connection. It is the terminal mutator: the returned Connected carries
 	// no further configuration surface. The tunnel infers the origin scheme
 	// from the listener: TLS listeners (tls.Listen, or any listener with a
 	// TLS() bool method reporting true) are dialed over https, plain ones
 	// over http.
-	WithListener(l net.Listener) Connected[T]
+	WithListener(l net.Listener) Connected
 }

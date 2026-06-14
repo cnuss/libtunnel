@@ -67,9 +67,9 @@ func New() *Backend {
 var (
 	_ v1.Backend[*Spec]      = (*Backend)(nil)
 	_ v1alpha1.Engine[*Spec] = (*Backend)(nil)
-	// One TunnelImpl serves both phases of the v1 contract.
-	_ v1.Tunnel[*Spec]    = (*v1alpha1.TunnelImpl[*Spec])(nil)
-	_ v1.Connected[*Spec] = (*v1alpha1.TunnelImpl[*Spec])(nil)
+	// One TunnelImpl serves both phases of the (non-generic) v1 contract.
+	_ v1.Tunnel    = (*v1alpha1.TunnelImpl[*Spec])(nil)
+	_ v1.Connected = (*v1alpha1.TunnelImpl[*Spec])(nil)
 )
 
 // Name implements v1.Backend.

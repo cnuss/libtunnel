@@ -105,7 +105,7 @@ const readyPrefix = "ready: "
 // tunnel dies first (Done) or never readies within d. waitReady is the
 // t.Fatal form; scenarios that wait inside worker goroutines (where t.Fatal
 // is illegal) use this directly.
-func readyErr(conn v1.Connected[*cloudflare.Spec], d time.Duration) error {
+func readyErr(conn v1.Connected, d time.Duration) error {
 	select {
 	case <-conn.TunnelReady():
 		return nil
@@ -118,7 +118,7 @@ func readyErr(conn v1.Connected[*cloudflare.Spec], d time.Duration) error {
 
 // waitReady waits for TunnelReady with a deadline, failing fast when the
 // tunnel dies first (Done) or never readies within d.
-func waitReady(t *testing.T, conn v1.Connected[*cloudflare.Spec], d time.Duration) {
+func waitReady(t *testing.T, conn v1.Connected, d time.Duration) {
 	t.Helper()
 	if err := readyErr(conn, d); err != nil {
 		t.Fatal(err)

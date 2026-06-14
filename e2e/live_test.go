@@ -178,12 +178,12 @@ func TestLiveResurrection(t *testing.T) {
 	// "530 origin unregistered" long after a new connector registers.)
 	// Minting exports the spec into this process's environment, so the
 	// spawned children inherit the tunnel identity with no plumbing.
-	spec := libtunnel.New(libtunnel.Cloudflare()).Spec()
-	if spec == nil || spec.Hostname == "" {
+	hostname := libtunnel.New(libtunnel.Cloudflare()).Hostname()
+	if hostname == "" {
 		t.Fatal("failed to mint a spec")
 	}
-	t.Logf("minted: %s", spec.Hostname)
-	url := "https://" + spec.Hostname + "/"
+	t.Logf("minted: %s", hostname)
+	url := "https://" + hostname + "/"
 
 	spawn := func(body string) (kill func()) {
 		t.Helper()

@@ -19,7 +19,7 @@ import (
 )
 
 // WithLogger sets the logger. A no-op once a listener has been provided.
-func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel[T] {
+func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel {
 	select {
 	case <-t.listenerProvided:
 	default:
@@ -34,7 +34,7 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel[T] {
 // "the hostname resolves" to "the tunnel is reachable end to end" — it waits
 // for TunnelReady, honoring this context, and returns nil if the context is
 // done first. A no-op once a listener has been provided, or if ctx is nil.
-func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel[T] {
+func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 	select {
 	case <-t.listenerProvided:
 	default:
@@ -49,7 +49,7 @@ func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel[T] {
 // connection. The listener is the single source of local-side truth: LocalIP,
 // LocalPort, and LocalURL all derive from its address. The returned
 // v1.Connected carries no mutators — there is nothing left to configure.
-func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected[T] {
+func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected {
 	t.listenerOnce.Do(func() {
 		t.Logger().Info("configuring tunnel with local listener", "address", l.Addr().String())
 		t.listener = l
