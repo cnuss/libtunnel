@@ -30,6 +30,21 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel[T] {
 	return t
 }
 
+// WithContext threads a caller context into URL: once set, URL upgrades from
+// "the hostname resolves" to "the tunnel is reachable end to end" — it waits
+// for TunnelReady, honoring this context, and returns nil if the context is
+// done first. A no-op once a listener has been provided, or if ctx is nil.
+func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel[T] {
+	select {
+	case <-t.listenerProvided:
+	default:
+		if ctx != nil {
+			t.userCtx.Store(&ctx)
+		}
+	}
+	return t
+}
+
 // WithListener provides the local listener and lazily starts the edge
 // connection. The listener is the single source of local-side truth: LocalIP,
 // LocalPort, and LocalURL all derive from its address. The returned
@@ -245,9 +260,25 @@ func (t *TunnelImpl[T]) Port() int {
 // before that happens, per the v1 contract's zero-value-on-cancel rule.
 func (t *TunnelImpl[T]) URL() *url.URL {
 	hostname := t.Hostname()
-	if !await(t.ctx, t.HostnameReady()) {
+
+	if p := t.userCtx.Load(); p != nil {
+		// A caller context set via WithContext upgrades URL from "the hostname
+		// resolves" to "the tunnel is reachable end to end": wait for
+		// TunnelReady (which implies the hostname has resolved), honoring both
+		// the tunnel's lifetime and the caller's context. A raw three-way
+		// select on purpose — it waits on two cancellation sources, which the
+		// single-ctx await helper does not model.
+		select {
+		case <-t.TunnelReady():
+		case <-t.ctx.Done():
+			return nil
+		case <-(*p).Done():
+			return nil
+		}
+	} else if !await(t.ctx, t.HostnameReady()) {
 		return nil
 	}
+
 	return &url.URL{
 		Scheme: "https",
 		Host:   hostname,

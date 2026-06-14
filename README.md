@@ -26,6 +26,7 @@ go get github.com/cnuss/libtunnel
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -38,18 +39,18 @@ func main() {
 	l, _ := net.Listen("tcp", "127.0.0.1:0") // you own the bind
 
 	conn := libtunnel.New(libtunnel.Cloudflare()).
-		WithListener(l) // lazily starts the edge connection
+		WithContext(context.Background()). // URL waits for end-to-end readiness
+		WithListener(l)                    // lazily starts the edge connection
 
 	go http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "hello from libtunnel")
 	}))
 
-	select {
-	case <-conn.TunnelReady():
-		fmt.Println(conn.URL()) // https://<something>.trycloudflare.com/
-	case <-conn.Done():
+	url := conn.URL() // blocks until reachable end to end (see WithContext)
+	if url == nil {
 		log.Fatal(conn.Err())
 	}
+	fmt.Println(url) // https://<something>.trycloudflare.com/
 }
 ```
 
@@ -87,8 +88,9 @@ For the file-by-file map, see
 // configurable phase — mutators chain until WithListener narrows the type
 type Tunnel[T Spec] interface {
     Connected[T]
-    WithLogger(log *slog.Logger) Tunnel[T]    // default: silent
-    WithListener(l net.Listener) Connected[T] // starts the connection
+    WithLogger(log *slog.Logger) Tunnel[T]      // default: silent
+    WithContext(ctx context.Context) Tunnel[T]  // URL waits end-to-end, honors ctx
+    WithListener(l net.Listener) Connected[T]   // starts the connection
 }
 
 // post-WithListener phase — observers and lifecycle only
@@ -103,7 +105,7 @@ type Connected[T Spec] interface {
     Hostname() string
     Domain() string
     Port() int
-    URL() *url.URL // blocks until the hostname resolves publicly
+    URL() *url.URL // blocks until the hostname resolves (end-to-end w/ WithContext)
     CACerts() []*x509.Certificate
     Spec() T
 

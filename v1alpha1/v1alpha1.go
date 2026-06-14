@@ -98,6 +98,11 @@ type TunnelImpl[T v1.Spec] struct {
 	listener         net.Listener
 	listenerProvided chan struct{}
 
+	// userCtx is an optional caller context set via WithContext, read by URL.
+	// Atomic because WithContext can race the goroutines that reach URL. Nil
+	// (unset) means URL waits on DNS alone; set, URL waits for full readiness.
+	userCtx atomic.Pointer[context.Context]
+
 	localIPOnce   sync.Once
 	localIP       net.IP
 	localHostOnce sync.Once
