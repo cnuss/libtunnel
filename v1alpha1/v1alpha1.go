@@ -94,8 +94,12 @@ type TunnelImpl[T v1.Spec] struct {
 	// New. Nil means a foreign backend — the tunnel is born canceled.
 	engine Engine[T]
 
-	listenerOnce     sync.Once
-	listener         net.Listener
+	listenerOnce sync.Once
+	// listener is atomic: ensureListener can auto-provision it from one
+	// goroutine while Listener (and the Local* getters routed through it) load
+	// it from others. The listenerProvided close is the happens-before edge,
+	// so reads only load after observing it.
+	listener         atomic.Pointer[net.Listener]
 	listenerProvided chan struct{}
 
 	localIPOnce   sync.Once

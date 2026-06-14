@@ -14,7 +14,10 @@ tunnel backend — Cloudflare quick tunnels first, driven entirely in-process
 The API is pure-lazy: every getter resolves on first use, and `WithListener`
 is the trigger that starts the edge connection. Once it fires, the returned
 value narrows to a mutator-free `Connected` — there is nothing left to
-configure, and the type system says so.
+configure, and the type system says so. `WithListener` is optional: ask for
+`URL()`, `Listener()`, or any `Local*` getter without it and the tunnel
+auto-provisions a loopback listener on `127.0.0.1:0`, starting the edge
+connection the same way.
 
 ## Quick Start
 

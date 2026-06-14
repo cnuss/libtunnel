@@ -5,7 +5,10 @@
 // A tunnel exposes a local listener to the public internet through a backend
 // transport (Cloudflare quick tunnels first). The API is pure-lazy: every
 // getter resolves on first use, and WithListener is the trigger that starts
-// the edge connection.
+// the edge connection. WithListener is optional: a getter that needs a local
+// origin (URL, Listener, the Local* getters) auto-provisions a loopback
+// listener on 127.0.0.1:0 when none was supplied, starting the edge
+// connection just as an explicit WithListener would.
 package v1
 
 import (
@@ -62,24 +65,26 @@ type Backend[T Spec] interface {
 type Connected[T Spec] interface {
 	// LocalIP is the listener's bound IP. A listener bound to an unspecified
 	// address (0.0.0.0 / ::) falls back to the outbound-route IP, discovered
-	// with a UDP dial that sends no packets. Blocks until a listener is
-	// provided.
+	// with a UDP dial that sends no packets. Auto-provisions a loopback
+	// listener when WithListener was never called.
 	LocalIP() net.IP
-	// LocalPort is the listener's bound port. Blocks until a listener is
-	// provided.
+	// LocalPort is the listener's bound port. Auto-provisions a loopback
+	// listener when WithListener was never called.
 	LocalPort() int
 	// LocalHost is the machine's hostname, truncated at the first dot.
 	LocalHost() string
 	// LocalURL is <scheme>://<LocalIP>:<LocalPort>/, where the scheme follows
-	// the listener (https when it terminates TLS, http otherwise). Blocks
-	// until a listener is provided.
+	// the listener (https when it terminates TLS, http otherwise).
+	// Auto-provisions a loopback listener when WithListener was never called.
 	LocalURL() *url.URL
 	// Listener returns a tunnel-owned view of the listener provided via
-	// WithListener, blocking until one arrives. Closing it closes the tunnel
-	// too (Done fires, Err reports ErrClosed) — so an http.Server serving on
-	// it tears the tunnel down on Shutdown/Close. To restart the origin
-	// while the tunnel persists, close the original listener handed to
-	// WithListener instead and rebind the same address.
+	// WithListener. When WithListener was never called, the first Listener call
+	// auto-provisions a loopback listener (127.0.0.1:0) and adopts it. Closing
+	// the returned listener closes the tunnel too (Done fires, Err reports
+	// ErrClosed) — so an http.Server serving on it tears the tunnel down on
+	// Shutdown/Close. To restart the origin while the tunnel persists, close
+	// the original listener handed to WithListener instead and rebind the same
+	// address.
 	Listener() net.Listener
 
 	// Host is the first label of Hostname.

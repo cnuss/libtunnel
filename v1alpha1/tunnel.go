@@ -35,52 +35,79 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel[T] {
 // LocalPort, and LocalURL all derive from its address. The returned
 // v1.Connected carries no mutators — there is nothing left to configure.
 func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected[T] {
-	t.listenerOnce.Do(func() {
-		t.Logger().Info("configuring tunnel with local listener", "address", l.Addr().String())
-		t.listener = l
-		close(t.listenerProvided)
-
-		if t.engine == nil {
-			// Foreign backend: the tunnel was born canceled (see New).
-			return
-		}
-
-		go func() {
-			t.Logger().Info("starting tunnel with local listener")
-			// Start the DNS readiness poller before the edge connect: the
-			// record exists from spec-mint time, so DNS propagation overlaps
-			// the (seconds-long) edge dial instead of queuing behind it.
-			ready := t.HostnameReady()
-			if err := t.engine.WithListener(t, l); err != nil {
-				t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
-				return
-			}
-
-			t.Logger().Info("tunnel connected, waiting for DNS")
-			if !await(t.ctx, ready) {
-				return
-			}
-
-			t.Logger().Info("tunnel is ready")
-			close(t.tunnelReady)
-		}()
-	})
+	t.listenerOnce.Do(func() { t.adopt(l) })
 	return t
 }
 
-// Listener returns a tunnel-owned view of the provided listener, blocking
-// until WithListener is called or the tunnel context is canceled (then nil).
-// Closing the returned listener closes the tunnel; the original listener
-// stays caller-owned, so closing that restarts the origin while the tunnel
-// persists.
+// adopt records the local listener as the single source of local-side truth
+// and, on a live backend, lazily starts the edge connection. It runs at most
+// once — callers guard it with listenerOnce — whether the listener arrives via
+// WithListener or is auto-provisioned by ensureListener.
+func (t *TunnelImpl[T]) adopt(l net.Listener) {
+	t.Logger().Info("configuring tunnel with local listener", "address", l.Addr().String())
+	t.listener.Store(&l)
+	close(t.listenerProvided)
+
+	if t.engine == nil {
+		// Foreign backend: the tunnel was born canceled (see New).
+		return
+	}
+
+	go func() {
+		t.Logger().Info("starting tunnel with local listener")
+		// Start the DNS readiness poller before the edge connect: the
+		// record exists from spec-mint time, so DNS propagation overlaps
+		// the (seconds-long) edge dial instead of queuing behind it.
+		ready := t.HostnameReady()
+		if err := t.engine.WithListener(t, l); err != nil {
+			t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
+			return
+		}
+
+		t.Logger().Info("tunnel connected, waiting for DNS")
+		if !await(t.ctx, ready) {
+			return
+		}
+
+		t.Logger().Info("tunnel is ready")
+		close(t.tunnelReady)
+	}()
+}
+
+// ensureListener auto-provisions a loopback listener when the caller never
+// supplied one. Callers that need local-side truth without bringing their own
+// origin (URL, Listener, the Local* getters) reach the listener through here,
+// so a missing WithListener no longer blocks forever: the first such call
+// binds 127.0.0.1:0 and adopts it exactly as WithListener would. listenerOnce
+// makes this a no-op once any listener — explicit or auto — has been adopted.
+func (t *TunnelImpl[T]) ensureListener() {
+	t.listenerOnce.Do(func() {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.cancel(fmt.Errorf("unable to provision local listener: %w", err))
+			return
+		}
+		t.adopt(l)
+	})
+}
+
+// Listener returns a tunnel-owned view of the provided listener. When
+// WithListener was never called it auto-provisions a loopback listener
+// (127.0.0.1:0) and adopts it; returns nil only if the tunnel context is
+// canceled first. Closing the returned listener closes the tunnel; the
+// original listener stays caller-owned, so closing that restarts the origin
+// while the tunnel persists.
 func (t *TunnelImpl[T]) Listener() net.Listener {
-	// The listener field is only safe to read once listenerProvided is closed
-	// (the close is the happens-before edge for the write), so a cancellation
-	// wake returns nil instead of reading the field.
+	// Auto-provision a loopback origin when WithListener was never called, so
+	// the wait below resolves instead of blocking forever.
+	t.ensureListener()
+	// The listener pointer is only safe to load once listenerProvided is closed
+	// (the close is the happens-before edge for the store), so a cancellation
+	// wake returns nil instead of reading it.
 	if !await(t.ctx, t.listenerProvided) {
 		return nil
 	}
-	return tunnelListener[T]{Listener: t.listener, t: t}
+	return tunnelListener[T]{Listener: *t.listener.Load(), t: t}
 }
 
 // tunnelListener ties the tunnel's lifetime to the listener handle handed to
@@ -95,8 +122,12 @@ func (l tunnelListener[T]) Close() error {
 	return l.Listener.Close()
 }
 
-// LocalPort is the listener's bound port. Blocks until a listener is
-// provided.
+// Unwrap exposes the caller's original listener so type-sniffing helpers
+// (IsTLS) see through the tunnel-owned wrapper.
+func (l tunnelListener[T]) Unwrap() net.Listener { return l.Listener }
+
+// LocalPort is the listener's bound port. Auto-provisions a loopback listener
+// when WithListener was never called.
 func (t *TunnelImpl[T]) LocalPort() int {
 	l := t.Listener()
 	if l == nil {
@@ -122,7 +153,7 @@ func (t *TunnelImpl[T]) LocalPort() int {
 // LocalIP is the listener's bound IP. A listener bound to an unspecified
 // address (0.0.0.0 / ::) has no concrete IP to report, so it falls back to
 // the outbound-route IP, discovered with a UDP dial (no packets are sent).
-// Blocks until a listener is provided.
+// Auto-provisions a loopback listener when WithListener was never called.
 func (t *TunnelImpl[T]) LocalIP() net.IP {
 	t.localIPOnce.Do(func() {
 		l := t.Listener()
@@ -175,15 +206,15 @@ func (t *TunnelImpl[T]) LocalHost() string {
 }
 
 // LocalURL is <scheme>://<LocalIP>:<LocalPort>/, where the scheme follows the
-// listener (https when it terminates TLS, http otherwise). Blocks until a
-// listener is provided.
+// listener (https when it terminates TLS, http otherwise). Auto-provisions a
+// loopback listener when WithListener was never called.
 func (t *TunnelImpl[T]) LocalURL() *url.URL {
 	ip := t.LocalIP()
 	if ip == nil {
 		return nil
 	}
 	scheme := "http"
-	if IsTLS(t.listener) {
+	if IsTLS(t.Listener()) {
 		scheme = "https"
 	}
 	return &url.URL{
@@ -244,6 +275,11 @@ func (t *TunnelImpl[T]) Port() int {
 // zone's authoritative nameservers. Returns nil if the tunnel is canceled
 // before that happens, per the v1 contract's zero-value-on-cancel rule.
 func (t *TunnelImpl[T]) URL() *url.URL {
+	// URL is meaningful only once the edge connection is up, which adopting a
+	// listener kicks off. Auto-provision a loopback origin when the caller
+	// never supplied one, so URL() drives toward readiness instead of blocking
+	// on a hostname nothing is resolving.
+	t.ensureListener()
 	hostname := t.Hostname()
 	if !await(t.ctx, t.HostnameReady()) {
 		return nil
@@ -474,6 +510,12 @@ func portOf(hostname string) int {
 // with a `TLS() bool` method) and falls back to the concrete type name for
 // listeners straight out of tls.Listen/tls.NewListener.
 func IsTLS(l net.Listener) bool {
+	// Peel the tunnel-owned wrapper so the underlying listener's type and
+	// TLS() reporting are visible (tunnelListener embeds the net.Listener
+	// interface, which promotes neither).
+	if u, ok := l.(interface{ Unwrap() net.Listener }); ok {
+		l = u.Unwrap()
+	}
 	if t, ok := l.(interface{ TLS() bool }); ok {
 		return t.TLS()
 	}

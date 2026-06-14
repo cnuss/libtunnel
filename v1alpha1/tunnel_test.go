@@ -78,28 +78,37 @@ func TestLocalGettersDeriveFromListener(t *testing.T) {
 	}
 }
 
-func TestLocalGettersBlockUntilListener(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
+func TestLocalGettersAutoProvisionListener(t *testing.T) {
+	eng := newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"})
+	tun := v1alpha1.New(eng)
 
+	// No WithListener call: a local getter must auto-provision a loopback
+	// listener instead of blocking forever.
 	port := make(chan int, 1)
 	go func() { port <- tun.LocalPort() }()
 
 	select {
 	case p := <-port:
-		t.Fatalf("LocalPort() = %d before any listener was provided; want it to block", p)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	l := listen(t)
-	tun.WithListener(l)
-
-	select {
-	case p := <-port:
-		if want := l.Addr().(*net.TCPAddr).Port; p != want {
-			t.Errorf("LocalPort() = %d, want %d", p, want)
+		if p == 0 {
+			t.Fatal("LocalPort() = 0; want an auto-provisioned loopback port")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("LocalPort() still blocked after WithListener")
+		t.Fatal("LocalPort() blocked; want it to auto-provision a listener")
+	}
+
+	if ip := tun.LocalIP(); !ip.IsLoopback() {
+		t.Errorf("LocalIP() = %v, want a loopback address", ip)
+	}
+
+	// The auto-provisioned listener is adopted exactly like an explicit one,
+	// so the engine receives it and drives the edge connection.
+	select {
+	case l := <-eng.got:
+		if !l.Addr().(*net.TCPAddr).IP.IsLoopback() {
+			t.Errorf("engine got listener on %v, want loopback", l.Addr())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine never received the auto-provisioned listener")
 	}
 }
 
