@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"time"
@@ -20,48 +19,42 @@ import (
 )
 
 func main() {
-	// You own the bind. The tunnel infers everything else from the listener —
-	// including whether the origin speaks TLS (wrap with tls.NewListener and
-	// the ingress switches to https automatically).
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	// Unset, the tunnel is silent. Info shows the tunnel lifecycle (including
 	// rate-limit retry warnings); Debug adds cloudflared's internals.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
-	conn := libtunnel.New(libtunnel.Cloudflare()).
-		WithLogger(logger).
-		WithListener(l)
+	// No WithListener: the first call that needs a local origin auto-provisions
+	// a loopback listener on 127.0.0.1:0 and starts the edge connection. Bring
+	// your own with WithListener when you need a specific bind or TLS origin
+	// (wrap it with tls.NewListener and the ingress switches to https).
+	tun := libtunnel.New(libtunnel.Cloudflare()).WithLogger(logger)
 
 	go func() {
-		err := http.Serve(conn.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := http.Serve(tun.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "hello from libtunnel")
 		}))
 		log.Fatal(err)
 	}()
 
-	fmt.Printf("local: %s\n", conn.LocalURL())
+	fmt.Printf("local: %s\n", tun.LocalURL())
 
 	// TunnelReady fires when the edge connection is up and the hostname
 	// resolves publicly; Done fires if the tunnel fails instead — always
 	// select on both, or a failed tunnel blocks forever.
 	select {
-	case <-conn.TunnelReady():
-	case <-conn.Done():
-		log.Fatal(conn.Err())
+	case <-tun.TunnelReady():
+	case <-tun.Done():
+		log.Fatal(tun.Err())
 	}
-	fmt.Printf("✓ tunneled %s to %s\n", conn.LocalURL(), conn.URL())
+	fmt.Printf("✓ tunneled %s to %s\n", tun.LocalURL(), tun.URL())
 
 	// The first request can race propagation: TunnelReady proves the
 	// authoritative nameservers serve the record, but this machine's own
 	// resolver and the edge route may lag a few seconds behind. Retry briefly
 	// — real clients hitting a fresh tunnel face the same window.
-	body, err := fetch(conn.URL().String())
+	body, err := fetch(tun.URL().String())
 	if err != nil {
 		log.Fatal(err)
 	}
