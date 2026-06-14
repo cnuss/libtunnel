@@ -84,6 +84,7 @@ func TestExamples(t *testing.T) {
 		verify func(t *testing.T, out string) // optional deeper assertions on the same run
 	}{
 		{"serve", "served: hello from libtunnel", true, nil},
+		{"serve-tls", "served: hello from libtunnel (tls)", true, nil},
 		{"subprocess", "handoff: hello from the child", true, verifySharedHostname},
 	}
 	for _, tc := range cases {

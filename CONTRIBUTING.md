@@ -67,6 +67,7 @@ Run a specific example locally:
 
 ```sh
 make run serve
+make run serve-tls
 make run subprocess
 ```
 
@@ -110,7 +111,7 @@ Easy to get wrong from the diff alone:
   example names (`Example_handoff` etc.). See [`v1/example_test.go`](./v1/example_test.go).
 - **e2e builds binaries at runtime**, so the test cache can't see example
   source changes — `make e2e` passes `-count=1` to force a rebuild.
-- **Live examples are gated.** `serve` and `subprocess` mint real tunnels from
+- **Live examples are gated.** `serve`, `serve-tls`, and `subprocess` mint real tunnels from
   `api.trycloudflare.com`, which rate-limits — minting from all 12 CI matrix
   cells would trip 429s, so one stable-Go cell per OS (ubuntu-24.04,
   windows-2025, macos-26) sets `LIBTUNNEL_E2E_LIVE=1` and the rest skip the
