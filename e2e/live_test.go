@@ -65,7 +65,7 @@ func TestLiveTunnel(t *testing.T) {
 	}))
 	srv := &http.Server{Handler: mux}
 
-	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
+	conn := libtunnel.New(libtunnel.Cloudflare().WithTLS(true)).WithListener(l)
 	// Serve the original listener: the bounce below restarts the origin and
 	// the tunnel must persist. (Serving conn.Listener() would tie the tunnel
 	// to the server's lifetime — that teardown is exercised at the end.)
