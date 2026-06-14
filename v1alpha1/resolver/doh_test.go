@@ -44,9 +44,10 @@ func dohServer(t *testing.T, answer func(q dnsmessage.Question) []byte) *httptes
 	return srv
 }
 
-// respond builds a wire-format response for q with the given rcode and A
-// record answers.
-func respond(t *testing.T, q dnsmessage.Question, rcode dnsmessage.RCode, addrs ...[4]byte) []byte {
+// respond builds a wire-format response for q with the given rcode, answering
+// A questions from v4 and AAAA questions from v6 (matching the question type,
+// as a real resolver does).
+func respond(t *testing.T, q dnsmessage.Question, rcode dnsmessage.RCode, v4 [][4]byte, v6 [][16]byte) []byte {
 	t.Helper()
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true, RCode: rcode})
 	b.EnableCompression()
@@ -56,13 +57,19 @@ func respond(t *testing.T, q dnsmessage.Question, rcode dnsmessage.RCode, addrs 
 	if err := b.Question(q); err != nil {
 		t.Fatal(err)
 	}
-	if len(addrs) > 0 {
-		if err := b.StartAnswers(); err != nil {
-			t.Fatal(err)
+	if err := b.StartAnswers(); err != nil {
+		t.Fatal(err)
+	}
+	switch q.Type {
+	case dnsmessage.TypeA:
+		for _, a := range v4 {
+			if err := b.AResource(dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.AResource{A: a}); err != nil {
+				t.Fatal(err)
+			}
 		}
-		for _, a := range addrs {
-			err := b.AResource(dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.AResource{A: a})
-			if err != nil {
+	case dnsmessage.TypeAAAA:
+		for _, a := range v6 {
+			if err := b.AAAAResource(dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.AAAAResource{AAAA: a}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -74,30 +81,34 @@ func respond(t *testing.T, q dnsmessage.Question, rcode dnsmessage.RCode, addrs 
 	return out
 }
 
-func TestLookupASuccess(t *testing.T) {
+func TestLookupSuccess(t *testing.T) {
+	v4 := [4]byte{104, 16, 230, 132}
+	v6 := [16]byte{0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x68, 0x10, 0xe6, 0x84}
 	srv := dohServer(t, func(q dnsmessage.Question) []byte {
 		if got, want := q.Name.String(), "demo.trycloudflare.com."; got != want {
 			t.Errorf("queried name = %q, want %q", got, want)
 		}
-		return respond(t, q, dnsmessage.RCodeSuccess, [4]byte{104, 16, 230, 132}, [4]byte{104, 16, 231, 132})
+		return respond(t, q, dnsmessage.RCodeSuccess, [][4]byte{v4}, [][16]byte{v6})
 	})
 
-	addrs, err := resolver.LookupA(context.Background(), srv.Client(), srv.URL, "demo.trycloudflare.com")
+	addrs, err := resolver.Lookup(context.Background(), srv.Client(), srv.URL, "demo.trycloudflare.com")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []netip.Addr{netip.AddrFrom4([4]byte{104, 16, 230, 132}), netip.AddrFrom4([4]byte{104, 16, 231, 132})}
+	// v4-first: the A record precedes the AAAA record, so a caller dialing in
+	// order tries IPv4 before IPv6.
+	want := []netip.Addr{netip.AddrFrom4(v4), netip.AddrFrom16(v6)}
 	if len(addrs) != len(want) || addrs[0] != want[0] || addrs[1] != want[1] {
-		t.Errorf("addrs = %v, want %v", addrs, want)
+		t.Errorf("addrs = %v, want %v (v4 first)", addrs, want)
 	}
 }
 
-func TestLookupANXDOMAINIsNotAnError(t *testing.T) {
+func TestLookupNXDOMAINIsNotAnError(t *testing.T) {
 	srv := dohServer(t, func(q dnsmessage.Question) []byte {
-		return respond(t, q, dnsmessage.RCodeNameError)
+		return respond(t, q, dnsmessage.RCodeNameError, nil, nil)
 	})
 
-	addrs, err := resolver.LookupA(context.Background(), srv.Client(), srv.URL, "missing.trycloudflare.com")
+	addrs, err := resolver.Lookup(context.Background(), srv.Client(), srv.URL, "missing.trycloudflare.com")
 	if err != nil {
 		t.Fatalf("NXDOMAIN must read as not-yet-visible, got error: %v", err)
 	}
@@ -106,40 +117,40 @@ func TestLookupANXDOMAINIsNotAnError(t *testing.T) {
 	}
 }
 
-func TestLookupAServerFailureIsAnError(t *testing.T) {
+func TestLookupServerFailureIsAnError(t *testing.T) {
 	srv := dohServer(t, func(q dnsmessage.Question) []byte {
-		return respond(t, q, dnsmessage.RCodeServerFailure)
+		return respond(t, q, dnsmessage.RCodeServerFailure, nil, nil)
 	})
 
-	if _, err := resolver.LookupA(context.Background(), srv.Client(), srv.URL, "demo.trycloudflare.com"); err == nil {
+	if _, err := resolver.Lookup(context.Background(), srv.Client(), srv.URL, "demo.trycloudflare.com"); err == nil {
 		t.Error("SERVFAIL returned no error")
 	}
 }
 
-func TestLookupAMalformedBody(t *testing.T) {
+func TestLookupMalformedBody(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Write([]byte("<html>not dns</html>"))
 	}))
 	defer srv.Close()
 
-	if _, err := resolver.LookupA(context.Background(), srv.Client(), srv.URL, "demo.trycloudflare.com"); err == nil {
+	if _, err := resolver.Lookup(context.Background(), srv.Client(), srv.URL, "demo.trycloudflare.com"); err == nil {
 		t.Error("malformed body returned no error")
 	}
 }
 
-func TestLookupAHTTPError(t *testing.T) {
+func TestLookupHTTPError(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 	}))
 	defer srv.Close()
 
-	if _, err := resolver.LookupA(context.Background(), srv.Client(), srv.URL, "demo.trycloudflare.com"); err == nil {
+	if _, err := resolver.Lookup(context.Background(), srv.Client(), srv.URL, "demo.trycloudflare.com"); err == nil {
 		t.Error("HTTP 429 returned no error")
 	}
 }
 
-func TestLookupATimeout(t *testing.T) {
+func TestLookupTimeout(t *testing.T) {
 	block := make(chan struct{})
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-block
@@ -150,7 +161,7 @@ func TestLookupATimeout(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if _, err := resolver.LookupA(ctx, srv.Client(), srv.URL, "demo.trycloudflare.com"); err == nil {
+	if _, err := resolver.Lookup(ctx, srv.Client(), srv.URL, "demo.trycloudflare.com"); err == nil {
 		t.Error("slow endpoint returned no error before the context deadline")
 	}
 }

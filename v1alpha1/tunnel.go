@@ -347,7 +347,7 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 				sleep += time.Second
 
 				started := time.Now()
-				addrs, err := resolver.LookupA(t.ctx, client, endpoint, host)
+				addrs, err := resolver.Lookup(t.ctx, client, endpoint, host)
 				t.Logger().Debug("DoH readiness query answered", "hostname", host, "endpoint", endpoint, "attempt", i+1, "took", time.Since(started), "addrs", addrs, "error", err)
 				if err == nil && len(addrs) > 0 {
 					ready("doh", host, addrs, i+1)

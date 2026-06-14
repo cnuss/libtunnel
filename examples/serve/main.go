@@ -84,7 +84,7 @@ func fetch(ctx context.Context, url string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := libtunnel.HTTPClient().Do(req)
 		if err != nil {
 			lastErr = err
 		} else {
