@@ -166,12 +166,14 @@ Self-contained programs in [`./examples`](./examples):
 | Example   | Demonstrates                                                       |
 | --------- | ------------------------------------------------------------------ |
 | `serve`   | Real quick tunnel: serve locally, request the public URL.           |
+| `serve-tls` | Same as `serve`, but a TLS listener (`tls.Listen`) — ingress flips to https. |
 | `subprocess` | Parent mints a spec; child adopts it via `TUNNEL_SPEC` and serves. |
 
 Run one locally:
 
 ```sh
 make run serve
+make run serve-tls
 make run subprocess
 ```
 
