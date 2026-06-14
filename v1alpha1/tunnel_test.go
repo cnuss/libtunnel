@@ -26,9 +26,11 @@ func newFakeEngine(spec *cloudflare.Spec) *fakeEngine {
 	return &fakeEngine{got: make(chan net.Listener, 1), spec: spec}
 }
 
-func (e *fakeEngine) Name() string                            { return "fake" }
-func (e *fakeEngine) Provider() v1.Provider[*cloudflare.Spec] { return v1alpha1.Static(e.spec) }
-func (e *fakeEngine) CACerts() []*x509.Certificate            { return []*x509.Certificate{} }
+func (e *fakeEngine) Name() string                                { return "fake" }
+func (e *fakeEngine) Provider() v1.Provider[*cloudflare.Spec]     { return v1alpha1.Static(e.spec) }
+func (e *fakeEngine) CACerts() []*x509.Certificate                { return []*x509.Certificate{} }
+func (e *fakeEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
+func (e *fakeEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
 	return nil
@@ -41,6 +43,8 @@ func (foreignBackend) Name() string { return "foreign" }
 func (foreignBackend) Provider() v1.Provider[*cloudflare.Spec] {
 	return v1alpha1.Static(&cloudflare.Spec{})
 }
+func (f foreignBackend) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return f }
+func (f foreignBackend) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return f }
 
 var (
 	_ v1alpha1.Engine[*cloudflare.Spec] = (*fakeEngine)(nil)
@@ -308,7 +312,9 @@ func (failingEngine) Name() string { return "failing" }
 func (failingEngine) Provider() v1.Provider[*cloudflare.Spec] {
 	return failingProvider{}
 }
-func (failingEngine) CACerts() []*x509.Certificate { return nil }
+func (failingEngine) CACerts() []*x509.Certificate                  { return nil }
+func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
+func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
 func (failingEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }

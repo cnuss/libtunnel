@@ -55,13 +55,31 @@ var cloudflaredVersion = func() string {
 // would collide across tunnels (and pollute the host application's metrics).
 var promMu sync.Mutex
 
-// Backend is the cloudflared quick-tunnel engine. Stateless; one value can
-// serve any number of tunnels.
-type Backend struct{}
+// Backend is the cloudflared quick-tunnel engine. It carries the origin-scheme
+// settings declared via WithTLS / WithHTTP2; obtain a fresh one per tunnel from
+// libtunnel.Cloudflare(). Both settings default false.
+type Backend struct {
+	tls   bool
+	http2 bool
+}
 
 // New returns the Cloudflare backend.
 func New() *Backend {
 	return &Backend{}
+}
+
+// WithTLS declares whether the origin terminates TLS (https vs http ingress).
+// Default false. Returns the backend for chaining.
+func (b *Backend) WithTLS(tls bool) v1.Backend[*Spec] {
+	b.tls = tls
+	return b
+}
+
+// WithHTTP2 declares whether the origin is dialed over HTTP/2. Default false.
+// Returns the backend for chaining.
+func (b *Backend) WithHTTP2(http2 bool) v1.Backend[*Spec] {
+	b.http2 = http2
+	return b
 }
 
 var (
@@ -219,21 +237,22 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 			OriginDialerService: originDialer,
 		}
 
-		// The origin scheme follows the listener: a TLS listener gets an https
-		// ingress (self-signed is fine — verification is off), a plain one gets
-		// http.
-		tlsOrigin := v1alpha1.IsTLS(l)
+		// The origin scheme and HTTP/2 follow the backend's explicit settings
+		// (WithTLS / WithHTTP2, both default false): WithTLS picks https vs http,
+		// WithHTTP2 toggles Http2Origin. TLS verification is always off — a local
+		// origin may carry a self-signed cert.
 		scheme := "http"
-		if tlsOrigin {
+		if b.tls {
 			scheme = "https"
 		}
-
 		noTLSVerify := true
+		http2Origin := b.http2
+
 		internalRules := []ingress.Rule{}
 		parsed, err := ingress.ParseIngress(&config.Configuration{
 			OriginRequest: config.OriginRequestConfig{
 				NoTLSVerify: &noTLSVerify,
-				Http2Origin: &tlsOrigin,
+				Http2Origin: &http2Origin,
 			},
 			WarpRouting: config.WarpRoutingConfig{},
 			Ingress: []config.UnvalidatedIngressRule{

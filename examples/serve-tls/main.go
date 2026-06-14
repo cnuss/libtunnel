@@ -40,12 +40,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// You own the bind. tls.Listen wraps a TCP listener with the cert below;
-	// the tunnel infers https from it (try plain net.Listen and the ingress
-	// falls back to http). Accept() yields *tls.Conn.
-	l, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{selfSigned()},
-	})
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -58,13 +53,15 @@ func main() {
 
 	// WithContext upgrades URL from "the hostname resolves" to "the tunnel is
 	// reachable end to end": URL then blocks until TunnelReady, honoring ctx.
-	tun := libtunnel.New(libtunnel.Cloudflare()).
+	tun := libtunnel.New(libtunnel.Cloudflare().WithTLS(true)).
 		WithLogger(logger).
 		WithContext(ctx).
-		WithListener(l)
+		WithListener(lis)
 
 	go func() {
-		err := http.Serve(tun.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := http.Serve(tls.NewListener(lis, &tls.Config{
+			Certificates: []tls.Certificate{selfSigned()},
+		}), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "hello from libtunnel (tls)")
 		}))
 		log.Fatal(err)
@@ -90,6 +87,12 @@ func main() {
 	}
 	fmt.Printf("served: %s\n", body)
 }
+
+// wrappedListener wraps a net.Listener (here the TLS listener) without exposing
+// it as crypto/tls's concrete type or declaring a TLS() bool of its own — the
+// shape any real proxy-protocol or limiter wrapper has. The embedded listener
+// supplies Accept/Close/Addr, so Accept still yields *tls.Conn.
+type wrappedListener struct{ net.Listener }
 
 // selfSigned mints a throwaway ECDSA certificate for 127.0.0.1, in memory. The
 // origin connector dials with verification off, so it never needs to be a real
