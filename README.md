@@ -13,7 +13,7 @@ tunnel backend — Cloudflare quick tunnels first, driven entirely in-process
 
 The API is pure-lazy: every getter resolves on first use, and `WithListener`
 is the trigger that starts the edge connection. Once it fires, the returned
-value narrows to a mutator-free `Connected` — there is nothing left to
+value narrows to a mutator-free `Tunneled` — there is nothing left to
 configure, and the type system says so.
 
 ## Quick Start
@@ -66,7 +66,7 @@ Three packages, stable/alpha versioning:
 ```
 github.com/cnuss/libtunnel                      — root façade: New, backends,
                                                   providers, handoff helpers.
-github.com/cnuss/libtunnel/v1                   — stable Tunnel/Connected +
+github.com/cnuss/libtunnel/v1                   — stable Tunnel/Tunneled +
                                                   Provider[T]/Backend[T] contract.
 github.com/cnuss/libtunnel/v1alpha1             — lazy tunnel core + generic
                                                   providers. May change between
@@ -89,14 +89,14 @@ For the file-by-file map, see
 // Non-generic: the spec type is a construction-time detail, so a tunnel
 // reference stores without threading T through caller code.
 type Tunnel interface {
-    Connected
+    Tunneled
     WithLogger(log *slog.Logger) Tunnel      // default: silent
     WithContext(ctx context.Context) Tunnel  // URL waits end-to-end, honors ctx
-    WithListener(l net.Listener) Connected   // starts the connection
+    WithListener(l net.Listener) Tunneled   // starts the connection
 }
 
 // post-WithListener phase — observers and lifecycle only
-type Connected interface {
+type Tunneled interface {
     LocalIP() net.IP // local side, inferred from the listener
     LocalPort() int
     LocalHost() string

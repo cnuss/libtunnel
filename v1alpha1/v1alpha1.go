@@ -80,7 +80,7 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 // TunnelImpl is the lazy tunnel core. Every getter resolves through a
 // sync.Once on first use; getters whose input is not yet available block on
 // the tunnel context. One TunnelImpl serves as both v1.Tunnel (configurable
-// phase) and v1.Connected (post-WithListener phase) — the narrowing at
+// phase) and v1.Tunneled (post-WithListener phase) — the narrowing at
 // WithListener is purely compile-time.
 type TunnelImpl[T v1.Spec] struct {
 	ctx    context.Context
@@ -129,12 +129,12 @@ func (t *TunnelImpl[T]) Context() context.Context {
 	return t.ctx
 }
 
-// Done implements v1.Connected: closed when the tunnel fails or shuts down.
+// Done implements v1.Tunneled: closed when the tunnel fails or shuts down.
 func (t *TunnelImpl[T]) Done() <-chan struct{} {
 	return t.ctx.Done()
 }
 
-// Err implements v1.Connected: the cancellation cause, nil while alive.
+// Err implements v1.Tunneled: the cancellation cause, nil while alive.
 func (t *TunnelImpl[T]) Err() error {
 	return context.Cause(t.ctx)
 }

@@ -18,7 +18,7 @@ import (
 )
 
 // ErrClosed is the Err result of a tunnel shut down deliberately — by
-// closing the listener returned from Connected.Listener.
+// closing the listener returned from Tunneled.Listener.
 var ErrClosed = errors.New("tunnel closed")
 
 // Spec is the credential/identity set a Provider yields. Each backend defines
@@ -54,7 +54,7 @@ type Backend[T Spec] interface {
 	Provider() Provider[T]
 }
 
-// Connected is the post-WithListener phase of a tunnel: the edge connection
+// Tunneled is the post-WithListener phase of a tunnel: the edge connection
 // is starting (or up), and only observers and lifecycle remain — no mutators.
 // All getters are lazy and resolve on first use; getters that need state that
 // is not yet available block until it is (or until the tunnel's context is
@@ -63,7 +63,7 @@ type Backend[T Spec] interface {
 // It is non-generic: the backend spec type is a construction-time detail that
 // does not outlive New, so callers can store a tunnel reference without
 // threading the spec type through their own code.
-type Connected interface {
+type Tunneled interface {
 	// LocalIP is the listener's bound IP. A listener bound to an unspecified
 	// address (0.0.0.0 / ::) falls back to the outbound-route IP, discovered
 	// with a UDP dial that sends no packets. Blocks until a listener is
@@ -117,12 +117,12 @@ type Connected interface {
 	HostnameReady() <-chan struct{}
 }
 
-// Tunnel is the configurable phase returned by libtunnel.New. All Connected
+// Tunnel is the configurable phase returned by libtunnel.New. All Tunneled
 // observers work here too (they resolve lazily); the mutators disappear once
-// WithListener narrows the type to Connected. Like Connected, it is
+// WithListener narrows the type to Tunneled. Like Tunneled, it is
 // non-generic — the spec type does not outlive construction.
 type Tunnel interface {
-	Connected
+	Tunneled
 
 	// WithLogger sets the logger. Unset, the tunnel is silent.
 	WithLogger(log *slog.Logger) Tunnel
@@ -132,10 +132,10 @@ type Tunnel interface {
 	// if the context is done first. Unset (or nil), URL waits on DNS alone.
 	WithContext(ctx context.Context) Tunnel
 	// WithListener provides the local listener and lazily starts the edge
-	// connection. It is the terminal mutator: the returned Connected carries
+	// connection. It is the terminal mutator: the returned Tunneled carries
 	// no further configuration surface. The tunnel infers the origin scheme
 	// from the listener: TLS listeners (tls.Listen, or any listener with a
 	// TLS() bool method reporting true) are dialed over https, plain ones
 	// over http.
-	WithListener(l net.Listener) Connected
+	WithListener(l net.Listener) Tunneled
 }

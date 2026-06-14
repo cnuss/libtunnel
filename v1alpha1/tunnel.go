@@ -48,8 +48,8 @@ func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 // WithListener provides the local listener and lazily starts the edge
 // connection. The listener is the single source of local-side truth: LocalIP,
 // LocalPort, and LocalURL all derive from its address. The returned
-// v1.Connected carries no mutators — there is nothing left to configure.
-func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Connected {
+// v1.Tunneled carries no mutators — there is nothing left to configure.
+func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunneled {
 	t.listenerOnce.Do(func() {
 		t.Logger().Info("configuring tunnel with local listener", "address", l.Addr().String())
 		t.listener = l
