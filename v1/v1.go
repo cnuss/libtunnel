@@ -52,6 +52,15 @@ type Backend[T Spec] interface {
 	// Cloudflare: adopt TUNNEL_SPEC from the environment when present,
 	// otherwise mint an anonymous quick tunnel.
 	Provider() Provider[T]
+	// WithTLS declares whether the local origin terminates TLS. True dials the
+	// listener over https (verification is off, so a self-signed cert is fine);
+	// false over http. Default false. Chainable:
+	// libtunnel.Cloudflare().WithTLS(true).
+	WithTLS(bool) Backend[T]
+	// WithHTTP2 declares whether the origin is dialed over HTTP/2 rather than
+	// HTTP/1.1. Independent of WithTLS, though a stdlib http.Server only
+	// negotiates HTTP/2 over TLS. Default false. Chainable.
+	WithHTTP2(bool) Backend[T]
 }
 
 // Tunneled is the post-WithListener phase of a tunnel: the edge connection
@@ -75,8 +84,8 @@ type Tunneled interface {
 	// LocalHost is the machine's hostname, truncated at the first dot.
 	LocalHost() string
 	// LocalURL is <scheme>://<LocalIP>:<LocalPort>/, where the scheme follows
-	// the listener (https when it terminates TLS, http otherwise). Blocks
-	// until a listener is provided.
+	// the backend's WithTLS (https when the origin terminates TLS, http
+	// otherwise). Blocks until a listener is provided.
 	LocalURL() *url.URL
 	// Listener returns a tunnel-owned view of the listener provided via
 	// WithListener, blocking until one arrives. Closing it closes the tunnel
@@ -133,9 +142,8 @@ type Tunnel interface {
 	WithContext(ctx context.Context) Tunnel
 	// WithListener provides the local listener and lazily starts the edge
 	// connection. It is the terminal mutator: the returned Tunneled carries
-	// no further configuration surface. The tunnel infers the origin scheme
-	// from the listener: TLS listeners (tls.Listen, or any listener with a
-	// TLS() bool method reporting true) are dialed over https, plain ones
-	// over http.
+	// no further configuration surface. The origin scheme is not inferred from
+	// the listener — declare it on the backend with WithTLS / WithHTTP2 (both
+	// default false).
 	WithListener(l net.Listener) Tunneled
 }

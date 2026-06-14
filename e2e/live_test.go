@@ -65,7 +65,7 @@ func TestLiveTunnel(t *testing.T) {
 	}))
 	srv := &http.Server{Handler: mux}
 
-	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
+	conn := libtunnel.New(libtunnel.Cloudflare().WithTLS(true)).WithListener(l)
 	// Serve the original listener: the bounce below restarts the origin and
 	// the tunnel must persist. (Serving conn.Listener() would tie the tunnel
 	// to the server's lifetime — that teardown is exercised at the end.)
@@ -73,8 +73,11 @@ func TestLiveTunnel(t *testing.T) {
 	// Free the hostname when done — TestLiveResurrection reuses this spec.
 	defer conn.Listener().Close()
 
-	if got := conn.LocalURL().Scheme; got != "https" {
-		t.Errorf("LocalURL scheme = %q, want https for a TLS listener", got)
+	// LocalURL is the local bind address — always http, regardless of the
+	// origin's TLS (declared on the backend via WithTLS). The public URL below
+	// carries the real scheme.
+	if got := conn.LocalURL().Scheme; got != "http" {
+		t.Errorf("LocalURL scheme = %q, want http (local bind address)", got)
 	}
 
 	waitReady(t, conn, 30*time.Second)
