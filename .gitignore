@@ -38,4 +38,5 @@ go.work.sum
 
 # e2e harness / make run build artifacts
 examples/serve/serve
+examples/serve-tls/serve-tls
 examples/subprocess/subprocess
