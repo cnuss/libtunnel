@@ -29,9 +29,12 @@
 package libtunnel
 
 import (
+	"net/http"
+
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
+	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
 // TunnelV1 is the configurable phase returned by New: a non-generic alias for
@@ -73,4 +76,14 @@ func New[T v1.Spec](backend v1.Backend[T]) TunnelV1 {
 // tunnel mints its own identity.
 func Cloudflare() CloudflareV1 {
 	return cloudflare.New()
+}
+
+// HTTPClient returns an http.Client that resolves hostnames over DNS-over-HTTPS
+// and dials dualstack — both IPv4 and IPv6, first address to connect wins.
+// Reach a tunnel's public URL with it from a network whose own resolver is
+// unreliable: CI runners that answer AAAA-only with no IPv6 egress, captive
+// portals, anywhere the default client can stall or fail on a fresh hostname.
+// TLS verification is unchanged — only the dial target is resolved over DoH.
+func HTTPClient() *http.Client {
+	return resolver.HTTPClient()
 }

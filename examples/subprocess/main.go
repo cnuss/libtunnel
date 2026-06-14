@@ -87,7 +87,7 @@ func parent() {
 func fetch(url string) (string, error) {
 	var lastErr error
 	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Second) {
-		resp, err := http.Get(url)
+		resp, err := libtunnel.HTTPClient().Get(url)
 		if err != nil {
 			lastErr = err
 			continue

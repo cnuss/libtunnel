@@ -37,12 +37,30 @@ var Endpoints = []string{
 // answer for one name is far smaller.
 const maxResponse = 64 << 10
 
-// LookupA queries endpoint for hostname's A records per RFC 8484: the
+// Lookup queries endpoint for hostname's A and AAAA records per RFC 8484: each
 // wire-format query is POSTed as application/dns-message and the wire-format
-// response parsed back. A name that does not (yet) resolve returns (nil, nil)
-// — that is the "keep polling" signal — while transport, HTTP, and DNS-level
-// failures return errors. client supplies timeouts and TLS configuration.
-func LookupA(ctx context.Context, client *http.Client, endpoint, hostname string) ([]netip.Addr, error) {
+// response parsed back. Addresses come back v4-first, so a caller dialing them
+// in order falls back from an unroutable IPv6 to IPv4 without waiting on a v6
+// timeout. A name that does not (yet) resolve in either family returns
+// (nil, nil) — the "keep polling" signal — while transport, HTTP, and
+// DNS-level failures return errors. client supplies timeouts and TLS
+// configuration.
+func Lookup(ctx context.Context, client *http.Client, endpoint, hostname string) ([]netip.Addr, error) {
+	v4, err := query(ctx, client, endpoint, hostname, dnsmessage.TypeA)
+	if err != nil {
+		return nil, err
+	}
+	v6, err := query(ctx, client, endpoint, hostname, dnsmessage.TypeAAAA)
+	if err != nil {
+		return nil, err
+	}
+	return append(v4, v6...), nil
+}
+
+// query runs one RFC 8484 lookup of qtype (A or AAAA) for hostname against
+// endpoint and returns the addresses of that family. NXDOMAIN reads as
+// (nil, nil); transport, HTTP, and DNS-level failures return errors.
+func query(ctx context.Context, client *http.Client, endpoint, hostname string, qtype dnsmessage.Type) ([]netip.Addr, error) {
 	name, err := dnsmessage.NewName(hostname + ".")
 	if err != nil {
 		return nil, fmt.Errorf("invalid hostname %q: %w", hostname, err)
@@ -54,15 +72,15 @@ func LookupA(ctx context.Context, client *http.Client, endpoint, hostname string
 	if err := b.StartQuestions(); err != nil {
 		return nil, err
 	}
-	if err := b.Question(dnsmessage.Question{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}); err != nil {
+	if err := b.Question(dnsmessage.Question{Name: name, Type: qtype, Class: dnsmessage.ClassINET}); err != nil {
 		return nil, err
 	}
-	query, err := b.Finish()
+	wire, err := b.Finish()
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(query))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(wire))
 	if err != nil {
 		return nil, err
 	}
@@ -107,18 +125,27 @@ func LookupA(ctx context.Context, client *http.Client, endpoint, hostname string
 		if err != nil {
 			return nil, err
 		}
-		if rh.Type != dnsmessage.TypeA {
-			// CNAME links and anything else in the chain: not addresses.
+		if rh.Type != qtype {
+			// CNAME links and the other family's records in the chain: skip.
 			if err := p.SkipAnswer(); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		r, err := p.AResource()
-		if err != nil {
-			return nil, err
+		switch qtype {
+		case dnsmessage.TypeA:
+			r, err := p.AResource()
+			if err != nil {
+				return nil, err
+			}
+			addrs = append(addrs, netip.AddrFrom4(r.A))
+		case dnsmessage.TypeAAAA:
+			r, err := p.AAAAResource()
+			if err != nil {
+				return nil, err
+			}
+			addrs = append(addrs, netip.AddrFrom16(r.AAAA))
 		}
-		addrs = append(addrs, netip.AddrFrom4(r.A))
 	}
 	return addrs, nil
 }
