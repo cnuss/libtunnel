@@ -308,19 +308,31 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 // falls back to the system resolver.
 var fibonacciBackoff = []time.Duration{1, 1, 2, 3, 5, 8, 13, 21}
 
+// graceBeforeFallback delays the system-resolver rung so the stricter
+// authoritative-consensus rung wins where direct :53 works (the record appears
+// ~5s after connect and consensus lands a beat later). On networks that block
+// or rewrite direct :53 to the nameservers, the fallback still fires shortly
+// after this grace — well inside a caller's readiness budget — instead of
+// waiting out the whole authoritative backoff.
+const graceBeforeFallback = 10 * time.Second
+
 // HostnameReady closes the returned channel (on first use, then idempotently)
-// once the tunnel hostname resolves. It polls the zone's authoritative
-// nameservers directly — the dig equivalent, via package resolver — and fires
-// only when every nameserver returns the same non-empty A+AAAA set:
-// full-propagation truth, not a first-server-to-see-it signal that races ahead
-// of the edge. Queries are RD=1 (the quick-tunnel nameservers REFUSE RD=0).
+// once the tunnel hostname resolves. Two rungs run concurrently; whichever
+// resolves first wins:
 //
-// Rounds are spaced by fibonacciBackoff. When that sequence is exhausted — or
-// the nameservers are unreachable, e.g. :53 is blocked — it falls back to the
-// system resolver, polling until the record appears or the tunnel is canceled.
+//   - the authoritative rung queries the zone's nameservers directly — the dig
+//     equivalent, via package resolver — and fires only when every nameserver
+//     returns the same non-empty A+AAAA set (full-propagation truth, not a
+//     first-server-to-see-it signal). Rounds are spaced by fibonacciBackoff.
+//     Queries are RD=1 (the quick-tunnel nameservers REFUSE RD=0).
+//   - the system-resolver rung is the fallback for networks that block direct
+//     :53; it starts after graceBeforeFallback so the authoritative rung is
+//     preferred, then polls the system resolver until the record appears.
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	t.hostnameReadyOnce.Do(func() {
-		go t.pollHostnameReady()
+		host := dnsName(t.Hostname())
+		go t.pollAuthoritative(host)
+		go t.pollSystemFallback(host)
 	})
 	return t.hostnameReady
 }
@@ -333,10 +345,9 @@ func (t *TunnelImpl[T]) markHostnameReady(rung, host string, rec resolver.Record
 	})
 }
 
-func (t *TunnelImpl[T]) pollHostnameReady() {
-	host := dnsName(t.Hostname())
-
-	// Authoritative rung: query every nameserver each round, fire on consensus.
+// pollAuthoritative queries every nameserver each round and fires on consensus,
+// spacing rounds by fibonacciBackoff.
+func (t *TunnelImpl[T]) pollAuthoritative(host string) {
 	for _, wait := range fibonacciBackoff {
 		if rec, ok := authoritativeProbe(t.ctx, t.Logger(), t.Domain(), host); ok {
 			t.markHostnameReady("authoritative", host, rec)
@@ -350,11 +361,19 @@ func (t *TunnelImpl[T]) pollHostnameReady() {
 		case <-time.After(wait * time.Second):
 		}
 	}
+	t.Logger().Debug("authoritative consensus not reached; leaving readiness to the system resolver", "hostname", host)
+}
 
-	// Fallback rung: the authoritative sequence was exhausted (or the
-	// nameservers are unreachable). Trust the system resolver, polling at the
-	// backoff cap until the record appears or the tunnel is canceled.
-	t.Logger().Debug("authoritative consensus not reached; falling back to the system resolver", "hostname", host)
+// pollSystemFallback waits out the grace, then polls the system resolver until
+// the record appears or the tunnel is canceled.
+func (t *TunnelImpl[T]) pollSystemFallback(host string) {
+	select {
+	case <-t.ctx.Done():
+		return
+	case <-t.hostnameReady:
+		return
+	case <-time.After(graceBeforeFallback):
+	}
 	for {
 		addrs, err := net.DefaultResolver.LookupNetIP(t.ctx, "ip", host)
 		if err == nil && len(addrs) > 0 {
@@ -366,7 +385,7 @@ func (t *TunnelImpl[T]) pollHostnameReady() {
 			return
 		case <-t.hostnameReady:
 			return
-		case <-time.After(21 * time.Second):
+		case <-time.After(3 * time.Second):
 		}
 	}
 }
