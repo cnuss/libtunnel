@@ -338,7 +338,8 @@ func (t *TunnelImpl[T]) pollHostnameReady() {
 
 	// Authoritative rung: query every nameserver each round, fire on consensus.
 	for _, wait := range fibonacciBackoff {
-		if t.authoritativeConsensus(host) {
+		if rec, ok := authoritativeProbe(t.ctx, t.Logger(), t.Domain(), host); ok {
+			t.markHostnameReady("authoritative", host, rec)
 			return
 		}
 		select {
@@ -370,36 +371,41 @@ func (t *TunnelImpl[T]) pollHostnameReady() {
 	}
 }
 
-// authoritativeConsensus queries each of the zone's nameservers for host's
+// authoritativeProbe runs one readiness probe for host in zone domain: it
+// returns the agreed records and true once every authoritative nameserver
+// returns the same non-empty A+AAAA set. It is a package var so tests can drive
+// readiness deterministically without live DNS; production uses
+// realAuthoritativeProbe.
+var authoritativeProbe = realAuthoritativeProbe
+
+// realAuthoritativeProbe queries each of the zone's nameservers for host's
 // A+AAAA and reports whether all returned the same non-empty set. Nameservers
 // are re-resolved each round so a changed delegation is picked up; any server
 // that errors, times out, or has no record yet fails the round (keep polling).
-func (t *TunnelImpl[T]) authoritativeConsensus(host string) bool {
-	servers := t.nameserverIPs()
+func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool) {
+	servers := nameserverIPs(ctx, domain)
 	if len(servers) == 0 {
-		t.Logger().Debug("no authoritative nameservers discovered yet", "domain", t.Domain())
-		return false
+		log.Debug("no authoritative nameservers discovered yet", "domain", domain)
+		return resolver.Records{}, false
 	}
 
 	var agreed *resolver.Records
 	for _, server := range servers {
-		ctx, cancel := context.WithTimeout(t.ctx, 5*time.Second)
-		rec, err := resolver.Query(ctx, server, host)
+		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		rec, err := resolver.Query(qctx, server, host)
 		cancel()
-		t.Logger().Debug("authoritative query", "hostname", host, "server", server, "A", rec.A, "AAAA", rec.AAAA, "error", err)
+		log.Debug("authoritative query", "hostname", host, "server", server, "A", rec.A, "AAAA", rec.AAAA, "error", err)
 		if err != nil || rec.Empty() {
-			return false
+			return resolver.Records{}, false
 		}
 		if agreed == nil {
 			agreed = &rec
 		} else if !agreed.Equal(rec) {
-			t.Logger().Debug("nameservers disagree, still propagating", "hostname", host)
-			return false
+			log.Debug("nameservers disagree, still propagating", "hostname", host)
+			return resolver.Records{}, false
 		}
 	}
-
-	t.markHostnameReady("authoritative", host, *agreed)
-	return true
+	return *agreed, true
 }
 
 // nameserverIPs resolves the zone's NS records to ip:53 endpoints via the
@@ -407,14 +413,14 @@ func (t *TunnelImpl[T]) authoritativeConsensus(host string) bool {
 // the system resolver is fine here — the record we wait on is queried at these
 // servers directly. The bare zone name is used (DNS queries take no :port,
 // which the v1 contract allows GetHostname to carry).
-func (t *TunnelImpl[T]) nameserverIPs() []string {
-	ns, err := net.DefaultResolver.LookupNS(t.ctx, dnsName(t.Domain()))
+func nameserverIPs(ctx context.Context, domain string) []string {
+	ns, err := net.DefaultResolver.LookupNS(ctx, dnsName(domain))
 	if err != nil {
 		return nil
 	}
 	var servers []string
 	for _, record := range ns {
-		ips, err := net.DefaultResolver.LookupHost(t.ctx, record.Host)
+		ips, err := net.DefaultResolver.LookupHost(ctx, record.Host)
 		if err != nil {
 			continue
 		}

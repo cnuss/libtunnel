@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"log/slog"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
+	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
 // fakeEngine satisfies the Engine contract without dialing anything: it
@@ -184,11 +187,21 @@ func TestEngineReceivesListener(t *testing.T) {
 	}
 }
 
-// TestTunnelReadyAfterEngineConnects uses a hostname that genuinely resolves
-// (and whose zone has reachable authoritative nameservers) so the readiness
-// poller succeeds — the fake engine supplies the connection half. Needs
-// outbound DNS.
+// stubReady makes the readiness consensus probe fire immediately so these tests
+// exercise the readiness plumbing (channel close, URL unblock) deterministically
+// without live DNS — the real probe is covered by the live e2e suite.
+func stubReady(t *testing.T) {
+	t.Helper()
+	t.Cleanup(v1alpha1.SetAuthoritativeProbe(func(context.Context, *slog.Logger, string, string) (resolver.Records, bool) {
+		return resolver.Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}, true
+	}))
+}
+
+// TestTunnelReadyAfterEngineConnects pins that TunnelReady closes once the
+// engine connects and the hostname resolves — the fake engine supplies the
+// connection half, stubReady the resolution half.
 func TestTunnelReadyAfterEngineConnects(t *testing.T) {
+	stubReady(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
 
 	conn := tun.WithListener(listen(t))
@@ -202,9 +215,9 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 
 // TestWithContextURLWaitsForTunnelReady pins WithContext's upgrade: with a
 // caller context set, URL blocks until TunnelReady (not DNS alone) and then
-// returns the public URL. Needs outbound DNS (same as
-// TestTunnelReadyAfterEngineConnects).
+// returns the public URL.
 func TestWithContextURLWaitsForTunnelReady(t *testing.T) {
+	stubReady(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})).
 		WithContext(context.Background())
 	conn := tun.WithListener(listen(t))
