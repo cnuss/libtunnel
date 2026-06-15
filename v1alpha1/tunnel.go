@@ -434,11 +434,18 @@ func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host 
 	return *agreed, true
 }
 
-// nameserverIPs resolves the zone's NS records to ip:53 endpoints via the
+// nameserverIPs resolves the zone's NS records to IPv4 ip:53 endpoints via the
 // system resolver. NS records are stable and are not the propagation target, so
 // the system resolver is fine here — the record we wait on is queried at these
 // servers directly. The bare zone name is used (DNS queries take no :port,
 // which the v1 contract allows GetHostname to carry).
+//
+// Only IPv4 endpoints are kept: consensus requires every queried server to
+// answer, so an NS endpoint the host can't reach (an IPv6 anycast address on an
+// IPv4-only host — e.g. a GitHub Actions runner — yields "connect: no route to
+// host") would stall readiness forever. Every Cloudflare NS has an IPv4 anycast
+// address, so v4-only loses no server; an IPv6-only host falls back to the
+// system resolver.
 func nameserverIPs(ctx context.Context, log *slog.Logger, domain string) []string {
 	ns, err := net.DefaultResolver.LookupNS(ctx, dnsName(domain))
 	if err != nil {
@@ -447,13 +454,13 @@ func nameserverIPs(ctx context.Context, log *slog.Logger, domain string) []strin
 	}
 	var servers []string
 	for _, record := range ns {
-		ips, err := net.DefaultResolver.LookupHost(ctx, record.Host)
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", record.Host)
 		if err != nil {
 			log.Debug("nameserver address lookup failed", "nameserver", record.Host, "error", err)
 			continue
 		}
 		for _, ip := range ips {
-			servers = append(servers, net.JoinHostPort(ip, "53"))
+			servers = append(servers, net.JoinHostPort(ip.String(), "53"))
 		}
 	}
 	return servers
