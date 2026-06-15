@@ -126,7 +126,7 @@ func fetch(ctx context.Context, url string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		resp, err := libtunnel.HTTPClient().Do(req)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			lastErr = err
 		} else {
