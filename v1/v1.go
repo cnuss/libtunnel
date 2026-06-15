@@ -63,8 +63,13 @@ type Backend[T Spec] interface {
 	WithHTTP2(bool) Backend[T]
 }
 
-// Tunneled is the post-WithListener phase of a tunnel: the edge connection
-// is starting (or up), and only observers and lifecycle remain — no mutators.
+// Tunneled is the post-WithListener phase of a tunnel: the edge connection is
+// starting (or up). It is the running-handle surface — how to reach the tunnel
+// (LocalURL, Listener, URL) and how to watch it (TunnelReady, Done, Err). Spec
+// introspection (Host, Hostname, Domain, Port, CACerts), the local-address
+// getters (LocalIP, LocalHost), and the HostnameReady probe describe the
+// tunnel before it starts and live on Tunnel, the pre-WithListener phase.
+//
 // All getters are lazy and resolve on first use; getters that need state that
 // is not yet available block until it is (or until the tunnel's context is
 // canceled), in which case they return zero values.
@@ -73,16 +78,9 @@ type Backend[T Spec] interface {
 // does not outlive New, so callers can store a tunnel reference without
 // threading the spec type through their own code.
 type Tunneled interface {
-	// LocalIP is the listener's bound IP. A listener bound to an unspecified
-	// address (0.0.0.0 / ::) falls back to the outbound-route IP, discovered
-	// with a UDP dial that sends no packets. Blocks until a listener is
-	// provided.
-	LocalIP() net.IP
 	// LocalPort is the listener's bound port. Blocks until a listener is
 	// provided.
 	LocalPort() int
-	// LocalHost is the machine's hostname, truncated at the first dot.
-	LocalHost() string
 	// LocalURL is <scheme>://<LocalIP>:<LocalPort>/, where the scheme follows
 	// the backend's WithTLS (https when the origin terminates TLS, http
 	// otherwise). Blocks until a listener is provided.
@@ -95,6 +93,39 @@ type Tunneled interface {
 	// WithListener instead and rebind the same address.
 	Listener() net.Listener
 
+	// URL is https://<Hostname>/. It blocks until the hostname resolves on
+	// the zone's authoritative nameservers (see Tunnel.HostnameReady).
+	URL() *url.URL
+
+	// TunnelReady is closed when the edge connection is up and the hostname
+	// resolves publicly — the tunnel is reachable end to end. It is never
+	// closed on failure: select on Done alongside it.
+	TunnelReady() <-chan struct{}
+	// Done is closed when the tunnel fails or shuts down. Waits on TunnelReady
+	// or Tunnel.HostnameReady should select on Done too, or a failed tunnel
+	// blocks them forever.
+	Done() <-chan struct{}
+	// Err reports why the tunnel ended (nil while it is alive).
+	Err() error
+}
+
+// Tunnel is the configurable phase returned by libtunnel.New. It carries the
+// running-handle surface (the embedded Tunneled), plus the spec introspection,
+// local-address getters, and HostnameReady probe that describe the tunnel
+// before it starts, and the mutators that disappear once WithListener narrows
+// the type to Tunneled. All getters are lazy and resolve on first use. Like
+// Tunneled, it is non-generic — the spec type does not outlive construction.
+type Tunnel interface {
+	Tunneled
+
+	// LocalIP is the listener's bound IP. A listener bound to an unspecified
+	// address (0.0.0.0 / ::) falls back to the outbound-route IP, discovered
+	// with a UDP dial that sends no packets. Blocks until a listener is
+	// provided.
+	LocalIP() net.IP
+	// LocalHost is the machine's hostname, truncated at the first dot.
+	LocalHost() string
+
 	// Host is the first label of Hostname.
 	Host() string
 	// Hostname is the public hostname from the spec.
@@ -103,35 +134,13 @@ type Tunneled interface {
 	Domain() string
 	// Port is the port encoded in Hostname, or 443 when absent.
 	Port() int
-	// URL is https://<Hostname>/. It blocks until the hostname resolves on
-	// the zone's authoritative nameservers (see HostnameReady).
-	URL() *url.URL
 	// CACerts returns the trust roots the backend uses for its edge
 	// connections.
 	CACerts() []*x509.Certificate
-
-	// TunnelReady is closed when the edge connection is up and the hostname
-	// resolves publicly — the tunnel is reachable end to end. It is never
-	// closed on failure: select on Done alongside it.
-	TunnelReady() <-chan struct{}
-	// Done is closed when the tunnel fails or shuts down. Waits on
-	// TunnelReady/HostnameReady should select on Done too, or a failed
-	// tunnel blocks them forever.
-	Done() <-chan struct{}
-	// Err reports why the tunnel ended (nil while it is alive).
-	Err() error
 	// HostnameReady is closed when the hostname resolves on the zone's
 	// authoritative nameservers — polled directly, so recursive resolvers'
 	// negative caches never delay readiness.
 	HostnameReady() <-chan struct{}
-}
-
-// Tunnel is the configurable phase returned by libtunnel.New. All Tunneled
-// observers work here too (they resolve lazily); the mutators disappear once
-// WithListener narrows the type to Tunneled. Like Tunneled, it is
-// non-generic — the spec type does not outlive construction.
-type Tunnel interface {
-	Tunneled
 
 	// WithLogger sets the logger. Unset, the tunnel is silent.
 	WithLogger(log *slog.Logger) Tunnel

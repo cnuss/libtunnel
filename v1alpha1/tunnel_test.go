@@ -73,7 +73,7 @@ func TestLocalGettersDeriveFromListener(t *testing.T) {
 	if got := conn.LocalPort(); got != addr.Port {
 		t.Errorf("LocalPort() = %d, want %d (the listener's port)", got, addr.Port)
 	}
-	if got := conn.LocalIP(); !got.Equal(addr.IP) {
+	if got := tun.LocalIP(); !got.Equal(addr.IP) {
 		t.Errorf("LocalIP() = %v, want %v (the listener's IP)", got, addr.IP)
 	}
 	wantHost := net.JoinHostPort(addr.IP.String(), strconv.Itoa(addr.Port))
@@ -118,9 +118,9 @@ func TestUnspecifiedBindFallsBackToOutboundRouteIP(t *testing.T) {
 	defer l.Close()
 
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
-	conn := tun.WithListener(l)
+	tun.WithListener(l)
 
-	ip := conn.LocalIP()
+	ip := tun.LocalIP()
 	if ip == nil {
 		t.Skip("no outbound route available")
 	}

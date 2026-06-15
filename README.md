@@ -13,8 +13,9 @@ tunnel backend — Cloudflare quick tunnels first, driven entirely in-process
 
 The API is pure-lazy: every getter resolves on first use, and `WithListener`
 is the trigger that starts the edge connection. Once it fires, the returned
-value narrows to a mutator-free `Tunneled` — there is nothing left to
-configure, and the type system says so.
+value narrows to a `Tunneled` running handle — the mutators and the pre-start
+introspection (spec getters, `HostnameReady`) are gone, leaving how to reach
+the tunnel and how to watch it, and the type system says so.
 
 ## Quick Start
 
@@ -90,28 +91,31 @@ For the file-by-file map, see
 // reference stores without threading T through caller code.
 type Tunnel interface {
     Tunneled
-    WithLogger(log *slog.Logger) Tunnel      // default: silent
-    WithContext(ctx context.Context) Tunnel  // URL waits end-to-end, honors ctx
-    WithListener(l net.Listener) Tunneled   // starts the connection
-}
 
-// post-WithListener phase — observers and lifecycle only
-type Tunneled interface {
     LocalIP() net.IP // local side, inferred from the listener
-    LocalPort() int
     LocalHost() string
-    LocalURL() *url.URL
-    Listener() net.Listener
 
     Host() string // public side, derived from the spec
     Hostname() string
     Domain() string
     Port() int
-    URL() *url.URL // blocks until the hostname resolves (end-to-end w/ WithContext)
     CACerts() []*x509.Certificate
+    HostnameReady() <-chan struct{} // hostname resolves on authoritative NS
+
+    WithLogger(log *slog.Logger) Tunnel      // default: silent
+    WithContext(ctx context.Context) Tunnel  // URL waits end-to-end, honors ctx
+    WithListener(l net.Listener) Tunneled   // starts the connection
+}
+
+// post-WithListener phase — the running handle: reach it, watch it
+type Tunneled interface {
+    LocalPort() int
+    LocalURL() *url.URL
+    Listener() net.Listener
+
+    URL() *url.URL // blocks until the hostname resolves (end-to-end w/ WithContext)
 
     TunnelReady() <-chan struct{}   // connection up + hostname resolves
-    HostnameReady() <-chan struct{} // hostname resolves on authoritative NS
     Done() <-chan struct{}          // tunnel failed or shut down
     Err() error                     // why (nil while alive)
 }
