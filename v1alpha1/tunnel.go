@@ -47,48 +47,94 @@ func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 // connection. The listener is the single source of local-side truth: LocalIP,
 // LocalPort, and LocalURL all derive from its address. The returned
 // v1.Tunneled carries no mutators — there is nothing left to configure.
+//
+// The listener is provided exactly once. Providing it again — a second
+// WithListener, or WithListener after Listener() already minted one — cancels
+// the tunnel (Err reports "listener already provided"). As an alternative to
+// bringing your own, call Listener() to have the tunnel mint a loopback
+// listener for you.
 func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunneled {
-	t.listenerOnce.Do(func() {
-		t.Logger().Info("configuring tunnel with local listener", "address", l.Addr().String())
-		t.listener = l
-		close(t.listenerProvided)
-
-		if t.engine == nil {
-			// Foreign backend: the tunnel was born canceled (see New).
-			return
-		}
-
-		go func() {
-			t.Logger().Info("starting tunnel with local listener")
-			// Start the DNS readiness poller (it waits on hostnameProvided) and
-			// mint the spec, both before the edge connect: the record exists
-			// from spec-mint time, so DNS propagation overlaps the (seconds-long)
-			// edge dial instead of queuing behind it.
-			go t.pollAuthoritative()
-			t.Spec()
-			if err := t.engine.WithListener(t, l); err != nil {
-				t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
-				return
-			}
-
-			t.Logger().Info("tunnel connected, waiting for DNS")
-			if !await(t.ctx, t.hostnameReady) {
-				return
-			}
-
-			t.Logger().Info("tunnel is ready")
-			close(t.tunnelReady)
-		}()
-	})
+	if t.listenerSet.CompareAndSwap(false, true) {
+		t.provide(l, false)
+	} else {
+		t.cancel(fmt.Errorf("WithListener: listener already provided"))
+	}
 	return t
 }
 
-// Listener returns a tunnel-owned view of the provided listener, blocking
-// until WithListener is called or the tunnel context is canceled (then nil).
-// Closing the returned listener closes the tunnel; the original listener
+// provide adopts l as the local origin and starts the edge connection. The
+// caller must have won the listenerSet CAS, so this runs exactly once. minted
+// marks a listener the tunnel owns (created by Listener), which is closed when
+// the tunnel ends; a caller-provided listener stays caller-owned.
+func (t *TunnelImpl[T]) provide(l net.Listener, minted bool) {
+	t.Logger().Info("configuring tunnel with local listener", "address", l.Addr().String(), "minted", minted)
+	t.listener = l
+	close(t.listenerProvided)
+
+	if minted {
+		// The tunnel owns a minted listener; close it when the tunnel ends so a
+		// canceled tunnel doesn't leak the bound port.
+		go func() {
+			<-t.ctx.Done()
+			l.Close()
+		}()
+	}
+
+	if t.engine == nil {
+		// Foreign backend: the tunnel was born canceled (see New).
+		return
+	}
+
+	go func() {
+		t.Logger().Info("starting tunnel with local listener")
+		// Start the DNS readiness poller (it waits on hostnameProvided) and
+		// mint the spec, both before the edge connect: the record exists
+		// from spec-mint time, so DNS propagation overlaps the (seconds-long)
+		// edge dial instead of queuing behind it.
+		go t.pollAuthoritative()
+		t.Spec()
+		if err := t.engine.WithListener(t, l); err != nil {
+			t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
+			return
+		}
+
+		t.Logger().Info("tunnel connected, waiting for DNS")
+		if !await(t.ctx, t.hostnameReady) {
+			return
+		}
+
+		t.Logger().Info("tunnel is ready")
+		close(t.tunnelReady)
+	}()
+}
+
+// Listener returns a tunnel-owned listener to serve on. If a listener was
+// provided via WithListener it returns a tunnel-owned view of that one;
+// otherwise it mints a loopback listener (127.0.0.1:0), adopts it as
+// WithListener would — same edge-connect and DNS-readiness path — and the
+// tunnel owns it (closed on shutdown). Idempotent: repeated calls return the
+// same listener.
+//
+// Closing the returned listener closes the tunnel. A caller-provided listener
 // stays caller-owned, so closing that restarts the origin while the tunnel
-// persists.
+// persists; a minted one has no separate owner, so closing it is terminal.
 func (t *TunnelImpl[T]) Listener() net.Listener {
+	if t.listenerSet.CompareAndSwap(false, true) {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.cancel(fmt.Errorf("unable to mint a local listener: %w", err))
+			return nil
+		}
+		t.provide(l, true)
+	}
+	return t.boundListener()
+}
+
+// boundListener blocks until a listener is provided (via WithListener or a
+// Listener mint) and returns a tunnel-owned view of it, or nil if the tunnel
+// is canceled first. It never mints — the local-side getters use it so
+// observing the bind address can't start a tunnel.
+func (t *TunnelImpl[T]) boundListener() net.Listener {
 	// The listener field is only safe to read once listenerProvided is closed
 	// (the close is the happens-before edge for the write), so a cancellation
 	// wake returns nil instead of reading the field.
@@ -113,7 +159,7 @@ func (l tunnelListener[T]) Close() error {
 // LocalPort is the listener's bound port. Blocks until a listener is
 // provided.
 func (t *TunnelImpl[T]) LocalPort() int {
-	l := t.Listener()
+	l := t.boundListener()
 	if l == nil {
 		return 0
 	}
@@ -140,7 +186,7 @@ func (t *TunnelImpl[T]) LocalPort() int {
 // Blocks until a listener is provided.
 func (t *TunnelImpl[T]) LocalIP() net.IP {
 	t.localIPOnce.Do(func() {
-		l := t.Listener()
+		l := t.boundListener()
 		if l == nil {
 			return
 		}

@@ -85,12 +85,18 @@ type Tunneled interface {
 	// the backend's WithTLS (https when the origin terminates TLS, http
 	// otherwise). Blocks until a listener is provided.
 	LocalURL() *url.URL
-	// Listener returns a tunnel-owned view of the listener provided via
-	// WithListener, blocking until one arrives. Closing it closes the tunnel
-	// too (Done fires, Err reports ErrClosed) — so an http.Server serving on
-	// it tears the tunnel down on Shutdown/Close. To restart the origin
-	// while the tunnel persists, close the original listener handed to
-	// WithListener instead and rebind the same address.
+	// Listener returns a tunnel-owned listener to serve on, starting the edge
+	// connection on first use. With a listener provided via WithListener it
+	// returns a tunnel-owned view of that one; with none provided it mints a
+	// loopback listener (127.0.0.1:0) and adopts it, so
+	// http.Serve(tun.Listener(), h) needs no net.Listen of your own.
+	// Idempotent: repeated calls return the same listener.
+	//
+	// Closing it closes the tunnel (Done fires, Err reports ErrClosed) — so an
+	// http.Server serving on it tears the tunnel down on Shutdown/Close. To
+	// restart the origin while the tunnel persists, close the original
+	// listener handed to WithListener instead and rebind the same address; a
+	// minted listener has no separate owner, so closing it is terminal.
 	Listener() net.Listener
 
 	// URL is https://<Hostname>/. It blocks until the hostname resolves on
@@ -150,9 +156,13 @@ type Tunnel interface {
 	// if the context is done first. Unset (or nil), URL waits on DNS alone.
 	WithContext(ctx context.Context) Tunnel
 	// WithListener provides the local listener and lazily starts the edge
-	// connection. It is the terminal mutator: the returned Tunneled carries
-	// no further configuration surface. The origin scheme is not inferred from
-	// the listener — declare it on the backend with WithTLS / WithHTTP2 (both
-	// default false).
+	// connection, narrowing to Tunneled — no further configuration surface.
+	// The origin scheme is not inferred from the listener — declare it on the
+	// backend with WithTLS / WithHTTP2 (both default false).
+	//
+	// The listener is provided exactly once. Providing it again — a second
+	// WithListener, or WithListener after Listener() minted one — cancels the
+	// tunnel (Err reports "listener already provided"). To let the tunnel
+	// supply the listener instead, skip WithListener and call Listener().
 	WithListener(l net.Listener) Tunneled
 }

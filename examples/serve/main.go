@@ -13,7 +13,6 @@ import (
 	"io"
 	"log"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"time"
@@ -27,14 +26,6 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// You own the bind. The tunnel infers everything else from the listener —
-	// including whether the origin speaks TLS (wrap with tls.NewListener and
-	// the ingress switches to https automatically).
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	// Unset, the tunnel is silent. Info shows the tunnel lifecycle (including
 	// rate-limit retry warnings); Debug adds cloudflared's internals and the
 	// DNS-readiness probe detail. Set LIBTUNNEL_LOG_LEVEL=debug to raise it.
@@ -46,12 +37,14 @@ func main() {
 		Level: level,
 	}))
 
-	// WithContext upgrades URL from "the hostname resolves" to "the tunnel is
-	// reachable end to end": URL then blocks until TunnelReady, honoring ctx.
+	// No listener of your own: Listener() below mints a loopback origin and
+	// starts the tunnel. (Bring your own with WithListener(l) when you need a
+	// specific bind or a TLS origin via WithTLS.) WithContext upgrades URL from
+	// "the hostname resolves" to "the tunnel is reachable end to end": URL then
+	// blocks until TunnelReady, honoring ctx.
 	tun := libtunnel.New(libtunnel.Cloudflare()).
 		WithLogger(logger).
-		WithContext(ctx).
-		WithListener(l)
+		WithContext(ctx)
 
 	go func() {
 		err := http.Serve(tun.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

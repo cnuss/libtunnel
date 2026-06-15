@@ -187,6 +187,85 @@ func TestEngineReceivesListener(t *testing.T) {
 	}
 }
 
+// TestListenerMintsWhenNoneProvided pins the lazy path: Listener() with no
+// prior WithListener binds a loopback listener, adopts it, and hands it to the
+// engine — so http.Serve(tun.Listener(), h) needs no net.Listen of its own.
+func TestListenerMintsWhenNoneProvided(t *testing.T) {
+	stubReady(t)
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"})
+	tun := v1alpha1.New(engine)
+
+	l := tun.Listener()
+	if l == nil {
+		t.Fatal("Listener() = nil; want a minted loopback listener")
+	}
+	if addr, ok := l.Addr().(*net.TCPAddr); !ok || !addr.IP.IsLoopback() {
+		t.Fatalf("minted listener addr = %v, want loopback", l.Addr())
+	}
+	select {
+	case got := <-engine.got:
+		if got.Addr().String() != l.Addr().String() {
+			t.Errorf("engine got %v, want the minted %v", got.Addr(), l.Addr())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine never received the minted listener")
+	}
+}
+
+// TestSecondWithListenerCancels pins the one-provide rule: a second
+// WithListener cancels the tunnel rather than silently dropping the listener.
+func TestSecondWithListenerCancels(t *testing.T) {
+	stubReady(t)
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	tun.WithListener(listen(t))
+	tun.WithListener(listen(t))
+
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "listener already provided") {
+			t.Errorf("Err() = %v, want 'listener already provided'", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed after a second WithListener")
+	}
+}
+
+// TestListenerMintThenWithListenerCancels pins that a minted listener also
+// counts as provided: a following WithListener is a double-provide.
+func TestListenerMintThenWithListenerCancels(t *testing.T) {
+	stubReady(t)
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	tun.Listener()
+	tun.WithListener(listen(t))
+
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "listener already provided") {
+			t.Errorf("Err() = %v, want 'listener already provided'", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed after WithListener following a mint")
+	}
+}
+
+// TestWithListenerThenListenerReturnsProvided pins the benign order: Listener()
+// after WithListener returns a view of the provided listener and never mints or
+// cancels.
+func TestWithListenerThenListenerReturnsProvided(t *testing.T) {
+	stubReady(t)
+	l := listen(t)
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	tun.WithListener(l)
+
+	got := tun.Listener()
+	if got == nil || got.Addr().String() != l.Addr().String() {
+		t.Errorf("Listener() = %v, want a view of the provided %v", got, l.Addr())
+	}
+	if err := tun.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil (Listener after WithListener is fine)", err)
+	}
+}
+
 // stubReady makes the readiness consensus probe fire immediately so these tests
 // exercise the readiness plumbing (channel close, URL unblock) deterministically
 // without live DNS — the real probe is covered by the live e2e suite.
