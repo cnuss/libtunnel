@@ -46,9 +46,14 @@ func main() {
 	}
 
 	// Unset, the tunnel is silent. Info shows the tunnel lifecycle (including
-	// rate-limit retry warnings); Debug adds cloudflared's internals.
+	// rate-limit retry warnings); Debug adds cloudflared's internals and the
+	// DNS-readiness probe detail. Set LIBTUNNEL_LOG_LEVEL=debug to raise it.
+	level := slog.LevelInfo
+	if os.Getenv("LIBTUNNEL_LOG_LEVEL") == "debug" {
+		level = slog.LevelDebug
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: level,
 	}))
 
 	// WithContext upgrades URL from "the hostname resolves" to "the tunnel is
