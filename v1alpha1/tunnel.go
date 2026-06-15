@@ -348,11 +348,13 @@ func (t *TunnelImpl[T]) markHostnameReady(rung, host string, rec resolver.Record
 // pollAuthoritative queries every nameserver each round and fires on consensus,
 // spacing rounds by fibonacciBackoff.
 func (t *TunnelImpl[T]) pollAuthoritative(host string) {
-	for _, wait := range fibonacciBackoff {
+	for round, wait := range fibonacciBackoff {
 		if rec, ok := authoritativeProbe(t.ctx, t.Logger(), t.Domain(), host); ok {
 			t.markHostnameReady("authoritative", host, rec)
 			return
 		}
+		t.Logger().Debug("authoritative rung not resolved yet, backing off",
+			"hostname", host, "round", round+1, "rounds", len(fibonacciBackoff), "nextWait", wait*time.Second)
 		select {
 		case <-t.ctx.Done():
 			return
@@ -374,12 +376,17 @@ func (t *TunnelImpl[T]) pollSystemFallback(host string) {
 		return
 	case <-time.After(graceBeforeFallback):
 	}
-	for {
+	for attempt := 1; ; attempt++ {
 		addrs, err := net.DefaultResolver.LookupNetIP(t.ctx, "ip", host)
 		if err == nil && len(addrs) > 0 {
 			t.markHostnameReady("system", host, recordsOf(addrs))
 			return
 		}
+		// The fallback is the last rung; when it keeps failing the tunnel hangs
+		// at "waiting for DNS" until the caller's deadline, so record why each
+		// round (error vs. resolved-but-empty).
+		t.Logger().Debug("system resolver has not resolved hostname yet",
+			"hostname", host, "attempt", attempt, "addrs", len(addrs), "error", err)
 		select {
 		case <-t.ctx.Done():
 			return
@@ -402,7 +409,7 @@ var authoritativeProbe = realAuthoritativeProbe
 // are re-resolved each round so a changed delegation is picked up; any server
 // that errors, times out, or has no record yet fails the round (keep polling).
 func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool) {
-	servers := nameserverIPs(ctx, domain)
+	servers := nameserverIPs(ctx, log, domain)
 	if len(servers) == 0 {
 		log.Debug("no authoritative nameservers discovered yet", "domain", domain)
 		return resolver.Records{}, false
@@ -432,15 +439,17 @@ func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host 
 // the system resolver is fine here — the record we wait on is queried at these
 // servers directly. The bare zone name is used (DNS queries take no :port,
 // which the v1 contract allows GetHostname to carry).
-func nameserverIPs(ctx context.Context, domain string) []string {
+func nameserverIPs(ctx context.Context, log *slog.Logger, domain string) []string {
 	ns, err := net.DefaultResolver.LookupNS(ctx, dnsName(domain))
 	if err != nil {
+		log.Debug("authoritative NS lookup failed", "domain", domain, "error", err)
 		return nil
 	}
 	var servers []string
 	for _, record := range ns {
 		ips, err := net.DefaultResolver.LookupHost(ctx, record.Host)
 		if err != nil {
+			log.Debug("nameserver address lookup failed", "nameserver", record.Host, "error", err)
 			continue
 		}
 		for _, ip := range ips {

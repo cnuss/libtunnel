@@ -44,7 +44,11 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, r.bin, args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, r.bin, args...)
+	// Run examples at Debug so a CI failure (e.g. a DNS-readiness stall) carries
+	// the per-rung probe detail; the examples default to Info for humans.
+	cmd.Env = append(os.Environ(), "LIBTUNNEL_LOG_LEVEL=debug")
+	out, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
