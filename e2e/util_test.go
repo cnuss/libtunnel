@@ -27,7 +27,6 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
-	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
 // roleEnv selects a child role inside a re-exec'd test binary.
@@ -124,23 +123,14 @@ func waitReady(t *testing.T, conn v1.Tunneled, d time.Duration) {
 	}
 }
 
-// dualClient resolves hostnames over the DoH fleet and dials dualstack (both
-// families, first address to connect wins) — the same robustness
-// libtunnel.HTTPClient gives callers. CI runner resolvers produce two failure
-// modes no retry budget can outwait: answering only AAAA on hosts with no IPv6
-// egress, and negative-caching a fresh hostname's A record for the zone's SOA
-// minimum. The DoH fleet sidesteps both, and the try-all dial means an
-// unroutable v6 falls back to v4 instead of failing. TLS still uses the URL
-// hostname for SNI and certificate verification; only the dial target changes.
-var dualClient = func() *http.Client {
-	c := resolver.HTTPClient()
-	c.Timeout = 15 * time.Second
-	return c
-}()
+// httpClient fetches the public URL. Readiness already guarantees the hostname
+// resolves on every authoritative nameserver before a tunnel reports ready, so
+// the stdlib client suffices — no DoH/dualstack workaround is needed here.
+var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 // getBody requests url once and returns the body.
 func getBody(url string) (string, int, error) {
-	resp, err := dualClient.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return "", 0, err
 	}

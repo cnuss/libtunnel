@@ -128,9 +128,6 @@ func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel // T wires the backend, not
 func Cloudflare() v1.Backend[*cloudflare.Spec]   // in-process cloudflared engine;
                                                  // adopts TUNNEL_SPEC, else mints
                                                  // an anonymous quick tunnel
-func HTTPClient() *http.Client                   // dualstack DoH client: reach a
-                                                 // tunnel from a flaky-resolver
-                                                 // network (AAAA-only, captive portal)
 
 // parent→child handoff — no API: minting exports the TUNNEL_SPEC env var,
 // construction adopts it
