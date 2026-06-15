@@ -65,7 +65,8 @@ func TestLiveTunnel(t *testing.T) {
 	}))
 	srv := &http.Server{Handler: mux}
 
-	conn := libtunnel.New(libtunnel.Cloudflare().WithTLS(true)).WithListener(l)
+	tun := libtunnel.New(libtunnel.Cloudflare().WithTLS(true))
+	conn := tun.WithListener(l)
 	// Serve the original listener: the bounce below restarts the origin and
 	// the tunnel must persist. (Serving conn.Listener() would tie the tunnel
 	// to the server's lifetime — that teardown is exercised at the end.)
@@ -112,7 +113,7 @@ func TestLiveTunnel(t *testing.T) {
 
 	// Streaming protocols must survive the edge.
 	t.Run("WebSocket", func(t *testing.T) {
-		ws, err := websocket.Dial("wss://"+conn.Hostname()+"/ws", "", url)
+		ws, err := websocket.Dial("wss://"+tun.Hostname()+"/ws", "", url)
 		if err != nil {
 			t.Fatalf("websocket dial: %v", err)
 		}
@@ -271,10 +272,11 @@ func TestLiveTwoTunnels(t *testing.T) {
 				return
 			}
 			defer l.Close()
-			conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
+			tun := libtunnel.New(libtunnel.Cloudflare())
+			conn := tun.WithListener(l)
 			serveBody(conn.Listener(), body)
 
-			if ip := conn.LocalIP(); ip == nil || ip.IsUnspecified() {
+			if ip := tun.LocalIP(); ip == nil || ip.IsUnspecified() {
 				errs <- fmt.Errorf("%s: LocalIP() = %v, want a concrete IP", body, ip)
 				return
 			}
