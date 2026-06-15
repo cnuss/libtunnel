@@ -51,6 +51,7 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		cancel:           cancel,
 		backend:          backend,
 		listenerProvided: make(chan struct{}),
+		hostnameProvided: make(chan struct{}),
 		tunnelReady:      make(chan struct{}),
 		hostnameReady:    make(chan struct{}),
 	}
@@ -110,15 +111,15 @@ type TunnelImpl[T v1.Spec] struct {
 
 	specOnce sync.Once
 	spec     T
+	// hostnameProvided is closed once Spec resolves the public hostname. It
+	// starts the authoritative DNS poll (mirrors listenerProvided), so polling
+	// begins at mint time rather than when a caller first asks HostnameReady.
+	hostnameProvided chan struct{}
 
 	caCertsOnce sync.Once
 	caCerts     []*x509.Certificate
 
-	hostnameReadyOnce sync.Once
-	// hostnameReadyClose guards the close: two readiness rungs (authoritative
-	// :53 and DoH) race to report first.
-	hostnameReadyClose sync.Once
-	hostnameReady      chan struct{}
+	hostnameReady chan struct{}
 
 	tunnelReady chan struct{}
 }

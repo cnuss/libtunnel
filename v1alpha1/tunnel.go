@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -61,17 +60,19 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunneled {
 
 		go func() {
 			t.Logger().Info("starting tunnel with local listener")
-			// Start the DNS readiness poller before the edge connect: the
-			// record exists from spec-mint time, so DNS propagation overlaps
-			// the (seconds-long) edge dial instead of queuing behind it.
-			ready := t.HostnameReady()
+			// Start the DNS readiness poller (it waits on hostnameProvided) and
+			// mint the spec, both before the edge connect: the record exists
+			// from spec-mint time, so DNS propagation overlaps the (seconds-long)
+			// edge dial instead of queuing behind it.
+			go t.pollAuthoritative()
+			t.Spec()
 			if err := t.engine.WithListener(t, l); err != nil {
 				t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
 				return
 			}
 
 			t.Logger().Info("tunnel connected, waiting for DNS")
-			if !await(t.ctx, ready) {
+			if !await(t.ctx, t.hostnameReady) {
 				return
 			}
 
@@ -227,6 +228,9 @@ func (t *TunnelImpl[T]) Spec() T {
 		}
 		t.spec = spec
 		t.Logger().Info("fetched tunnel spec", "hostname", spec.GetHostname())
+		// The public hostname is now known; release the authoritative poll
+		// (started by WithListener) so DNS propagation overlaps the edge dial.
+		close(t.hostnameProvided)
 	})
 	return t.spec
 }
@@ -304,95 +308,56 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 // fibonacciBackoff is the wait between authoritative poll rounds, in seconds.
 // It tracks the observed ~5s window for a fresh quick-tunnel record to land on
 // the zone's nameservers and caps at 21s; spot-tests showed the record absent
-// at 1–3s, reliably present by 5s. Once the sequence is exhausted readiness
-// falls back to the system resolver.
+// at 1–3s, reliably present by 5s. After the sequence is exhausted the poll
+// holds at the 21s cap and keeps going until consensus or tunnel cancel.
 var fibonacciBackoff = []time.Duration{1, 1, 2, 3, 5, 8, 13, 21}
 
-// graceBeforeFallback delays the system-resolver rung so the stricter
-// authoritative-consensus rung wins where direct :53 works (the record appears
-// ~5s after connect and consensus lands a beat later). On networks that block
-// or rewrite direct :53 to the nameservers, the fallback still fires shortly
-// after this grace — well inside a caller's readiness budget — instead of
-// waiting out the whole authoritative backoff.
-const graceBeforeFallback = 10 * time.Second
-
-// HostnameReady closes the returned channel (on first use, then idempotently)
-// once the tunnel hostname resolves. Two rungs run concurrently; whichever
-// resolves first wins:
+// HostnameReady returns the channel closed once the public hostname resolves on
+// the zone's authoritative nameservers. The poll that closes it is started by
+// WithListener and gated on hostnameProvided, so this is a pure accessor —
+// select on it (and on Done).
 //
-//   - the authoritative rung queries the zone's nameservers directly — the dig
-//     equivalent, via package resolver — and fires only when every nameserver
-//     returns the same non-empty A+AAAA set (full-propagation truth, not a
-//     first-server-to-see-it signal). Rounds are spaced by fibonacciBackoff.
-//     Queries are RD=1 (the quick-tunnel nameservers REFUSE RD=0).
-//   - the system-resolver rung is the fallback for networks that block direct
-//     :53; it starts after graceBeforeFallback so the authoritative rung is
-//     preferred, then polls the system resolver until the record appears.
+// Readiness is authoritative-only: pollAuthoritative queries the zone's
+// nameservers directly (the dig equivalent, via package resolver) and fires
+// only when every reachable nameserver returns the same non-empty A+AAAA set —
+// full-propagation truth, not a first-server-to-see-it signal, and never a
+// recursive resolver's cache. Queries are RD=1 (the quick-tunnel nameservers
+// REFUSE RD=0).
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
-	t.hostnameReadyOnce.Do(func() {
-		host := dnsName(t.Hostname())
-		go t.pollAuthoritative(host)
-		go t.pollSystemFallback(host)
-	})
 	return t.hostnameReady
 }
 
-// markHostnameReady closes the readiness channel once, recording who saw it.
-func (t *TunnelImpl[T]) markHostnameReady(rung, host string, rec resolver.Records) {
-	t.hostnameReadyClose.Do(func() {
-		t.Logger().Info("hostname resolved", "rung", rung, "hostname", host, "A", rec.A, "AAAA", rec.AAAA)
-		close(t.hostnameReady)
-	})
+// markHostnameReady logs the resolved record and closes the readiness channel.
+// One caller (pollAuthoritative) reaches it once, so the close needs no guard.
+func (t *TunnelImpl[T]) markHostnameReady(host string, rec resolver.Records) {
+	t.Logger().Info("hostname resolved", "hostname", host, "A", rec.A, "AAAA", rec.AAAA)
+	close(t.hostnameReady)
 }
 
-// pollAuthoritative queries every nameserver each round and fires on consensus,
-// spacing rounds by fibonacciBackoff.
-func (t *TunnelImpl[T]) pollAuthoritative(host string) {
-	for round, wait := range fibonacciBackoff {
+// pollAuthoritative waits for the spec to provide the public hostname, then
+// queries every nameserver each round and fires on consensus. Rounds ramp
+// through fibonacciBackoff and then hold at its cap; it runs until consensus or
+// the tunnel is canceled.
+func (t *TunnelImpl[T]) pollAuthoritative() {
+	if !await(t.ctx, t.hostnameProvided) {
+		return
+	}
+	host := dnsName(t.Hostname())
+	for round := 0; ; round++ {
 		if rec, ok := authoritativeProbe(t.ctx, t.Logger(), t.Domain(), host); ok {
-			t.markHostnameReady("authoritative", host, rec)
+			t.markHostnameReady(host, rec)
 			return
+		}
+		wait := fibonacciBackoff[len(fibonacciBackoff)-1]
+		if round < len(fibonacciBackoff) {
+			wait = fibonacciBackoff[round]
 		}
 		t.Logger().Debug("authoritative rung not resolved yet, backing off",
-			"hostname", host, "round", round+1, "rounds", len(fibonacciBackoff), "nextWait", wait*time.Second)
+			"hostname", host, "round", round+1, "nextWait", wait*time.Second)
 		select {
 		case <-t.ctx.Done():
-			return
-		case <-t.hostnameReady:
 			return
 		case <-time.After(wait * time.Second):
-		}
-	}
-	t.Logger().Debug("authoritative consensus not reached; leaving readiness to the system resolver", "hostname", host)
-}
-
-// pollSystemFallback waits out the grace, then polls the system resolver until
-// the record appears or the tunnel is canceled.
-func (t *TunnelImpl[T]) pollSystemFallback(host string) {
-	select {
-	case <-t.ctx.Done():
-		return
-	case <-t.hostnameReady:
-		return
-	case <-time.After(graceBeforeFallback):
-	}
-	for attempt := 1; ; attempt++ {
-		addrs, err := net.DefaultResolver.LookupNetIP(t.ctx, "ip", host)
-		if err == nil && len(addrs) > 0 {
-			t.markHostnameReady("system", host, recordsOf(addrs))
-			return
-		}
-		// The fallback is the last rung; when it keeps failing the tunnel hangs
-		// at "waiting for DNS" until the caller's deadline, so record why each
-		// round (error vs. resolved-but-empty).
-		t.Logger().Debug("system resolver has not resolved hostname yet",
-			"hostname", host, "attempt", attempt, "addrs", len(addrs), "error", err)
-		select {
-		case <-t.ctx.Done():
-			return
-		case <-t.hostnameReady:
-			return
-		case <-time.After(3 * time.Second):
 		}
 	}
 }
@@ -464,20 +429,6 @@ func nameserverIPs(ctx context.Context, log *slog.Logger, domain string) []strin
 		}
 	}
 	return servers
-}
-
-// recordsOf splits resolved addresses into A/AAAA, for logging the
-// system-resolver fallback in the same shape as the authoritative rung.
-func recordsOf(addrs []netip.Addr) resolver.Records {
-	var rec resolver.Records
-	for _, a := range addrs {
-		if a.Unmap().Is4() {
-			rec.A = append(rec.A, a.Unmap())
-		} else {
-			rec.AAAA = append(rec.AAAA, a)
-		}
-	}
-	return rec
 }
 
 // hostOf returns the first label of hostname.
