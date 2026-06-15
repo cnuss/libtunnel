@@ -1,0 +1,65 @@
+# Experiment (not part of CI): measure how long a single minted quick-tunnel
+# spec stays reusable. It adopts a pre-minted spec from the TUNNEL_SPEC secret
+# and runs examples/serve, which connects, waits for readiness, self-fetches its
+# public URL, and exits non-zero on any failure. The run history is the result:
+# the first red run is roughly when Cloudflare reaped the tunnel (or its
+# *.trycloudflare.com DNS).
+#
+# Deliberately isolated from the matrix E2E: that tier runs live on one cell per
+# OS concurrently, and a single shared hostname would cross-talk (requests
+# load-balanced across cells serving different bodies). One runner here, one
+# connector, no cross-talk.
+#
+# Setup: mint once with `curl -XPOST https://api.trycloudflare.com/tunnel`, then
+# store the env envelope as the repo secret TUNNEL_SPEC:
+#   TUNNEL_SPEC={"backend":"cloudflare","spec":{<the .result object>}}
+# Until the secret is set the job skips green (it never mints — minting hourly
+# would defeat the purpose and trip the API rate limit).
+name: Spec Longevity
+
+on:
+  schedule:
+    # Hourly. This measures lifetime under periodic reuse (what the E2E reuse
+    # pattern would be); if reaping is idle-based the hourly poke is exactly the
+    # signal we want, and an age-based hard expiry still trips it.
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never overlap runs against the one shared spec; let each complete.
+  group: spec-longevity
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: probe the stored spec
+        env:
+          # Adopted by the Cloudflare credential chain before it would mint.
+          # Empty (secret unset) => skip, so the probe never mints a fresh one.
+          TUNNEL_SPEC: ${{ secrets.TUNNEL_SPEC }}
+          # Debug surfaces the readiness detail (per-NS probe, backoff) so a
+          # failure shows whether the hostname stopped resolving vs. the edge
+          # rejecting the credential.
+          LIBTUNNEL_LOG_LEVEL: debug
+        run: |
+          if [ -z "$TUNNEL_SPEC" ]; then
+            echo "::notice::TUNNEL_SPEC secret is not set — mint one and store it to start the experiment. Skipping."
+            exit 0
+          fi
+          go run ./examples/serve
