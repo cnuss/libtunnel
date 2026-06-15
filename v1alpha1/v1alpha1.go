@@ -95,7 +95,10 @@ type TunnelImpl[T v1.Spec] struct {
 	// New. Nil means a foreign backend — the tunnel is born canceled.
 	engine Engine[T]
 
-	listenerOnce     sync.Once
+	// listenerSet guards the one-time provide: the first WithListener or
+	// Listener-mint wins the CAS and sets listener; a later WithListener that
+	// loses is a double-provide and cancels the tunnel.
+	listenerSet      atomic.Bool
 	listener         net.Listener
 	listenerProvided chan struct{}
 
