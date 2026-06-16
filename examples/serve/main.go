@@ -26,34 +26,28 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// Unset, the tunnel is silent. Info shows the tunnel lifecycle (including
-	// rate-limit retry warnings); Debug adds cloudflared's internals and the
-	// DNS-readiness probe detail. Set LIBTUNNEL_LOG_LEVEL=debug to raise it.
-	level := slog.LevelInfo
-	if os.Getenv("LIBTUNNEL_LOG_LEVEL") == "debug" {
-		level = slog.LevelDebug
-	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: level,
+		Level: slog.LevelDebug,
 	}))
 
-	// No listener of your own: Listener() below mints a loopback origin and
-	// starts the tunnel. (Bring your own with WithListener(l) when you need a
-	// specific bind or a TLS origin via WithTLS.) WithContext upgrades URL from
-	// "the hostname resolves" to "the tunnel is reachable end to end": URL then
-	// blocks until TunnelReady, honoring ctx.
 	tun := libtunnel.New(libtunnel.Cloudflare()).
 		WithLogger(logger).
 		WithContext(ctx)
 
+	lis := tun.Listener()
+	if lis == nil {
+		log.Fatal("failed to mint a listener")
+	}
+	log.Printf("listening on %s\n", lis.Addr())
+
 	go func() {
-		err := http.Serve(tun.Listener(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := http.Serve(lis, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "hello from libtunnel")
 		}))
 		log.Fatal(err)
 	}()
 
-	fmt.Printf("local: %s\n", tun.LocalURL())
+	log.Printf("local: %s\n", tun.LocalURL())
 
 	// URL returns nil if the tunnel failed or the deadline elapsed first —
 	// Err() reports a tunnel failure, ctx.Err() a timeout.
@@ -61,7 +55,7 @@ func main() {
 	if url == nil {
 		log.Fatal(cmp.Or(tun.Err(), ctx.Err()))
 	}
-	fmt.Printf("✓ tunneled %s to %s\n", tun.LocalURL(), url)
+	log.Printf("✓ tunneled %s to %s\n", tun.LocalURL(), url)
 
 	// The first request can race propagation: TunnelReady proves the
 	// authoritative nameservers serve the record, but this machine's own
@@ -71,7 +65,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("served: %s\n", body)
+	log.Printf("served: %s\n", body)
 }
 
 // fetch GETs url, retrying until it answers 200 or ctx is done.
