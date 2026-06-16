@@ -355,7 +355,7 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 // It tracks the observed ~5s window for a fresh quick-tunnel record to land on
 // the zone's nameservers and caps at 21s; spot-tests showed the record absent
 // at 1–3s, reliably present by 5s. After the sequence is exhausted the poll
-// holds at the 21s cap and keeps going until consensus or tunnel cancel.
+// holds at the 21s cap and keeps going until the record appears or tunnel cancel.
 var fibonacciBackoff = []time.Duration{1, 1, 2, 3, 5, 8, 13, 21}
 
 // HostnameReady returns the channel closed once the public hostname resolves on
@@ -364,11 +364,10 @@ var fibonacciBackoff = []time.Duration{1, 1, 2, 3, 5, 8, 13, 21}
 // select on it (and on Done).
 //
 // Readiness is authoritative-only: pollAuthoritative queries the zone's
-// nameservers directly (the dig equivalent, via package resolver) and fires
-// only when every reachable nameserver returns the same non-empty A+AAAA set —
-// full-propagation truth, not a first-server-to-see-it signal, and never a
-// recursive resolver's cache. Queries are RD=1 (the quick-tunnel nameservers
-// REFUSE RD=0).
+// nameservers directly (the dig equivalent, via package resolver) and fires as
+// soon as one of them serves a non-empty A+AAAA set — a record on any
+// authoritative nameserver, never a recursive resolver's cache. Queries are
+// RD=1 (the quick-tunnel nameservers REFUSE RD=0).
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	return t.hostnameReady
 }
@@ -381,9 +380,9 @@ func (t *TunnelImpl[T]) markHostnameReady(host string, rec resolver.Records) {
 }
 
 // pollAuthoritative waits for the spec to provide the public hostname, then
-// queries every nameserver each round and fires on consensus. Rounds ramp
-// through fibonacciBackoff and then hold at its cap; it runs until consensus or
-// the tunnel is canceled.
+// probes the nameservers each round and fires as soon as one serves the record.
+// Rounds ramp through fibonacciBackoff and then hold at its cap; it runs until
+// the record appears or the tunnel is canceled.
 func (t *TunnelImpl[T]) pollAuthoritative() {
 	if !await(t.ctx, t.hostnameProvided) {
 		return
@@ -409,16 +408,17 @@ func (t *TunnelImpl[T]) pollAuthoritative() {
 }
 
 // authoritativeProbe runs one readiness probe for host in zone domain: it
-// returns the agreed records and true once every authoritative nameserver
-// returns the same non-empty A+AAAA set. It is a package var so tests can drive
-// readiness deterministically without live DNS; production uses
-// realAuthoritativeProbe.
+// returns records and true as soon as one authoritative nameserver serves a
+// non-empty A+AAAA set. It is a package var so tests can drive readiness
+// deterministically without live DNS; production uses realAuthoritativeProbe.
 var authoritativeProbe = realAuthoritativeProbe
 
-// realAuthoritativeProbe queries each of the zone's nameservers for host's
-// A+AAAA and reports whether all returned the same non-empty set. Nameservers
-// are re-resolved each round so a changed delegation is picked up; any server
-// that errors, times out, or has no record yet fails the round (keep polling).
+// realAuthoritativeProbe queries the zone's nameservers for host's A+AAAA and
+// returns the first non-empty answer — one authoritative nameserver serving the
+// record is enough, no cross-server agreement required. Nameservers are
+// re-resolved each round so a changed delegation is picked up; a server that
+// errors, times out, or has no record yet is skipped, and a round with no
+// non-empty answer keeps polling.
 func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool) {
 	servers := nameserverIPs(ctx, log, domain)
 	if len(servers) == 0 {
@@ -426,23 +426,17 @@ func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host 
 		return resolver.Records{}, false
 	}
 
-	var agreed *resolver.Records
 	for _, server := range servers {
 		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		rec, err := resolver.Query(qctx, server, host)
 		cancel()
 		log.Debug("authoritative query", "hostname", host, "server", server, "A", rec.A, "AAAA", rec.AAAA, "error", err)
 		if err != nil || rec.Empty() {
-			return resolver.Records{}, false
+			continue
 		}
-		if agreed == nil {
-			agreed = &rec
-		} else if !agreed.Equal(rec) {
-			log.Debug("nameservers disagree, still propagating", "hostname", host)
-			return resolver.Records{}, false
-		}
+		return rec, true
 	}
-	return *agreed, true
+	return resolver.Records{}, false
 }
 
 // nameserverIPs resolves the zone's NS records to IPv4 ip:53 endpoints via the
@@ -451,12 +445,10 @@ func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host 
 // servers directly. The bare zone name is used (DNS queries take no :port,
 // which the v1 contract allows GetHostname to carry).
 //
-// Only IPv4 endpoints are kept: consensus requires every queried server to
-// answer, so an NS endpoint the host can't reach (an IPv6 anycast address on an
-// IPv4-only host — e.g. a GitHub Actions runner — yields "connect: no route to
-// host") would stall readiness forever. Every Cloudflare NS has an IPv4 anycast
-// address, so v4-only loses no server; an IPv6-only host falls back to the
-// system resolver.
+// Only IPv4 endpoints are kept: an IPv6 NS anycast address on an IPv4-only host
+// (e.g. a GitHub Actions runner) yields "connect: no route to host", burning a
+// 5s query timeout each round for nothing. Every Cloudflare NS has an IPv4
+// anycast address, so v4-only loses no nameserver.
 func nameserverIPs(ctx context.Context, log *slog.Logger, domain string) []string {
 	ns, err := net.DefaultResolver.LookupNS(ctx, dnsName(domain))
 	if err != nil {
