@@ -18,7 +18,14 @@ import (
 // The value is a specEnvelope: the spec tagged with the backend that minted
 // it, so a child running a different backend fails loudly instead of
 // unmarshaling a foreign spec into its own type.
-const SpecEnv = "TUNNEL_SPEC"
+const SpecEnv = "LIBTUNNEL_SPEC"
+
+// HostnameEnv is a plain-text mirror of the spec's hostname, set by ExportSpec
+// alongside SpecEnv. It is export-only convenience — tooling or a child process
+// can read the public hostname without parsing the SpecEnv envelope. libtunnel
+// itself never adopts it: connecting needs the full credential in SpecEnv, not
+// a hostname alone.
+const HostnameEnv = "LIBTUNNEL_HOSTNAME"
 
 // specEnvelope is the wire form of SpecEnv: the backend name plus the
 // backend's own spec encoding.
@@ -59,7 +66,7 @@ func (p staticProvider[T]) Spec(context.Context) (T, error) {
 	return p.spec, nil
 }
 
-// Env wraps a provider with TUNNEL_SPEC handling for the named backend: when
+// Env wraps a provider with LIBTUNNEL_SPEC handling for the named backend: when
 // the environment carries a spec inherited from a parent process, it wins;
 // otherwise the wrapped provider resolves one and the result is exported back
 // into this process's environment, so spawned children inherit the same
@@ -111,7 +118,7 @@ func (p envProvider[E, T]) Spec(ctx context.Context) (T, error) {
 	return minted, nil
 }
 
-// SpecEnviron encodes spec as a "TUNNEL_SPEC=<json>" entry for a child
+// SpecEnviron encodes spec as a "LIBTUNNEL_SPEC=<json>" entry for a child
 // process's exec.Cmd.Env, tagged with the minting backend's name.
 func SpecEnviron[T v1.Spec](backend string, spec T) (string, error) {
 	data, err := json.Marshal(spec)
@@ -127,7 +134,8 @@ func SpecEnviron[T v1.Spec](backend string, spec T) (string, error) {
 
 // ExportSpec publishes spec into this process's own environment so re-exec'd
 // or spawned children inherit it. The exported value is remembered and never
-// re-adopted by this process's own SpecFromEnv (see Env).
+// re-adopted by this process's own SpecFromEnv (see Env). It also sets
+// HostnameEnv to the spec's plain hostname as a convenience mirror.
 func ExportSpec[T v1.Spec](backend string, spec T) error {
 	entry, err := SpecEnviron(backend, spec)
 	if err != nil {
@@ -137,10 +145,16 @@ func ExportSpec[T v1.Spec](backend string, spec T) error {
 	selfExportedMu.Lock()
 	selfExported[value] = true
 	selfExportedMu.Unlock()
-	return os.Setenv(SpecEnv, value)
+	if err := os.Setenv(SpecEnv, value); err != nil {
+		return err
+	}
+	// Best effort: the hostname mirror is convenience only, not the channel
+	// libtunnel adopts, so a failure here shouldn't fail the export.
+	_ = os.Setenv(HostnameEnv, spec.GetHostname())
+	return nil
 }
 
-// SpecFromEnv decodes TUNNEL_SPEC into the caller-allocated spec. It reports
+// SpecFromEnv decodes LIBTUNNEL_SPEC into the caller-allocated spec. It reports
 // whether a spec was adopted; a present-but-malformed value, or one minted by
 // a different backend, is an error. A value this process exported itself
 // (ExportSpec) reads as absent — the handoff channel carries parent→child

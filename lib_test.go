@@ -108,14 +108,14 @@ func TestReExecInheritsSpec(t *testing.T) {
 }
 
 // TestHandoffChain proves the handoff composes: parent → child → grandchild,
-// each hop inheriting TUNNEL_SPEC through the environment, all three
+// each hop inheriting LIBTUNNEL_SPEC through the environment, all three
 // resolving the same hostname.
 func TestHandoffChain(t *testing.T) {
 	switch role() {
 	case "chain-child":
 		reportSpec()
 		// Spawn the grandchild with a plainly inherited environment — no
-		// explicit entry; TUNNEL_SPEC rides along.
+		// explicit entry; LIBTUNNEL_SPEC rides along.
 		out, err := reexec("TestHandoffChain", roleEnv+"=chain-grandchild").CombinedOutput()
 		if err != nil {
 			fmt.Printf("grandchild failed: %v\n%s", err, out)
@@ -150,7 +150,7 @@ func TestHandoffChain(t *testing.T) {
 }
 
 // TestMalformedSpecEnv pins the failure path: a child handed a corrupt
-// TUNNEL_SPEC must fail loudly — the tunnel resolves to nothing and the
+// LIBTUNNEL_SPEC must fail loudly — the tunnel resolves to nothing and the
 // cancellation cause names the parse failure on the child's logger.
 func TestMalformedSpecEnv(t *testing.T) {
 	if role() == "malformed-child" {
@@ -167,9 +167,9 @@ func TestMalformedSpecEnv(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	t.Logf("child output:\n%s", out)
 	if err == nil {
-		t.Fatal("child exited 0 with a corrupt TUNNEL_SPEC; want a loud failure")
+		t.Fatal("child exited 0 with a corrupt LIBTUNNEL_SPEC; want a loud failure")
 	}
-	if want := "unable to parse TUNNEL_SPEC"; !strings.Contains(string(out), want) {
+	if want := "unable to parse LIBTUNNEL_SPEC"; !strings.Contains(string(out), want) {
 		t.Errorf("child output does not contain %q (the cancellation cause)", want)
 	}
 	if want := `hostname=""`; !strings.Contains(string(out), want) {

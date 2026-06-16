@@ -49,7 +49,7 @@ type Backend[T Spec] interface {
 	// Name identifies the backend (e.g. "cloudflare").
 	Name() string
 	// Provider is the credential chain this backend draws specs from. For
-	// Cloudflare: adopt TUNNEL_SPEC from the environment when present,
+	// Cloudflare: adopt LIBTUNNEL_SPEC from the environment when present,
 	// otherwise mint an anonymous quick tunnel.
 	Provider() Provider[T]
 	// WithTLS declares whether the local origin terminates TLS. True dials the

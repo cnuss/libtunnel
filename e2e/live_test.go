@@ -39,7 +39,7 @@ func TestLiveTunnel(t *testing.T) {
 	gateLive(t)
 
 	// Reuse the preflight mint: hand its spec to this tunnel through the
-	// environment (the Cloudflare chain adopts TUNNEL_SPEC before minting).
+	// environment (the Cloudflare chain adopts LIBTUNNEL_SPEC before minting).
 	if preflightSpec != nil {
 		if entry, err := v1alpha1.SpecEnviron("cloudflare", preflightSpec); err == nil {
 			t.Setenv(v1alpha1.SpecEnv, strings.TrimPrefix(entry, v1alpha1.SpecEnv+"="))
@@ -222,7 +222,7 @@ func TestLiveResurrection(t *testing.T) {
 	eventuallyBody(t, url, "generation two", 45*time.Second)
 }
 
-// liveServeChild adopts TUNNEL_SPEC, serves LIBTUNNEL_E2E_BODY, reports
+// liveServeChild adopts LIBTUNNEL_SPEC, serves LIBTUNNEL_E2E_BODY, reports
 // readiness, and blocks until killed.
 func liveServeChild() {
 	l, err := net.Listen("tcp", "127.0.0.1:0")

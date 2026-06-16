@@ -130,20 +130,22 @@ type Spec interface { GetHostname() string }
 // façade
 func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel // T wires the backend, not the result
 func Cloudflare() v1.Backend[*cloudflare.Spec]   // in-process cloudflared engine;
-                                                 // adopts TUNNEL_SPEC, else mints
+                                                 // adopts LIBTUNNEL_SPEC, else mints
                                                  // an anonymous quick tunnel
 
-// parent→child handoff — no API: minting exports the TUNNEL_SPEC env var,
+// parent→child handoff — no API: minting exports the LIBTUNNEL_SPEC env var,
 // construction adopts it
 ```
 
 ## Parent→child handoff
 
-`TUNNEL_SPEC` is a first-class handoff channel with nothing to call: when
+`LIBTUNNEL_SPEC` is a first-class handoff channel with nothing to call: when
 the Cloudflare credential chain mints a spec it exports it into the
 process's environment, and at construction it adopts one found there. A
 spawned child (or a re-exec) therefore connects under the same hostname —
-no second quick-tunnel resolution, no plumbing.
+no second quick-tunnel resolution, no plumbing. The export also sets
+`LIBTUNNEL_HOSTNAME` to the plain hostname, so tooling can read it without
+parsing the envelope (libtunnel itself adopts `LIBTUNNEL_SPEC`, not this).
 
 Two guardrails keep the channel safe: a process never re-adopts a spec it
 exported itself (a second tunnel in the same process mints its own identity
@@ -152,12 +154,12 @@ with the backend that minted it, so a child running a different backend
 fails loudly instead of silently unmarshaling a foreign spec.
 
 ```go
-// parent: forcing the mint exports TUNNEL_SPEC as a side effect (never
+// parent: forcing the mint exports LIBTUNNEL_SPEC as a side effect (never
 // connects itself); Hostname triggers the mint and returns the public name
 libtunnel.New(libtunnel.Cloudflare()).Hostname()
 cmd := exec.Command(os.Args[0], "child") // inherits the environment
 
-// child: the Cloudflare credential chain finds TUNNEL_SPEC and adopts it
+// child: the Cloudflare credential chain finds LIBTUNNEL_SPEC and adopts it
 conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 ```
 
@@ -171,7 +173,7 @@ Self-contained programs in [`./examples`](./examples):
 | --------- | ------------------------------------------------------------------ |
 | `serve`   | Real quick tunnel: serve locally, request the public URL.           |
 | `serve-tls` | Same as `serve`, but a TLS listener (`tls.Listen`) — ingress flips to https. |
-| `subprocess` | Parent mints a spec; child adopts it via `TUNNEL_SPEC` and serves. |
+| `subprocess` | Parent mints a spec; child adopts it via `LIBTUNNEL_SPEC` and serves. |
 
 Run one locally:
 
