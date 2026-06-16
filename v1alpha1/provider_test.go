@@ -47,7 +47,8 @@ func TestSpecEnvironRoundTrip(t *testing.T) {
 }
 
 func TestExportSpecGuardsSelfAdoption(t *testing.T) {
-	t.Setenv(v1alpha1.SpecEnv, "") // restore after the test
+	t.Setenv(v1alpha1.SpecEnv, "")     // restore after the test
+	t.Setenv(v1alpha1.HostnameEnv, "") // restore after the test
 	spec := &cloudflare.Spec{Hostname: "exported.trycloudflare.com"}
 	if err := v1alpha1.ExportSpec("cloudflare", spec); err != nil {
 		t.Fatal(err)
@@ -56,6 +57,10 @@ func TestExportSpecGuardsSelfAdoption(t *testing.T) {
 	// The exported value sits in the environment for children to inherit …
 	if env := os.Getenv(v1alpha1.SpecEnv); !strings.Contains(env, "exported.trycloudflare.com") {
 		t.Errorf("env %s = %q, want the exported spec", v1alpha1.SpecEnv, env)
+	}
+	// … alongside the plain-hostname mirror.
+	if got := os.Getenv(v1alpha1.HostnameEnv); got != "exported.trycloudflare.com" {
+		t.Errorf("env %s = %q, want the plain hostname", v1alpha1.HostnameEnv, got)
 	}
 
 	// … but this process never re-adopts its own export: a second in-process

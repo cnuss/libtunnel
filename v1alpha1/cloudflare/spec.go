@@ -4,7 +4,7 @@ import v1 "github.com/cnuss/libtunnel/v1"
 
 // Spec is the Cloudflare backend's credential set — the spec type T produced
 // by libtunnel.Cloudflare(). The json tags match the api.trycloudflare.com
-// response and the TUNNEL_SPEC handoff encoding.
+// response and the LIBTUNNEL_SPEC handoff encoding.
 type Spec struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`

@@ -95,7 +95,7 @@ func (b *Backend) Name() string {
 	return "cloudflare"
 }
 
-// Provider is the Cloudflare credential chain: adopt TUNNEL_SPEC from the
+// Provider is the Cloudflare credential chain: adopt LIBTUNNEL_SPEC from the
 // environment when a parent process handed one off, otherwise mint an
 // anonymous quick tunnel from api.trycloudflare.com. Mutators for named
 // tunnels / other endpoints will hang off Cloudflare() when they exist.

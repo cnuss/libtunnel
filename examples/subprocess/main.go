@@ -1,6 +1,6 @@
 // Command subprocess is the canonical parent→child spec handoff: the parent
 // process mints a tunnel spec and passes it to a spawned child through the
-// TUNNEL_SPEC environment variable; the child provides the listener, connects
+// LIBTUNNEL_SPEC environment variable; the child provides the listener, connects
 // the tunnel, and serves; the parent then requests the child's public URL.
 //
 // It needs network access (it mints a tunnel from api.trycloudflare.com); the
@@ -32,14 +32,14 @@ func main() {
 
 // parent mints a spec (without ever connecting) and requests the child's
 // public URL once the child reports the tunnel ready. Minting exports the
-// spec into this process's environment (TUNNEL_SPEC), so the spawned child
+// spec into this process's environment (LIBTUNNEL_SPEC), so the spawned child
 // inherits the tunnel identity with no plumbing at all.
 func parent() {
 	t := libtunnel.New(libtunnel.Cloudflare())
 	hostname := t.Hostname()
 	if hostname == "" {
 		// Hostname forces the mint and returns "" when it fails (e.g. a
-		// malformed TUNNEL_SPEC already in the environment); Err carries the
+		// malformed LIBTUNNEL_SPEC already in the environment); Err carries the
 		// cause. Minting exports the spec into the environment as a side
 		// effect, so the spawned child inherits it.
 		log.Fatalf("unable to mint a tunnel spec: %v", t.Err())
@@ -103,7 +103,7 @@ func fetch(url string) (string, error) {
 }
 
 // child adopts the spec from the environment (the Cloudflare credential
-// chain finds TUNNEL_SPEC before minting anything), provides the listener,
+// chain finds LIBTUNNEL_SPEC before minting anything), provides the listener,
 // and serves until the parent kills it.
 func child() {
 	l, err := net.Listen("tcp", "127.0.0.1:0")

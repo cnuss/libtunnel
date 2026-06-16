@@ -52,14 +52,14 @@ jobs:
         env:
           # Adopted by the Cloudflare credential chain before it would mint.
           # Empty (secret unset) => skip, so the probe never mints a fresh one.
-          TUNNEL_SPEC: ${{ secrets.TUNNEL_SPEC }}
+          LIBTUNNEL_SPEC: ${{ secrets.TUNNEL_SPEC }}
           # Debug surfaces the readiness detail (per-NS probe, backoff) so a
           # failure shows whether the hostname stopped resolving vs. the edge
           # rejecting the credential.
           LIBTUNNEL_LOG_LEVEL: debug
         run: |
-          if [ -z "$TUNNEL_SPEC" ]; then
-            echo "::notice::TUNNEL_SPEC secret is not set — mint one and store it to start the experiment. Skipping."
+          if [ -z "$LIBTUNNEL_SPEC" ]; then
+            echo "::notice::LIBTUNNEL_SPEC is not set (store the spec as the TUNNEL_SPEC secret) — skipping."
             exit 0
           fi
           go run ./examples/serve

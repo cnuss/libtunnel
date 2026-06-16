@@ -11,11 +11,11 @@ import (
 )
 
 // TestWithListenerRejectsMalformedSpecID pins the fail-fast contract: a spec
-// whose ID is not a UUID (e.g. a corrupted TUNNEL_SPEC handoff) must cancel
+// whose ID is not a UUID (e.g. a corrupted LIBTUNNEL_SPEC handoff) must cancel
 // the tunnel with a descriptive cause instead of registering the zero UUID
 // with the edge. Runs offline — the ID check fires before any network use.
 func TestWithListenerRejectsMalformedSpecID(t *testing.T) {
-	t.Setenv("TUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

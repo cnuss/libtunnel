@@ -32,13 +32,13 @@ func Example() {
 	}
 }
 
-// TUNNEL_SPEC is the parent→child handoff channel: a parent process that
+// LIBTUNNEL_SPEC is the parent→child handoff channel: a parent process that
 // mints a tunnel exports its spec there automatically, and a child's
 // Cloudflare credential chain adopts it at construction — no API to call.
 // Here the environment is populated by hand to stand in for the parent.
 func Example_handoff() {
-	os.Setenv("TUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.trycloudflare.com"}}`)
-	defer os.Unsetenv("TUNNEL_SPEC")
+	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.trycloudflare.com"}}`)
+	defer os.Unsetenv("LIBTUNNEL_SPEC")
 
 	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Println(t.Hostname())
@@ -48,8 +48,8 @@ func Example_handoff() {
 // Getters resolve lazily from the backend's credential chain — here a spec
 // adopted from the environment, so nothing touches the network.
 func Example_lazy() {
-	os.Setenv("TUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.trycloudflare.com"}}`)
-	defer os.Unsetenv("TUNNEL_SPEC")
+	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.trycloudflare.com"}}`)
+	defer os.Unsetenv("LIBTUNNEL_SPEC")
 
 	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Printf("%s . %s : %d\n", t.Host(), t.Domain(), t.Port())

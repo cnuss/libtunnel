@@ -43,7 +43,7 @@ func reexec(test string, extraEnv ...string) *exec.Cmd {
 }
 
 // gateLive skips the test unless the live tier is enabled, fails fast when
-// the preflight comms check failed, scrubs any inherited TUNNEL_SPEC so live
+// the preflight comms check failed, scrubs any inherited LIBTUNNEL_SPEC so live
 // scenarios always mint their own, and paces the suite.
 func gateLive(t *testing.T) {
 	t.Helper()
