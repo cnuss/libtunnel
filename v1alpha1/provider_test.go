@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,6 +14,22 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
+
+// TestMain redirects os.UserCacheDir to a throwaway dir: minting (even the fake
+// mints below) caches the spec there, and the suite must not touch a real cache.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "libtunnel-cache")
+	if err != nil {
+		panic(err)
+	}
+	// Cover every platform's os.UserCacheDir source (XDG / $HOME / Windows).
+	os.Setenv("XDG_CACHE_HOME", dir)
+	os.Setenv("HOME", dir)
+	os.Setenv("LocalAppData", dir)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 func TestSpecEnvironRoundTrip(t *testing.T) {
 	spec := &cloudflare.Spec{
@@ -67,6 +84,55 @@ func TestExportSpecGuardsSelfAdoption(t *testing.T) {
 	// tunnel must mint its own identity, not race to inherit this one's.
 	if ok, err := v1alpha1.SpecFromEnv("cloudflare", &cloudflare.Spec{}); ok || err != nil {
 		t.Errorf("SpecFromEnv = (%t, %v) for a self-exported spec; want (false, nil)", ok, err)
+	}
+}
+
+func TestMintCachesSpec(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", tmp)
+	t.Setenv("HOME", tmp)
+	t.Setenv("LocalAppData", tmp)
+	t.Setenv(v1alpha1.SpecEnv, "") // force the mint path, not adopt
+	base, err := os.UserCacheDir()
+	if err != nil {
+		t.Skipf("no user cache dir: %v", err)
+	}
+
+	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "cached.trycloudflare.com"}}
+	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(base, "libtunnel", "cached.trycloudflare.com.spec.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("mint did not cache the spec at %s: %v", path, err)
+	}
+	tag, _, err := v1alpha1.DecodeSpec(string(data))
+	if err != nil || tag != "cloudflare" {
+		t.Errorf("cache content = %q (tag %q, err %v), want a cloudflare envelope", data, tag, err)
+	}
+}
+
+func TestAdoptedSpecIsNotCached(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", tmp)
+	t.Setenv("HOME", tmp)
+	t.Setenv("LocalAppData", tmp)
+	t.Setenv(v1alpha1.SpecEnv, `{"backend":"cloudflare","spec":{"hostname":"adopted.trycloudflare.com"}}`)
+	base, err := os.UserCacheDir()
+	if err != nil {
+		t.Skipf("no user cache dir: %v", err)
+	}
+
+	next := &trackingProvider{}
+	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(base, "libtunnel", "adopted.trycloudflare.com.spec.json")
+	if _, err := os.Stat(path); err == nil {
+		t.Errorf("adopted spec was cached at %s; want mint-only caching", path)
 	}
 }
 

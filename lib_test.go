@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -17,6 +18,43 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
+
+// TestFromSerializeRoundTrip pins the Serialize -> From loop: a serialized spec
+// replays into a tunnel pinned to the same hostname, no mint, no network.
+func TestFromSerializeRoundTrip(t *testing.T) {
+	want := &cloudflare.Spec{ID: "id-1", Hostname: "replay.trycloudflare.com", AccountTag: "tag", Secret: []byte("s")}
+	tun := libtunnel.From(want.Serialize())
+	if got := tun.Hostname(); got != want.Hostname {
+		t.Errorf("Hostname() = %q, want %q", got, want.Hostname)
+	}
+	if err := tun.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil for a valid spec", err)
+	}
+}
+
+// TestFromFile pins that From reads a spec file path (the cache-file form).
+func TestFromFile(t *testing.T) {
+	spec := &cloudflare.Spec{Hostname: "file.trycloudflare.com"}
+	path := filepath.Join(t.TempDir(), "file.trycloudflare.com.spec.json")
+	if err := os.WriteFile(path, []byte(spec.Serialize()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := libtunnel.From(path).Hostname(); got != spec.Hostname {
+		t.Errorf("Hostname() = %q, want %q", got, spec.Hostname)
+	}
+}
+
+// TestFromBadInput pins the façade error contract: bad JSON or an unknown
+// backend yields a tunnel already canceled with the cause.
+func TestFromBadInput(t *testing.T) {
+	if err := libtunnel.From("{not json").Err(); err == nil {
+		t.Error("From(malformed) Err() = nil, want a parse error")
+	}
+	err := libtunnel.From(`{"backend":"other","spec":{}}`).Err()
+	if err == nil || !strings.Contains(err.Error(), "other") {
+		t.Errorf("From(unknown backend) Err() = %v, want it to name the backend", err)
+	}
+}
 
 // roleEnv selects a child role inside a re-exec'd test binary.
 const roleEnv = "LIBTUNNEL_TEST_ROLE"

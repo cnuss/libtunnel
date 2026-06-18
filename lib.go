@@ -29,6 +29,10 @@
 package libtunnel
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
@@ -73,4 +77,46 @@ func New[T v1.Spec](backend v1.Backend[T]) TunnelV1 {
 // tunnel mints its own identity.
 func Cloudflare() CloudflareV1 {
 	return cloudflare.New()
+}
+
+// From returns an unstarted tunnel that replays a previously serialized spec
+// instead of minting or adopting one — the credentials are pinned, so it
+// connects under the same hostname. spec is either a path to a spec file (as
+// written to os.UserCacheDir()/libtunnel by a mint, or saved from
+// Spec.Serialize) or the serialized JSON itself: an existing file is read,
+// anything else is parsed as the JSON.
+//
+// Like New, it returns immediately and WithListener (or Listener) starts the
+// connection. A spec that can't be read, parsed, or whose backend tag is
+// unknown yields a tunnel already canceled with that cause — surfaced through
+// Err()/Done(), per the façade's no-error contract.
+func From(spec string) TunnelV1 {
+	value := spec
+	if data, err := os.ReadFile(spec); err == nil {
+		value = string(data)
+	}
+
+	backend, raw, err := v1alpha1.DecodeSpec(value)
+	if err != nil {
+		return failed(fmt.Errorf("libtunnel.From: %w", err))
+	}
+	switch backend {
+	case "cloudflare":
+		s := &cloudflare.Spec{}
+		if err := json.Unmarshal(raw, s); err != nil {
+			return failed(fmt.Errorf("libtunnel.From: invalid cloudflare spec: %w", err))
+		}
+		return v1alpha1.New(cloudflare.FromSpec(s))
+	default:
+		return failed(fmt.Errorf("libtunnel.From: unknown backend %q", backend))
+	}
+}
+
+// failed returns a tunnel born canceled with cause, so From can report a
+// bad-input error through the normal Err()/Done() channel rather than a second
+// return value.
+func failed(cause error) TunnelV1 {
+	t := v1alpha1.New(cloudflare.New())
+	t.Cancel(cause)
+	return t
 }

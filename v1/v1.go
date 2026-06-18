@@ -29,6 +29,10 @@ type Spec interface {
 	// GetHostname returns the public hostname (host or host:port) the tunnel
 	// serves under.
 	GetHostname() string
+	// Serialize returns the spec as a tagged-envelope JSON string — the same
+	// form carried by LIBTUNNEL_SPEC. The result round-trips through
+	// libtunnel.From and can be dropped straight into the env var.
+	Serialize() string
 }
 
 // Provider supplies a tunnel spec. Implementations may mint fresh credentials

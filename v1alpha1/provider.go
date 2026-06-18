@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -112,15 +114,19 @@ func (p envProvider[E, T]) Spec(ctx context.Context) (T, error) {
 		var zero T
 		return zero, err
 	}
-	// Export the freshly minted spec so children of this process inherit it.
-	// Best effort: a marshal/setenv failure shouldn't fail the tunnel.
+	// Export the freshly minted spec so children of this process inherit it,
+	// and cache it to disk for later replay via libtunnel.From. Both best
+	// effort: a marshal/setenv/write failure shouldn't fail the tunnel. Only
+	// the mint path lands here — adopted specs are not re-exported or re-cached.
 	_ = ExportSpec(p.backend, minted)
+	_ = cacheSpec(minted)
 	return minted, nil
 }
 
-// SpecEnviron encodes spec as a "LIBTUNNEL_SPEC=<json>" entry for a child
-// process's exec.Cmd.Env, tagged with the minting backend's name.
-func SpecEnviron[T v1.Spec](backend string, spec T) (string, error) {
+// EncodeSpec returns spec as a tagged-envelope JSON string — the value carried
+// by SpecEnv and returned by Spec.Serialize. backend tags which engine minted
+// it so a decoder routes to the right spec type.
+func EncodeSpec[T v1.Spec](backend string, spec T) (string, error) {
 	data, err := json.Marshal(spec)
 	if err != nil {
 		return "", fmt.Errorf("unable to encode spec: %w", err)
@@ -129,7 +135,31 @@ func SpecEnviron[T v1.Spec](backend string, spec T) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("unable to encode spec envelope: %w", err)
 	}
-	return SpecEnv + "=" + string(envelope), nil
+	return string(envelope), nil
+}
+
+// DecodeSpec splits an envelope (EncodeSpec output / SpecEnv value) into its
+// backend tag and the raw backend spec JSON, for a caller to unmarshal into the
+// matching spec type. A value with no backend tag is not an envelope.
+func DecodeSpec(envelope string) (backend string, spec json.RawMessage, err error) {
+	var e specEnvelope
+	if err := json.Unmarshal([]byte(envelope), &e); err != nil {
+		return "", nil, err
+	}
+	if e.Backend == "" {
+		return "", nil, fmt.Errorf("no backend tag (not a spec envelope)")
+	}
+	return e.Backend, e.Spec, nil
+}
+
+// SpecEnviron encodes spec as a "LIBTUNNEL_SPEC=<json>" entry for a child
+// process's exec.Cmd.Env, tagged with the minting backend's name.
+func SpecEnviron[T v1.Spec](backend string, spec T) (string, error) {
+	value, err := EncodeSpec(backend, spec)
+	if err != nil {
+		return "", err
+	}
+	return SpecEnv + "=" + value, nil
 }
 
 // ExportSpec publishes spec into this process's own environment so re-exec'd
@@ -172,18 +202,45 @@ func SpecFromEnv[T v1.Spec](backend string, spec T) (bool, error) {
 		return false, nil
 	}
 
-	var envelope specEnvelope
-	if err := json.Unmarshal([]byte(env), &envelope); err != nil {
+	tag, raw, err := DecodeSpec(env)
+	if err != nil {
 		return false, fmt.Errorf("unable to parse %s: %w", SpecEnv, err)
 	}
-	if envelope.Backend == "" {
-		return false, fmt.Errorf("unable to parse %s: no backend tag (not a spec envelope)", SpecEnv)
+	if tag != backend {
+		return false, fmt.Errorf("%s was minted by backend %q, not %q", SpecEnv, tag, backend)
 	}
-	if envelope.Backend != backend {
-		return false, fmt.Errorf("%s was minted by backend %q, not %q", SpecEnv, envelope.Backend, backend)
-	}
-	if err := json.Unmarshal(envelope.Spec, spec); err != nil {
+	if err := json.Unmarshal(raw, spec); err != nil {
 		return false, fmt.Errorf("unable to parse %s: %w", SpecEnv, err)
 	}
 	return true, nil
+}
+
+// cacheSpec writes a freshly minted spec to os.UserCacheDir()/libtunnel as
+// <hostname>.spec.json (Serialize output, the SpecEnv envelope). Best effort:
+// callers ignore the error — the cache is a convenience, not the source of
+// truth. Only minted specs are cached (see envProvider.Spec); adopted or
+// From-loaded specs are not re-written.
+func cacheSpec[T v1.Spec](spec T) error {
+	host := spec.GetHostname()
+	if host == "" {
+		return nil // nothing to key the file on
+	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(base, "libtunnel")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	name := cacheFileName(host)
+	return os.WriteFile(filepath.Join(dir, name), []byte(spec.Serialize()), 0o600)
+}
+
+// cacheFileName builds a filesystem-safe "<hostname>.spec.json": GetHostname
+// may carry a :port, and the colon (plus any separators) is illegal in a
+// filename on some platforms.
+func cacheFileName(hostname string) string {
+	safe := strings.NewReplacer("/", "_", `\`, "_", ":", "_").Replace(hostname)
+	return safe + ".spec.json"
 }
