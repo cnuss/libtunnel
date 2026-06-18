@@ -31,7 +31,6 @@ package libtunnel
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
@@ -91,32 +90,16 @@ func Cloudflare() CloudflareV1 {
 // unknown yields a tunnel already canceled with that cause — surfaced through
 // Err()/Done(), per the façade's no-error contract.
 func From(spec string) TunnelV1 {
-	value := spec
-	if data, err := os.ReadFile(spec); err == nil {
-		value = string(data)
-	}
-
-	backend, raw, err := v1alpha1.DecodeSpec(value)
-	if err != nil {
-		return failed(fmt.Errorf("libtunnel.From: %w", err))
-	}
-	switch backend {
-	case "cloudflare":
-		s := &cloudflare.Spec{}
-		if err := json.Unmarshal(raw, s); err != nil {
-			return failed(fmt.Errorf("libtunnel.From: invalid cloudflare spec: %w", err))
+	return v1alpha1.From(spec, func(backend string, raw json.RawMessage) (v1.Tunnel, error) {
+		switch backend {
+		case "cloudflare":
+			s := &cloudflare.Spec{}
+			if err := json.Unmarshal(raw, s); err != nil {
+				return nil, fmt.Errorf("invalid cloudflare spec: %w", err)
+			}
+			return v1alpha1.New(cloudflare.FromSpec(s)), nil
+		default:
+			return nil, fmt.Errorf("unknown backend %q", backend)
 		}
-		return v1alpha1.New(cloudflare.FromSpec(s))
-	default:
-		return failed(fmt.Errorf("libtunnel.From: unknown backend %q", backend))
-	}
-}
-
-// failed returns a tunnel born canceled with cause, so From can report a
-// bad-input error through the normal Err()/Done() channel rather than a second
-// return value.
-func failed(cause error) TunnelV1 {
-	t := v1alpha1.New(cloudflare.New())
-	t.Cancel(cause)
-	return t
+	})
 }

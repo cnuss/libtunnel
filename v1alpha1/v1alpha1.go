@@ -43,9 +43,10 @@ type Engine[T v1.Spec] interface {
 // The backend must implement this package's Engine contract (backends from
 // façade constructors such as libtunnel.Cloudflare() do); a foreign Backend
 // cancels the tunnel on first use.
-func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
+// newImpl builds a fresh TunnelImpl with its channels and default (silent)
+// logger — the shared core of New and Failed, minus the engine wiring.
+func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	ctx, cancel := context.WithCancelCause(context.Background())
-
 	t := &TunnelImpl[T]{
 		ctx:              ctx,
 		cancel:           cancel,
@@ -56,6 +57,11 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		hostnameReady:    make(chan struct{}),
 	}
 	t.log.Store(slog.New(slog.DiscardHandler))
+	return t
+}
+
+func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
+	t := newImpl(backend)
 
 	// Establish the backend→engine relationship once, here, instead of
 	// re-asserting at every engine-touching getter: a foreign backend cancels
@@ -64,15 +70,15 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	if engine, ok := backend.(Engine[T]); ok {
 		t.engine = engine
 	} else {
-		cancel(fmt.Errorf("backend %q does not implement the v1alpha1 engine contract", backend.Name()))
+		t.cancel(fmt.Errorf("backend %q does not implement the v1alpha1 engine contract", backend.Name()))
 	}
 
 	// Surface why the tunnel context was canceled. cancel is a
 	// CancelCauseFunc, so every t.Cancel(err) records a cause that
 	// context.Cause reports here when Done fires.
 	go func() {
-		<-ctx.Done()
-		t.Logger().Warn("tunnel context canceled", "cause", context.Cause(ctx))
+		<-t.ctx.Done()
+		t.Logger().Warn("tunnel context canceled", "cause", context.Cause(t.ctx))
 	}()
 
 	return t
