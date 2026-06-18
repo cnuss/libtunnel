@@ -125,13 +125,18 @@ type Backend[T Spec] interface { // opaque; the engine contract is alpha-interna
     Name() string
     Provider() Provider[T] // the backend's credential chain
 }
-type Spec interface { GetHostname() string }
+type Spec interface {
+    GetHostname() string
+    Serialize() string // tagged-envelope JSON; == a LIBTUNNEL_SPEC value
+}
 
 // façade
 func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel // T wires the backend, not the result
 func Cloudflare() v1.Backend[*cloudflare.Spec]   // in-process cloudflared engine;
                                                  // adopts LIBTUNNEL_SPEC, else mints
                                                  // an anonymous quick tunnel
+func From(spec string) v1.Tunnel                 // replay a serialized spec (JSON or
+                                                 // file path) instead of minting
 
 // parent→child handoff — no API: minting exports the LIBTUNNEL_SPEC env var,
 // construction adopts it
@@ -164,6 +169,21 @@ conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 ```
 
 (Full source: [`examples/subprocess/main.go`](./examples/subprocess/main.go).)
+
+## Replaying a spec
+
+A freshly minted spec is also cached to disk —
+`os.UserCacheDir()/libtunnel/<hostname>.spec.json` (the `Serialize()` envelope,
+same form as `LIBTUNNEL_SPEC`). `libtunnel.From(spec)` replays one: `spec` is
+either that JSON or a path to it, and the tunnel connects under the same
+hostname instead of minting. Only minted specs are cached (adopted or
+`From`-loaded ones are not), and a bad/unknown spec yields a tunnel already
+canceled with the cause (read it off `Err()`).
+
+```go
+conn := libtunnel.From("~/Library/Caches/libtunnel/foo.trycloudflare.com.spec.json").
+    WithListener(l)
+```
 
 ## Examples
 

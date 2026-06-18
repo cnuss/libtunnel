@@ -255,6 +255,11 @@ func (t *TunnelImpl[T]) LocalURL() *url.URL {
 // provider chain on first use.
 func (t *TunnelImpl[T]) Spec() T {
 	t.specOnce.Do(func() {
+		if t.backend == nil {
+			// A placeholder tunnel (Failed) has no backend and is already
+			// canceled; there is nothing to resolve.
+			return
+		}
 		provider := t.backend.Provider()
 		// Providers that can log (retry warnings, rate limits) pick up the
 		// tunnel's logger here — they're built by the backend before any

@@ -55,17 +55,31 @@ var cloudflaredVersion = func() string {
 // would collide across tunnels (and pollute the host application's metrics).
 var promMu sync.Mutex
 
+// backendName tags specs minted by this backend (Name, Serialize, the
+// LIBTUNNEL_SPEC envelope) — one source of truth so the tag never drifts.
+const backendName = "cloudflare"
+
 // Backend is the cloudflared quick-tunnel engine. It carries the origin-scheme
 // settings declared via WithTLS / WithHTTP2; obtain a fresh one per tunnel from
 // libtunnel.Cloudflare(). Both settings default false.
 type Backend struct {
 	tls   bool
 	http2 bool
+	// provider, when set, pins the credential chain to a fixed spec (FromSpec /
+	// libtunnel.From). Nil uses the default adopt-LIBTUNNEL_SPEC-else-mint chain.
+	provider v1.Provider[*Spec]
 }
 
 // New returns the Cloudflare backend.
 func New() *Backend {
 	return &Backend{}
+}
+
+// FromSpec returns a Cloudflare backend pinned to spec: it connects with the
+// given credentials instead of adopting LIBTUNNEL_SPEC or minting. It backs
+// libtunnel.From.
+func FromSpec(spec *Spec) *Backend {
+	return &Backend{provider: v1alpha1.Static[*Spec](spec)}
 }
 
 // WithTLS declares whether the origin terminates TLS (https vs http ingress).
@@ -92,14 +106,18 @@ var (
 
 // Name implements v1.Backend.
 func (b *Backend) Name() string {
-	return "cloudflare"
+	return backendName
 }
 
 // Provider is the Cloudflare credential chain: adopt LIBTUNNEL_SPEC from the
 // environment when a parent process handed one off, otherwise mint an
-// anonymous quick tunnel from api.trycloudflare.com. Mutators for named
-// tunnels / other endpoints will hang off Cloudflare() when they exist.
+// anonymous quick tunnel from api.trycloudflare.com. A backend built by
+// FromSpec instead yields its pinned spec. Mutators for named tunnels / other
+// endpoints will hang off Cloudflare() when they exist.
 func (b *Backend) Provider() v1.Provider[*Spec] {
+	if b.provider != nil {
+		return b.provider
+	}
 	return v1alpha1.Env(b.Name(), QuickTunnel())
 }
 
