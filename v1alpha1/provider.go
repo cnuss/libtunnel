@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -32,8 +33,12 @@ const HostnameEnv = "LIBTUNNEL_HOSTNAME"
 // specEnvelope is the wire form of SpecEnv: the backend name plus the
 // backend's own spec encoding.
 type specEnvelope struct {
-	Backend string          `json:"backend"`
-	Spec    json.RawMessage `json:"spec"`
+	Backend string `json:"backend"`
+	// Hostname mirrors the spec's public hostname at the envelope level so a
+	// reader (Hosts) can list it without knowing the backend's spec type.
+	// Redundant with the spec body; decoders that want the credential read Spec.
+	Hostname string          `json:"hostname,omitempty"`
+	Spec     json.RawMessage `json:"spec"`
 }
 
 // selfExported records SpecEnv values this process exported itself, so
@@ -131,7 +136,7 @@ func EncodeSpec[T v1.Spec](backend string, spec T) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("unable to encode spec: %w", err)
 	}
-	envelope, err := json.Marshal(specEnvelope{Backend: backend, Spec: data})
+	envelope, err := json.Marshal(specEnvelope{Backend: backend, Hostname: spec.GetHostname(), Spec: data})
 	if err != nil {
 		return "", fmt.Errorf("unable to encode spec envelope: %w", err)
 	}
@@ -215,21 +220,46 @@ func SpecFromEnv[T v1.Spec](backend string, spec T) (bool, error) {
 	return true, nil
 }
 
-// cacheSpec writes a freshly minted spec to os.UserCacheDir()/libtunnel as
-// <hostname>.spec.json (Serialize output, the SpecEnv envelope). Best effort:
-// callers ignore the error — the cache is a convenience, not the source of
-// truth. Only minted specs are cached (see envProvider.Spec); adopted or
-// From-loaded specs are not re-written.
+// CacheDirEnv overrides where specs are cached and looked up (cache write,
+// Hosts, From). Unset, the per-user os.UserCacheDir()/libtunnel is used.
+const CacheDirEnv = "LIBTUNNEL_CACHE_DIR"
+
+// CacheDir is the directory specs are cached to and replayed from: CacheDirEnv
+// when set (used as-is), otherwise os.UserCacheDir() namespaced by the stable
+// v1 contract package path (e.g. .../github.com/cnuss/libtunnel/v1).
+func CacheDir() (string, error) {
+	if d := os.Getenv(CacheDirEnv); d != "" {
+		return d, nil
+	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, filepath.FromSlash(packagePath())), nil
+}
+
+// packagePath is the stable contract package path
+// (github.com/cnuss/libtunnel/v1), inferred via reflection on v1.Spec rather
+// than hardcoded — so a fork or rename gets its own cache namespace, and the
+// namespace tracks the stable v1 surface instead of drifting with each alpha.
+func packagePath() string {
+	return reflect.TypeOf((*v1.Spec)(nil)).Elem().PkgPath()
+}
+
+// cacheSpec writes a freshly minted spec to CacheDir as <hostname>.spec.json
+// (Serialize output, the SpecEnv envelope). Best effort: callers ignore the
+// error — the cache is a convenience, not the source of truth. Only minted
+// specs are cached (see envProvider.Spec); adopted or From-loaded specs are
+// not re-written.
 func cacheSpec[T v1.Spec](spec T) error {
 	host := spec.GetHostname()
 	if host == "" {
 		return nil // nothing to key the file on
 	}
-	base, err := os.UserCacheDir()
+	dir, err := CacheDir()
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(base, "libtunnel")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}

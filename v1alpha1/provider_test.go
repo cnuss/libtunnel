@@ -15,17 +15,14 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
-// TestMain redirects os.UserCacheDir to a throwaway dir: minting (even the fake
-// mints below) caches the spec there, and the suite must not touch a real cache.
+// TestMain redirects the cache dir to a throwaway: minting (even the fake mints
+// below) caches the spec there, and the suite must not touch a real cache.
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "libtunnel-cache")
 	if err != nil {
 		panic(err)
 	}
-	// Cover every platform's os.UserCacheDir source (XDG / $HOME / Windows).
-	os.Setenv("XDG_CACHE_HOME", dir)
-	os.Setenv("HOME", dir)
-	os.Setenv("LocalAppData", dir)
+	os.Setenv(v1alpha1.CacheDirEnv, dir)
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -88,22 +85,16 @@ func TestExportSpecGuardsSelfAdoption(t *testing.T) {
 }
 
 func TestMintCachesSpec(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
-	t.Setenv("HOME", tmp)
-	t.Setenv("LocalAppData", tmp)
+	dir := t.TempDir()
+	t.Setenv(v1alpha1.CacheDirEnv, dir)
 	t.Setenv(v1alpha1.SpecEnv, "") // force the mint path, not adopt
-	base, err := os.UserCacheDir()
-	if err != nil {
-		t.Skipf("no user cache dir: %v", err)
-	}
 
 	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "cached.trycloudflare.com"}}
 	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	path := filepath.Join(base, "libtunnel", "cached.trycloudflare.com.spec.json")
+	path := filepath.Join(dir, "cached.trycloudflare.com.spec.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("mint did not cache the spec at %s: %v", path, err)
@@ -115,24 +106,59 @@ func TestMintCachesSpec(t *testing.T) {
 }
 
 func TestAdoptedSpecIsNotCached(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", tmp)
-	t.Setenv("HOME", tmp)
-	t.Setenv("LocalAppData", tmp)
+	dir := t.TempDir()
+	t.Setenv(v1alpha1.CacheDirEnv, dir)
 	t.Setenv(v1alpha1.SpecEnv, `{"backend":"cloudflare","spec":{"hostname":"adopted.trycloudflare.com"}}`)
-	base, err := os.UserCacheDir()
-	if err != nil {
-		t.Skipf("no user cache dir: %v", err)
-	}
 
 	next := &trackingProvider{}
 	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	path := filepath.Join(base, "libtunnel", "adopted.trycloudflare.com.spec.json")
+	path := filepath.Join(dir, "adopted.trycloudflare.com.spec.json")
 	if _, err := os.Stat(path); err == nil {
 		t.Errorf("adopted spec was cached at %s; want mint-only caching", path)
+	}
+}
+
+func TestCacheDirDefaultUsesPackagePath(t *testing.T) {
+	t.Setenv(v1alpha1.CacheDirEnv, "") // unset -> default
+	dir, err := v1alpha1.CacheDir()
+	if err != nil {
+		t.Skipf("no user cache dir: %v", err)
+	}
+	if !strings.HasSuffix(filepath.ToSlash(dir), "github.com/cnuss/libtunnel/v1") {
+		t.Errorf("CacheDir() = %q, want it namespaced by the v1 package path", dir)
+	}
+}
+
+func TestHostsListsCachedSpecs(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(v1alpha1.CacheDirEnv, dir)
+
+	for _, h := range []string{"bbb.trycloudflare.com", "aaa.trycloudflare.com"} {
+		spec := &cloudflare.Spec{Hostname: h}
+		if err := os.WriteFile(filepath.Join(dir, h+".spec.json"), []byte(spec.Serialize()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A non-spec file is ignored.
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("ignore me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := v1alpha1.Hosts()
+	want := []string{
+		"https://aaa.trycloudflare.com:443/",
+		"https://bbb.trycloudflare.com:443/",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Hosts() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Hosts()[%d] = %q, want %q (sorted, 443 backfilled)", i, got[i], want[i])
+		}
 	}
 }
 

@@ -135,8 +135,9 @@ func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel // T wires the backend, not
 func Cloudflare() v1.Backend[*cloudflare.Spec]   // in-process cloudflared engine;
                                                  // adopts LIBTUNNEL_SPEC, else mints
                                                  // an anonymous quick tunnel
-func From(spec string) v1.Tunnel                 // replay a serialized spec (JSON or
-                                                 // file path) instead of minting
+func From(spec string) v1.Tunnel                 // replay a serialized spec (JSON,
+                                                 // file path, or cached hostname)
+func Hosts() []string                            // public URLs of cached specs
 
 // parent→child handoff — no API: minting exports the LIBTUNNEL_SPEC env var,
 // construction adopts it
@@ -172,17 +173,18 @@ conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 
 ## Replaying a spec
 
-A freshly minted spec is also cached to disk —
-`os.UserCacheDir()/libtunnel/<hostname>.spec.json` (the `Serialize()` envelope,
-same form as `LIBTUNNEL_SPEC`). `libtunnel.From(spec)` replays one: `spec` is
-either that JSON or a path to it, and the tunnel connects under the same
-hostname instead of minting. Only minted specs are cached (adopted or
-`From`-loaded ones are not), and a bad/unknown spec yields a tunnel already
-canceled with the cause (read it off `Err()`).
+A freshly minted spec is cached to disk as `<hostname>.spec.json` (the
+`Serialize()` envelope, same form as `LIBTUNNEL_SPEC`) under the cache dir —
+`LIBTUNNEL_CACHE_DIR` if set, else a per-user location from `os.UserCacheDir()`.
+`libtunnel.Hosts()` lists the cached tunnels as `https://<host>:443/` URLs, and
+`libtunnel.From(spec)` replays one — `spec` is the JSON, a file path, or just a
+cached hostname — connecting under the same hostname instead of minting. Only
+minted specs are cached (adopted or `From`-loaded ones are not), and a
+bad/unknown spec yields a tunnel already canceled with the cause (off `Err()`).
 
 ```go
-conn := libtunnel.From("~/Library/Caches/libtunnel/foo.trycloudflare.com.spec.json").
-    WithListener(l)
+// replay the most recently cached tunnel by hostname
+conn := libtunnel.From("foo.trycloudflare.com").WithListener(l)
 ```
 
 ## Examples
