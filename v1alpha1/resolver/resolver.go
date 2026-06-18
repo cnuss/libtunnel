@@ -5,9 +5,10 @@
 // authoritative nameservers directly so a recursive resolver's negative cache
 // never delays readiness.
 //
-// Queries set RD=1 (recursion desired): Cloudflare's quick-tunnel nameservers
-// REFUSE nonrecursive (RD=0) queries, so a "nonrecursive" lookup is not an
-// option against them.
+// Queries are nonrecursive (RD=0): they target the zone's authoritative
+// nameservers, which answer in-zone names authoritatively (the AA bit) whether
+// or not recursion is requested, so RD is unnecessary — and a nonrecursive
+// query can't be served from any recursive cache.
 package resolver
 
 import (
@@ -89,7 +90,11 @@ func buildQuery(hostname string, qtype dnsmessage.Type) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid hostname %q: %w", hostname, err)
 	}
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{RecursionDesired: true})
+	// RD=0: these queries go straight to the zone's authoritative nameservers,
+	// which answer in-zone names authoritatively regardless, so recursion is
+	// neither needed nor wanted. (Authoritative/AA is a response flag the server
+	// sets — pointless on an outbound query.)
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{RecursionDesired: false})
 	b.EnableCompression()
 	if err := b.StartQuestions(); err != nil {
 		return nil, err
