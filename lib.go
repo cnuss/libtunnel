@@ -80,14 +80,16 @@ func Cloudflare() CloudflareV1 {
 
 // From returns an unstarted tunnel that replays a previously serialized spec
 // instead of minting or adopting one — the credentials are pinned, so it
-// connects under the same hostname. spec is either a path to a spec file (as
-// written to os.UserCacheDir()/libtunnel by a mint, or saved from
-// Spec.Serialize) or the serialized JSON itself: an existing file is read,
-// anything else is parsed as the JSON.
+// connects under the same hostname. spec is resolved in order: an existing file
+// at that path; a file of that name in the cache dir; a cached spec for that
+// hostname (so From("foo.trycloudflare.com") replays the cached mint); finally
+// the serialized JSON itself. The cache dir is LIBTUNNEL_CACHE_DIR when set,
+// else a per-user location under os.UserCacheDir() — where a mint writes its
+// spec.
 //
 // Like New, it returns immediately and WithListener (or Listener) starts the
-// connection. A spec that can't be read, parsed, or whose backend tag is
-// unknown yields a tunnel already canceled with that cause — surfaced through
+// connection. A spec that can't be parsed, or whose backend tag is unknown,
+// yields a tunnel already canceled with that cause — surfaced through
 // Err()/Done(), per the façade's no-error contract.
 func From(spec string) TunnelV1 {
 	return v1alpha1.From(spec, func(backend string, raw json.RawMessage) (v1.Tunnel, error) {
@@ -102,4 +104,24 @@ func From(spec string) TunnelV1 {
 			return nil, fmt.Errorf("unknown backend %q", backend)
 		}
 	})
+}
+
+// Hosts lists the public URLs of the specs cached on disk —
+// "https://<hostname>:443/" each, sorted — from LIBTUNNEL_CACHE_DIR if set,
+// else a per-user location under os.UserCacheDir(). A mint caches its spec
+// there, so this enumerates the tunnels From can replay. Best effort: an
+// unreadable cache yields a shorter or empty list, never an error.
+func Hosts() []string {
+	return v1alpha1.Hosts()
+}
+
+// CacheDir is where minted specs are cached and where From and Hosts look:
+// LIBTUNNEL_CACHE_DIR if set, else a per-user location under os.UserCacheDir().
+// Empty if no per-user cache directory can be determined.
+func CacheDir() string {
+	dir, err := v1alpha1.CacheDir()
+	if err != nil {
+		return ""
+	}
+	return dir
 }
