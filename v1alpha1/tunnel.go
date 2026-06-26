@@ -425,7 +425,11 @@ var authoritativeProbe = realAuthoritativeProbe
 // errors, times out, or has no record yet is skipped, and a round with no
 // non-empty answer keeps polling.
 func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool) {
-	servers := nameserverIPs(ctx, log, domain)
+	servers, err := resolver.NameserverIPs(ctx, domain, net.DefaultResolver)
+	if err != nil {
+		log.Debug("authoritative NS lookup failed", "domain", domain, "error", err)
+		return resolver.Records{}, false
+	}
 	if len(servers) == 0 {
 		log.Debug("no authoritative nameservers discovered yet", "domain", domain)
 		return resolver.Records{}, false
@@ -442,36 +446,6 @@ func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host 
 		return rec, true
 	}
 	return resolver.Records{}, false
-}
-
-// nameserverIPs resolves the zone's NS records to IPv4 ip:53 endpoints via the
-// system resolver. NS records are stable and are not the propagation target, so
-// the system resolver is fine here — the record we wait on is queried at these
-// servers directly. The bare zone name is used (DNS queries take no :port,
-// which the v1 contract allows GetHostname to carry).
-//
-// Only IPv4 endpoints are kept: an IPv6 NS anycast address on an IPv4-only host
-// (e.g. a GitHub Actions runner) yields "connect: no route to host", burning a
-// 5s query timeout each round for nothing. Every Cloudflare NS has an IPv4
-// anycast address, so v4-only loses no nameserver.
-func nameserverIPs(ctx context.Context, log *slog.Logger, domain string) []string {
-	ns, err := net.DefaultResolver.LookupNS(ctx, dnsName(domain))
-	if err != nil {
-		log.Debug("authoritative NS lookup failed", "domain", domain, "error", err)
-		return nil
-	}
-	var servers []string
-	for _, record := range ns {
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", record.Host)
-		if err != nil {
-			log.Debug("nameserver address lookup failed", "nameserver", record.Host, "error", err)
-			continue
-		}
-		for _, ip := range ips {
-			servers = append(servers, net.JoinHostPort(ip.String(), "53"))
-		}
-	}
-	return servers
 }
 
 // hostOf returns the first label of hostname.

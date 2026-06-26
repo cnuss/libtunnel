@@ -156,3 +156,29 @@ func TestRecordsEqual(t *testing.T) {
 		t.Error("Equal = true for differing records")
 	}
 }
+
+// TestNewResolverDialsPacketConn guards the framing seam: Go's resolver
+// type-asserts the dialed conn to net.PacketConn to choose datagram (bare) over
+// stream (length-prefixed) framing. The NXDOMAIN/timeout repair parses bare
+// messages, so the wrapper must keep presenting as a PacketConn on the UDP path.
+// If a future edit drops that interface, framing silently flips to stream and
+// the 2-byte length prefix desyncs every parse — this test fails first.
+func TestNewResolverDialsPacketConn(t *testing.T) {
+	server := serveDNS(t, func(q dnsmessage.Question) []byte {
+		return respond(t, q, dnsmessage.RCodeSuccess, [][4]byte{{1, 2, 3, 4}}, nil)
+	})
+
+	r := resolver.NewResolver()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := r.Dial(ctx, "udp", server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, ok := conn.(net.PacketConn); !ok {
+		t.Fatalf("UDP conn %T does not implement net.PacketConn: Go will use stream framing and the repair parser will desync", conn)
+	}
+}
