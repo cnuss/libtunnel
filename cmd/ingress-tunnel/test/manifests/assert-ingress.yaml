@@ -1,0 +1,12 @@
+# The controller writes the minted public hostname into the Ingress status.
+# Assert one load-balancer entry whose hostname is a *.trycloudflare.com name —
+# proof the reconcile minted a tunnel and published it back.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: whoami
+  namespace: default
+status:
+  loadBalancer:
+    ingress:
+      - (ends_with(hostname, '.trycloudflare.com')): true

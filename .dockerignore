@@ -1,0 +1,6 @@
+.git
+go.work
+go.work.sum
+cmd/ingress-tunnel/test
+**/*_test.go
+e2e

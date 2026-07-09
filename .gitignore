@@ -40,3 +40,6 @@ go.work.sum
 examples/serve/serve
 examples/serve-tls/serve-tls
 examples/subprocess/subprocess
+
+# built PoC binary
+cmd/ingress-tunnel/ingress-tunnel

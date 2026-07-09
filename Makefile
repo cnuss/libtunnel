@@ -1,4 +1,4 @@
-.PHONY: all check fmt fmt-check vet build windows test e2e run
+.PHONY: all check fmt fmt-check vet build windows test e2e ingress-e2e run
 
 # The library is pure Go. Forcing CGO off keeps every build identical across
 # hosts and sidesteps broken toolchains (e.g. windows-11-arm runners ship an
@@ -43,6 +43,16 @@ test:
 # cache key wouldn't otherwise pick up example source changes.
 e2e:
 	go test -count=1 -v ./e2e
+
+# Exploratory: Chainsaw e2e for the cmd/ingress-tunnel PoC. Mints its own kind
+# cluster, builds + loads the controller image, and proves a public quick-tunnel
+# URL reaches an in-cluster Service. Needs docker, kind, and a live network (it
+# mints a real trycloudflare tunnel); chainsaw runs via the tool directive in
+# cmd/ingress-tunnel/test/go.mod. --no-cluster: the test registers its own
+# cluster per step, so chainsaw must not touch the default kubeconfig. Kept out
+# of all/check — heavy, separate module, not wired into CI.
+ingress-e2e:
+	cd cmd/ingress-tunnel/test && go tool chainsaw test --test-dir . --no-cluster
 
 # Run an example by name, forwarding any trailing words as args:
 #   make run basic

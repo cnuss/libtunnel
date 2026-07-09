@@ -1,0 +1,89 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ingress-tunnel
+spec:
+  # Minting a quick tunnel + DNS propagation takes a few seconds; give asserts
+  # generous headroom.
+  timeouts:
+    apply: 1m
+    assert: 3m
+    exec: 5m
+  steps:
+    # 1. Chainsaw mints a throwaway kind cluster, builds the controller image
+    #    from the repo, and loads it in. cleanup tears the cluster down even if a
+    #    later step fails.
+    - name: cluster
+      try:
+        - script:
+            timeout: 5m
+            content: |
+              set -eu
+              kind create cluster --name ingress-tunnel-poc --kubeconfig ./kubeconfig
+              # build context is the repo root (../../..); GOWORK=off in the
+              # Dockerfile keeps the workspace/test module out of the image.
+              docker build -t ingress-tunnel:poc -f ../Dockerfile ../../..
+              kind load docker-image ingress-tunnel:poc --name ingress-tunnel-poc
+      cleanup:
+        - script:
+            content: kind delete cluster --name ingress-tunnel-poc
+        - script:
+            content: rm -f ./kubeconfig
+
+    # 2. Install the controller (RBAC, IngressClass, Deployment) and wait for it
+    #    to be available.
+    - name: install-controller
+      clusters:
+        poc:
+          kubeconfig: ./kubeconfig
+      cluster: poc
+      try:
+        - apply:
+            file: manifests/controller.yaml
+        - assert:
+            file: manifests/assert-controller.yaml
+
+    # 3. Deploy a whoami backend and an Ingress of class "tunnel". The controller
+    #    mints a tunnel and publishes the public hostname into the Ingress status.
+    - name: expose
+      clusters:
+        poc:
+          kubeconfig: ./kubeconfig
+      cluster: poc
+      try:
+        - apply:
+            file: manifests/app.yaml
+        - assert:
+            file: manifests/assert-app.yaml
+        - apply:
+            file: manifests/ingress.yaml
+        - assert:
+            file: manifests/assert-ingress.yaml
+
+    # 4. Hit the public URL from outside the cluster and prove the request lands
+    #    on whoami through the tunnel.
+    - name: reachable
+      clusters:
+        poc:
+          kubeconfig: ./kubeconfig
+      cluster: poc
+      try:
+        - script:
+            timeout: 3m
+            content: |
+              set -eu
+              host=$(kubectl --kubeconfig ./kubeconfig get ingress whoami -n default \
+                -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+              echo "public host: $host"
+              for i in $(seq 1 30); do
+                body=$(curl -fsS --max-time 10 "https://$host/" || true)
+                if echo "$body" | grep -q "Hostname:"; then
+                  echo "OK reached whoami via tunnel:"
+                  echo "$body" | grep -E "Hostname:|RemoteAddr:|GET" || true
+                  exit 0
+                fi
+                echo "  attempt $i: not ready yet"
+                sleep 5
+              done
+              echo "FAILED: never reached whoami through the tunnel" >&2
+              exit 1
