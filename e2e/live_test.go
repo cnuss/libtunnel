@@ -167,13 +167,13 @@ func TestLiveTunnel(t *testing.T) {
 	})
 }
 
-// TestLiveListenerServe pins the scenario reported in #82: no WithListener at
-// all — the caller goes straight to http.Serve(tun.Listener(), mux) and the
-// tunnel must mint its own loopback listener and come up end to end. The
-// reported failure mode was Listener() blocking forever with no output, so
-// Listener() runs off the test goroutine and every wait is bounded by ctx: a
-// regression fails the test instead of hanging it.
-func TestLiveListenerServe(t *testing.T) {
+// TestLiveMintedListener pins the scenario from #82: no WithListener, no
+// net.Listen of the caller's own — serve straight on tun.Listener() (which
+// mints the loopback listener and starts the tunnel) and read the public URL.
+// The reported failure mode was blocking forever with no output; WithContext
+// bounds every wait, so a regression fails the test instead of hanging it.
+// (URL-before-listener start ordering is pinned by the unit tests.)
+func TestLiveMintedListener(t *testing.T) {
 	gateLive(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -189,19 +189,7 @@ func TestLiveListenerServe(t *testing.T) {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "hello via minted listener")
 	})
-
-	got := make(chan net.Listener, 1)
-	go func() { got <- tun.Listener() }()
-	var lis net.Listener
-	select {
-	case lis = <-got:
-	case <-ctx.Done():
-		t.Fatal("Listener() still blocked at the context deadline — the #82 hang")
-	}
-	if lis == nil {
-		t.Fatalf("Listener() = nil, tunnel err: %v", tun.Err())
-	}
-	go http.Serve(lis, mux)
+	go http.Serve(tun.Listener(), mux)
 
 	// WithContext is set, so URL waits for end-to-end readiness and returns
 	// nil if ctx expires first — bounded either way.

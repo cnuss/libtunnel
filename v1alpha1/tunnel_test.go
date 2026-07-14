@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -212,6 +213,44 @@ func TestListenerMintsWhenNoneProvided(t *testing.T) {
 	}
 }
 
+// TestURLMintsListenerWhenNoneProvided pins URL as a start trigger: called
+// with no listener provided, it must mint a loopback listener and start the
+// tunnel — not block on readiness that could never arrive (#82).
+func TestURLMintsListenerWhenNoneProvided(t *testing.T) {
+	stubReady(t)
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"})
+	tun := v1alpha1.New(engine)
+
+	u := tun.URL()
+	if u == nil || u.String() != "https://demo.trycloudflare.com/" {
+		t.Fatalf("URL() = %v, want https://demo.trycloudflare.com/", u)
+	}
+	select {
+	case got := <-engine.got:
+		if addr, ok := got.Addr().(*net.TCPAddr); !ok || !addr.IP.IsLoopback() {
+			t.Errorf("engine got %v, want a minted loopback listener", got.Addr())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine never received a listener — URL() did not start the tunnel")
+	}
+}
+
+// TestTunnelReadyStartsTunnelWhenNoneProvided pins TunnelReady as a start
+// trigger: waiting on it with no listener provided must start the tunnel and
+// eventually fire, not block forever.
+func TestTunnelReadyStartsTunnelWhenNoneProvided(t *testing.T) {
+	stubReady(t)
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+
+	select {
+	case <-tun.TunnelReady():
+	case <-tun.Done():
+		t.Fatalf("tunnel died instead of becoming ready: %v", tun.Err())
+	case <-time.After(5 * time.Second):
+		t.Fatal("TunnelReady never closed — it did not start the tunnel")
+	}
+}
+
 // TestSecondWithListenerCancels pins the one-provide rule: a second
 // WithListener cancels the tunnel rather than silently dropping the listener.
 func TestSecondWithListenerCancels(t *testing.T) {
@@ -263,6 +302,51 @@ func TestWithListenerThenListenerReturnsProvided(t *testing.T) {
 	}
 	if err := tun.Err(); err != nil {
 		t.Errorf("Err() = %v, want nil (Listener after WithListener is fine)", err)
+	}
+}
+
+// TestWithLoggerWriteOnce pins the write-once mutator contract: the first
+// WithLogger fixes the logger; a later call is a no-op, not a mutation.
+func TestWithLoggerWriteOnce(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	first := slog.New(slog.DiscardHandler)
+	second := slog.New(slog.DiscardHandler)
+
+	tun.WithLogger(first)
+	if got := tun.Logger(); got != first {
+		t.Fatalf("Logger() = %p, want the first WithLogger value %p", got, first)
+	}
+	tun.WithLogger(second)
+	if got := tun.Logger(); got != first {
+		t.Errorf("Logger() = %p after a second WithLogger, want the first value %p to stick", got, first)
+	}
+}
+
+// TestWithContextWriteOnce pins the write-once mutator contract for
+// WithContext: the first context sticks, so URL honors it even when a later
+// WithContext tries to replace it. The readiness probe never fires here, so
+// URL can only return via the first (already canceled) context — if the
+// second context won, URL would hang past the test timeout.
+func TestWithContextWriteOnce(t *testing.T) {
+	t.Cleanup(v1alpha1.SetAuthoritativeProbe(func(context.Context, *slog.Logger, string, string) (resolver.Records, bool) {
+		return resolver.Records{}, false // never ready
+	}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	tun.WithContext(canceled)
+	tun.WithContext(context.Background()) // loses: the first WithContext fixed the field
+
+	done := make(chan *url.URL, 1)
+	go func() { done <- tun.URL() }()
+	select {
+	case u := <-done:
+		if u != nil {
+			t.Errorf("URL() = %v, want nil (first WithContext context is canceled)", u)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("URL() hung — the second WithContext must not replace the first")
 	}
 }
 
