@@ -13,8 +13,10 @@ package e2e_test
 
 import (
 	"bufio"
+	"context"
 	cryptotls "crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -163,6 +165,51 @@ func TestLiveTunnel(t *testing.T) {
 
 		eventuallyBody(t, url, "after the bounce", 30*time.Second)
 	})
+}
+
+// TestLiveListenerServe pins the scenario reported in #82: no WithListener at
+// all — the caller goes straight to http.Serve(tun.Listener(), mux) and the
+// tunnel must mint its own loopback listener and come up end to end. The
+// reported failure mode was Listener() blocking forever with no output, so
+// Listener() runs off the test goroutine and every wait is bounded by ctx: a
+// regression fails the test instead of hanging it.
+func TestLiveListenerServe(t *testing.T) {
+	gateLive(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// The exact construction from the report: context and logger threaded,
+	// no listener of the caller's own.
+	tun := libtunnel.New(libtunnel.Cloudflare()).
+		WithContext(ctx).
+		WithLogger(slog.Default())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello via minted listener")
+	})
+
+	got := make(chan net.Listener, 1)
+	go func() { got <- tun.Listener() }()
+	var lis net.Listener
+	select {
+	case lis = <-got:
+	case <-ctx.Done():
+		t.Fatal("Listener() still blocked at the context deadline — the #82 hang")
+	}
+	if lis == nil {
+		t.Fatalf("Listener() = nil, tunnel err: %v", tun.Err())
+	}
+	go http.Serve(lis, mux)
+
+	// WithContext is set, so URL waits for end-to-end readiness and returns
+	// nil if ctx expires first — bounded either way.
+	url := tun.URL()
+	if url == nil {
+		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", tun.Err(), ctx.Err())
+	}
+	eventuallyBody(t, url.String(), "hello via minted listener", 30*time.Second)
 }
 
 // TestLiveResurrection is the strongest form of the handoff promise: the
