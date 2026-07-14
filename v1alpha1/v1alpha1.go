@@ -13,7 +13,6 @@ import (
 	"log/slog"
 	"net"
 	"sync"
-	"sync/atomic"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1/resolver"
@@ -61,7 +60,6 @@ func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		tunnelReady:      make(chan struct{}),
 		hostnameReady:    make(chan struct{}),
 	}
-	t.log.Store(slog.New(slog.DiscardHandler))
 	return t
 }
 
@@ -89,34 +87,37 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	return t
 }
 
-// TunnelImpl is the lazy tunnel core. Every getter resolves through a
-// sync.Once on first use; getters whose input is not yet available block on
-// the tunnel context. One TunnelImpl serves as both v1.Tunnel (configurable
-// phase) and v1.Tunneled (post-WithListener phase) — the narrowing at
-// WithListener is purely compile-time.
+// TunnelImpl is the lazy tunnel core behind v1.Tunnel. Every getter resolves
+// through a sync.Once on first use; getters whose input is not yet available
+// block on the tunnel context. The configurable fields are write-once for the
+// same reason — each is guarded by its own sync.Once, fixed by the first
+// mutator call or the first internal use, so a fixed value never mutates
+// under a goroutine that already read it.
 type TunnelImpl[T v1.Spec] struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	// log is atomic: WithLogger can race the goroutines New and WithListener
-	// spawn, which read it through Logger.
-	log     atomic.Pointer[slog.Logger]
+	// logOnce fixes log: the first WithLogger wins; a Logger read before any
+	// WithLogger fixes the silent default.
+	logOnce sync.Once
+	log     *slog.Logger
 	backend v1.Backend[T]
 	// engine is backend asserted to the alpha contract, established once in
 	// New. Nil means a foreign backend — the tunnel is born canceled.
 	engine Engine[T]
 
-	// listenerSet guards the one-time provide: the first WithListener or
-	// Listener-mint wins the CAS and sets listener; a later WithListener that
-	// loses is a double-provide and cancels the tunnel.
-	listenerSet      atomic.Bool
+	// listenerOnce guards the one-time provide: the first WithListener or
+	// start-trigger mint wins and sets listener; a later WithListener is a
+	// double-provide and cancels the tunnel.
+	listenerOnce     sync.Once
 	listener         net.Listener
 	listenerProvided chan struct{}
 
-	// userCtx is an optional caller context set via WithContext, read by URL.
-	// Atomic because WithContext can race the goroutines that reach URL. Nil
-	// (unset) means URL waits on DNS alone; set, URL waits for full readiness.
-	userCtx atomic.Pointer[context.Context]
+	// userCtxOnce fixes userCtx: the first WithContext wins; a URL read
+	// before any WithContext fixes it to nil (unset). Nil means URL waits on
+	// DNS alone; set, URL waits for full readiness.
+	userCtxOnce sync.Once
+	userCtx     context.Context
 
 	localIPOnce   sync.Once
 	localIP       net.IP
@@ -144,12 +145,12 @@ func (t *TunnelImpl[T]) Context() context.Context {
 	return t.ctx
 }
 
-// Done implements v1.Tunneled: closed when the tunnel fails or shuts down.
+// Done implements v1.Tunnel: closed when the tunnel fails or shuts down.
 func (t *TunnelImpl[T]) Done() <-chan struct{} {
 	return t.ctx.Done()
 }
 
-// Err implements v1.Tunneled: the cancellation cause, nil while alive.
+// Err implements v1.Tunnel: the cancellation cause, nil while alive.
 func (t *TunnelImpl[T]) Err() error {
 	return context.Cause(t.ctx)
 }
@@ -161,7 +162,11 @@ func (t *TunnelImpl[T]) Cancel(cause error) {
 }
 
 // Logger is the tunnel's logger (never nil; silent by default). Exposed for
-// Engine implementations in subpackages.
+// Engine implementations in subpackages. The first read without a prior
+// WithLogger fixes the silent default — the log field is write-once.
 func (t *TunnelImpl[T]) Logger() *slog.Logger {
-	return t.log.Load()
+	t.logOnce.Do(func() {
+		t.log = slog.New(slog.DiscardHandler)
+	})
+	return t.log
 }

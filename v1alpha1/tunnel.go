@@ -16,14 +16,14 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
-// WithLogger sets the logger. A no-op once a listener has been provided.
+// WithLogger sets the logger, once: the first call wins, and a nil logger is
+// ignored. A no-op after the log field is fixed — by an earlier WithLogger,
+// or by the tunnel's first internal Logger read fixing the silent default.
 func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel {
-	select {
-	case <-t.listenerProvided:
-	default:
-		if log != nil {
-			t.log.Store(log)
-		}
+	if log != nil {
+		t.logOnce.Do(func() {
+			t.log = log
+		})
 	}
 	return t
 }
@@ -31,39 +31,40 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel {
 // WithContext threads a caller context into URL: once set, URL upgrades from
 // "the hostname resolves" to "the tunnel is reachable end to end" — it waits
 // for TunnelReady, honoring this context, and returns nil if the context is
-// done first. A no-op once a listener has been provided, or if ctx is nil.
+// done first. Write-once: the first call wins, a nil ctx is ignored, and a
+// URL call that already fixed the field (to nil, unset) makes this a no-op.
 func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
-	select {
-	case <-t.listenerProvided:
-	default:
-		if ctx != nil {
-			t.userCtx.Store(&ctx)
-		}
+	if ctx != nil {
+		t.userCtxOnce.Do(func() {
+			t.userCtx = ctx
+		})
 	}
 	return t
 }
 
 // WithListener provides the local listener and lazily starts the edge
 // connection. The listener is the single source of local-side truth: LocalIP,
-// LocalPort, and LocalURL all derive from its address. The returned
-// v1.Tunneled carries no mutators — there is nothing left to configure.
+// LocalPort, and LocalURL all derive from its address.
 //
 // The listener is provided exactly once. Providing it again — a second
-// WithListener, or WithListener after Listener() already minted one — cancels
-// the tunnel (Err reports "listener already provided"). As an alternative to
-// bringing your own, call Listener() to have the tunnel mint a loopback
-// listener for you.
-func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunneled {
-	if t.listenerSet.CompareAndSwap(false, true) {
+// WithListener, or WithListener after a start trigger (Listener, URL,
+// TunnelReady) already minted one — cancels the tunnel (Err reports "listener
+// already provided"). As an alternative to bringing your own, call Listener()
+// to have the tunnel mint a loopback listener for you.
+func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
+	provided := false
+	t.listenerOnce.Do(func() {
+		provided = true
 		t.provide(l, false)
-	} else {
+	})
+	if !provided {
 		t.cancel(fmt.Errorf("WithListener: listener already provided"))
 	}
 	return t
 }
 
-// provide adopts l as the local origin and starts the edge connection. The
-// caller must have won the listenerSet CAS, so this runs exactly once. minted
+// provide adopts l as the local origin and starts the edge connection. It
+// runs inside the caller's listenerOnce.Do, so exactly once. minted
 // marks a listener the tunnel owns (created by Listener), which is closed when
 // the tunnel ends; a caller-provided listener stays caller-owned.
 func (t *TunnelImpl[T]) provide(l net.Listener, minted bool) {
@@ -119,14 +120,15 @@ func (t *TunnelImpl[T]) provide(l net.Listener, minted bool) {
 // stays caller-owned, so closing that restarts the origin while the tunnel
 // persists; a minted one has no separate owner, so closing it is terminal.
 func (t *TunnelImpl[T]) Listener() net.Listener {
-	if t.listenerSet.CompareAndSwap(false, true) {
+	t.listenerOnce.Do(func() {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
+			// boundListener below sees the canceled tunnel and returns nil.
 			t.cancel(fmt.Errorf("unable to mint a local listener: %w", err))
-			return nil
+			return
 		}
 		t.provide(l, true)
-	}
+	})
 	return t.boundListener()
 }
 
@@ -309,10 +311,22 @@ func (t *TunnelImpl[T]) Port() int {
 // URL is https://<Hostname>/. It blocks until the hostname resolves on the
 // zone's authoritative nameservers. Returns nil if the tunnel is canceled
 // before that happens, per the v1 contract's zero-value-on-cancel rule.
+//
+// URL demands public reachability, so like Listener it is a start trigger:
+// with no listener provided it mints a loopback one and starts the edge
+// connection, instead of waiting on readiness that could never arrive.
 func (t *TunnelImpl[T]) URL() *url.URL {
+	// Ensure the tunnel is starting before waiting on it. Listener first, then
+	// Hostname: provide kicks off the spec fetch in the background, so the
+	// edge dial and DNS propagation overlap the Hostname wait.
+	t.Listener()
 	hostname := t.Hostname()
 
-	if p := t.userCtx.Load(); p != nil {
+	// Fix the userCtx field before reading it: an unset field freezes to nil
+	// (URL waits on DNS alone), and a later WithContext becomes a no-op
+	// instead of a mutation under this read.
+	t.userCtxOnce.Do(func() {})
+	if t.userCtx != nil {
 		// A caller context set via WithContext upgrades URL from "the hostname
 		// resolves" to "the tunnel is reachable end to end": wait for
 		// TunnelReady (which implies the hostname has resolved), honoring both
@@ -323,7 +337,7 @@ func (t *TunnelImpl[T]) URL() *url.URL {
 		case <-t.TunnelReady():
 		case <-t.ctx.Done():
 			return nil
-		case <-(*p).Done():
+		case <-t.userCtx.Done():
 			return nil
 		}
 	} else if !await(t.ctx, t.HostnameReady()) {
@@ -351,8 +365,11 @@ func (t *TunnelImpl[T]) CACerts() []*x509.Certificate {
 }
 
 // TunnelReady is closed when the edge connection is up and the hostname
-// resolves publicly.
+// resolves publicly. Waiting on readiness demands a running tunnel, so like
+// URL it is a start trigger: with no listener provided it mints a loopback
+// one and starts the edge connection before handing back the channel.
 func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
+	t.Listener()
 	return t.tunnelReady
 }
 

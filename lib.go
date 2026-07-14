@@ -6,16 +6,18 @@
 //
 //   - libtunnel (this package) — thin façade exposing New and the backend
 //     constructors. Stable surface for application code.
-//   - github.com/cnuss/libtunnel/v1 — the stable Tunnel/Tunneled/Provider/
-//     Backend interfaces and spec types. Application code that wants to
-//     declare types against the contract imports this.
+//   - github.com/cnuss/libtunnel/v1 — the stable Tunnel/Provider/Backend
+//     interfaces and spec types. Application code that wants to declare
+//     types against the contract imports this.
 //   - github.com/cnuss/libtunnel/v1alpha1 — the current implementation: the
 //     lazy tunnel core plus generic providers, with backend engines in
 //     subpackages (v1alpha1/cloudflare). Internals may change between alpha
 //     revisions.
 //
-// Everything is lazy: New returns immediately, and WithListener is the
-// trigger that starts the edge connection.
+// Everything is lazy: New returns immediately, and the edge connection starts
+// on first demand — WithListener provides the origin listener explicitly,
+// while Listener, URL, and TunnelReady mint a loopback one if none was
+// provided.
 //
 //	l, _ := net.Listen("tcp", "127.0.0.1:0")
 //	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
@@ -37,15 +39,10 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
-// TunnelV1 is the configurable phase returned by New: a non-generic alias for
+// TunnelV1 is the tunnel handle returned by New: a non-generic alias for
 // v1.Tunnel, re-exported so callers can name the type without importing v1.
-// Mutators (With*) chain until WithListener narrows it to TunneledV1.
+// Storable as a plain field — the backend spec type does not appear in it.
 type TunnelV1 = v1.Tunnel
-
-// TunneledV1 is the post-WithListener phase: a non-generic alias for
-// v1.Tunneled (observers and lifecycle, no mutators). Storable as a plain
-// field — the backend spec type does not appear in it.
-type TunneledV1 = v1.Tunneled
 
 // CloudflareV1 is the backend type returned by Cloudflare: an alias for
 // v1.Backend[*cloudflare.Spec], re-exported so callers can name it without

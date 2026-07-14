@@ -11,11 +11,12 @@
 tunnel backend — Cloudflare quick tunnels first, driven entirely in-process
 (no `cloudflared` binary required).
 
-The API is pure-lazy: every getter resolves on first use, and `WithListener`
-is the trigger that starts the edge connection. Once it fires, the returned
-value narrows to a `Tunneled` running handle — the mutators and the pre-start
-introspection (spec getters, `HostnameReady`) are gone, leaving how to reach
-the tunnel and how to watch it, and the type system says so.
+The API is pure-lazy: every getter resolves on first use, and the edge
+connection starts on first demand — `WithListener` provides the origin
+listener explicitly, while `Listener`, `URL`, and `TunnelReady` mint a
+loopback one if none was provided. Configuration is write-once: each `With*`
+mutator takes effect at most once and is a no-op after its value is fixed,
+whether by an earlier call or by the tunnel's first use of the default.
 
 ## Quick Start
 
@@ -67,7 +68,7 @@ Three packages, stable/alpha versioning:
 ```
 github.com/cnuss/libtunnel                      — root façade: New, backends,
                                                   providers, handoff helpers.
-github.com/cnuss/libtunnel/v1                   — stable Tunnel/Tunneled +
+github.com/cnuss/libtunnel/v1                   — stable Tunnel +
                                                   Provider[T]/Backend[T] contract.
 github.com/cnuss/libtunnel/v1alpha1             — lazy tunnel core + generic
                                                   providers. May change between
@@ -86,38 +87,35 @@ For the file-by-file map, see
 ## API at a glance
 
 ```go
-// configurable phase — mutators chain until WithListener narrows the type.
-// Non-generic: the spec type is a construction-time detail, so a tunnel
-// reference stores without threading T through caller code.
+// the lazy tunnel handle — every getter resolves on first use; the tunnel
+// starts on first demand. Non-generic: the spec type is a construction-time
+// detail, so a tunnel reference stores without threading T through caller code.
 type Tunnel interface {
-    Tunneled
-
-    LocalIP() net.IP // local side, inferred from the listener
+    LocalPort() int  // local side, inferred from the listener
+    LocalIP() net.IP
     LocalHost() string
+    LocalURL() *url.URL
 
     Host() string // public side, derived from the spec
     Hostname() string
     Domain() string
     Port() int
     CACerts() []*x509.Certificate
+
+    Listener() net.Listener // start trigger: mints a loopback listener if none provided
+    URL() *url.URL // blocks until the hostname resolves (end-to-end w/ WithContext);
+                   // start trigger, like Listener
+
     HostnameReady() <-chan struct{} // hostname resolves on authoritative NS
-
-    WithLogger(log *slog.Logger) Tunnel      // default: silent
-    WithContext(ctx context.Context) Tunnel  // URL waits end-to-end, honors ctx
-    WithListener(l net.Listener) Tunneled   // starts the connection
-}
-
-// post-WithListener phase — the running handle: reach it, watch it
-type Tunneled interface {
-    LocalPort() int
-    LocalURL() *url.URL
-    Listener() net.Listener
-
-    URL() *url.URL // blocks until the hostname resolves (end-to-end w/ WithContext)
-
-    TunnelReady() <-chan struct{}   // connection up + hostname resolves
+    TunnelReady() <-chan struct{}   // connection up + hostname resolves;
+                                    // start trigger, like Listener
     Done() <-chan struct{}          // tunnel failed or shut down
     Err() error                     // why (nil while alive)
+
+    // write-once mutators: first call wins, no-ops once the value is fixed
+    WithLogger(log *slog.Logger) Tunnel      // default: silent
+    WithContext(ctx context.Context) Tunnel  // URL waits end-to-end, honors ctx
+    WithListener(l net.Listener) Tunnel      // bring your own listener
 }
 
 type Provider[T Spec] interface { Spec(ctx context.Context) (T, error) }

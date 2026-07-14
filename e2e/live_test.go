@@ -13,8 +13,10 @@ package e2e_test
 
 import (
 	"bufio"
+	"context"
 	cryptotls "crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -163,6 +165,39 @@ func TestLiveTunnel(t *testing.T) {
 
 		eventuallyBody(t, url, "after the bounce", 30*time.Second)
 	})
+}
+
+// TestLiveMintedListener pins the scenario from #82: no WithListener, no
+// net.Listen of the caller's own — serve straight on tun.Listener() (which
+// mints the loopback listener and starts the tunnel) and read the public URL.
+// The reported failure mode was blocking forever with no output; WithContext
+// bounds every wait, so a regression fails the test instead of hanging it.
+// (URL-before-listener start ordering is pinned by the unit tests.)
+func TestLiveMintedListener(t *testing.T) {
+	gateLive(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// The exact construction from the report: context and logger threaded,
+	// no listener of the caller's own.
+	tun := libtunnel.New(libtunnel.Cloudflare()).
+		WithContext(ctx).
+		WithLogger(slog.Default())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello via minted listener")
+	})
+	go http.Serve(tun.Listener(), mux)
+
+	// WithContext is set, so URL waits for end-to-end readiness and returns
+	// nil if ctx expires first — bounded either way.
+	url := tun.URL()
+	if url == nil {
+		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", tun.Err(), ctx.Err())
+	}
+	eventuallyBody(t, url.String(), "hello via minted listener", 30*time.Second)
 }
 
 // TestLiveResurrection is the strongest form of the handoff promise: the
