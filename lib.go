@@ -1,4 +1,4 @@
-// Package libtunnel exposes a local listener to the public internet through a
+// Package libtunnel exposes a local origin to the public internet through a
 // tunnel backend (Cloudflare quick tunnels first), behind a thin, stable
 // façade over stable/alpha versioned packages.
 //
@@ -16,8 +16,9 @@
 //
 // Everything is lazy: New returns immediately, and the edge connection starts
 // on first demand — WithListener provides the origin listener explicitly,
-// while Listener, URL, and TunnelReady mint a loopback one if none was
-// provided.
+// WithLocalURL points at an already-running local origin instead (the
+// cloudflared `tunnel --url` shape), and Listener, URL, and TunnelReady mint
+// a loopback listener if no origin was provided.
 //
 //	l, _ := net.Listen("tcp", "127.0.0.1:0")
 //	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)

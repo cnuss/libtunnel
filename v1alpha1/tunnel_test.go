@@ -20,14 +20,16 @@ import (
 )
 
 // fakeEngine satisfies the Engine contract without dialing anything: it
-// records the listener it was handed and reports success immediately.
+// records the origin it was handed (listener or URL) and reports success
+// immediately.
 type fakeEngine struct {
-	got  chan net.Listener
-	spec *cloudflare.Spec
+	got    chan net.Listener
+	gotURL chan *url.URL
+	spec   *cloudflare.Spec
 }
 
 func newFakeEngine(spec *cloudflare.Spec) *fakeEngine {
-	return &fakeEngine{got: make(chan net.Listener, 1), spec: spec}
+	return &fakeEngine{got: make(chan net.Listener, 1), gotURL: make(chan *url.URL, 1), spec: spec}
 }
 
 func (e *fakeEngine) Name() string                                { return "fake" }
@@ -37,6 +39,10 @@ func (e *fakeEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e *fakeEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
+	return nil
+}
+func (e *fakeEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], u *url.URL) error {
+	e.gotURL <- u
 	return nil
 }
 
@@ -261,8 +267,8 @@ func TestSecondWithListenerCancels(t *testing.T) {
 
 	select {
 	case <-tun.Done():
-		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "listener already provided") {
-			t.Errorf("Err() = %v, want 'listener already provided'", err)
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "origin already provided") {
+			t.Errorf("Err() = %v, want 'origin already provided'", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Done never closed after a second WithListener")
@@ -279,8 +285,8 @@ func TestListenerMintThenWithListenerCancels(t *testing.T) {
 
 	select {
 	case <-tun.Done():
-		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "listener already provided") {
-			t.Errorf("Err() = %v, want 'listener already provided'", err)
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "origin already provided") {
+			t.Errorf("Err() = %v, want 'origin already provided'", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Done never closed after WithListener following a mint")
@@ -302,6 +308,169 @@ func TestWithListenerThenListenerReturnsProvided(t *testing.T) {
 	}
 	if err := tun.Err(); err != nil {
 		t.Errorf("Err() = %v, want nil (Listener after WithListener is fine)", err)
+	}
+}
+
+// TestWithLocalURLGettersDeriveFromURL pins the URL-origin local side: the
+// local getters derive from the provided URL, and the engine receives the
+// URL — never a listener.
+func TestWithLocalURLGettersDeriveFromURL(t *testing.T) {
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"})
+	conn := v1alpha1.New(engine).WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
+
+	if got := conn.LocalPort(); got != 1234 {
+		t.Errorf("LocalPort() = %d, want 1234 (the URL's port)", got)
+	}
+	if got := conn.LocalIP(); !got.Equal(net.IPv4(127, 0, 0, 1)) {
+		t.Errorf("LocalIP() = %v, want 127.0.0.1 (the URL's host)", got)
+	}
+	if got := conn.LocalURL(); got.String() != "http://127.0.0.1:1234/" {
+		t.Errorf("LocalURL() = %v, want http://127.0.0.1:1234/ (the provided URL)", got)
+	}
+
+	select {
+	case got := <-engine.gotURL:
+		if got.String() != "http://127.0.0.1:1234/" {
+			t.Errorf("engine received %v, want http://127.0.0.1:1234/", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine never received the origin URL")
+	}
+	select {
+	case l := <-engine.got:
+		t.Errorf("engine received listener %v for a URL origin", l.Addr())
+	default:
+	}
+}
+
+// TestWithLocalURLDefaultPorts pins the port default for host-only URLs: 443
+// for https, 80 for http.
+func TestWithLocalURLDefaultPorts(t *testing.T) {
+	for scheme, want := range map[string]int{"http": 80, "https": 443} {
+		conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"})).
+			WithLocalURL(&url.URL{Scheme: scheme, Host: "127.0.0.1"})
+		if got := conn.LocalPort(); got != want {
+			t.Errorf("LocalPort() = %d for a portless %s URL, want %d", got, scheme, want)
+		}
+	}
+}
+
+// TestWithLocalURLResolvesHost pins LocalIP for a non-IP URL host: the name
+// is resolved (localhost ⇒ a loopback address).
+func TestWithLocalURLResolvesHost(t *testing.T) {
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"})).
+		WithLocalURL(&url.URL{Scheme: "http", Host: "localhost:8080"})
+
+	if got := conn.LocalIP(); got == nil || !got.IsLoopback() {
+		t.Errorf("LocalIP() = %v for localhost, want a loopback address", got)
+	}
+}
+
+// TestWithLocalURLInvalidCancels pins eager validation: a nil URL, a non-http
+// scheme, or a hostless URL cancels the tunnel instead of confusing the
+// backend later.
+func TestWithLocalURLInvalidCancels(t *testing.T) {
+	for name, u := range map[string]*url.URL{
+		"nil":       nil,
+		"badScheme": {Scheme: "ftp", Host: "127.0.0.1:21"},
+		"noHost":    {Scheme: "http"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+			tun.WithLocalURL(u)
+
+			select {
+			case <-tun.Done():
+				if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "http(s) URL") {
+					t.Errorf("Err() = %v, want the URL validation failure", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Done never closed for an invalid origin URL")
+			}
+		})
+	}
+}
+
+// TestWithLocalURLThenWithListenerCancels pins the one-provide rule across
+// origin kinds: a listener after a URL origin is a double-provide.
+func TestWithLocalURLThenWithListenerCancels(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
+	tun.WithListener(listen(t))
+
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "origin already provided") {
+			t.Errorf("Err() = %v, want 'origin already provided'", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed after WithListener following WithLocalURL")
+	}
+}
+
+// TestWithListenerThenWithLocalURLCancels pins the reverse order: a URL
+// origin after a listener is a double-provide.
+func TestWithListenerThenWithLocalURLCancels(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	tun.WithListener(listen(t))
+	tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
+
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "origin already provided") {
+			t.Errorf("Err() = %v, want 'origin already provided'", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed after WithLocalURL following WithListener")
+	}
+}
+
+// TestListenerAfterWithLocalURLCancels pins the contract violation: a URL
+// origin has no listener, so Listener() cancels the tunnel and returns nil
+// instead of blocking forever or minting a second origin.
+func TestListenerAfterWithLocalURLCancels(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
+
+	if l := tun.Listener(); l != nil {
+		t.Errorf("Listener() = %v for a URL origin, want nil", l)
+	}
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "no listener exists") {
+			t.Errorf("Err() = %v, want 'no listener exists'", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed after Listener() on a URL origin")
+	}
+}
+
+// TestWithLocalURLReadiness pins the start triggers for a URL origin: URL and
+// TunnelReady must not mint a listener (the origin is already provided) and
+// must complete once the engine connects and the hostname resolves.
+func TestWithLocalURLReadiness(t *testing.T) {
+	stubReady(t)
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"})
+	tun := v1alpha1.New(engine)
+	conn := tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
+
+	if u := conn.URL(); u == nil || u.String() != "https://demo.trycloudflare.com/" {
+		t.Fatalf("URL() = %v, want https://demo.trycloudflare.com/", u)
+	}
+	select {
+	case <-conn.TunnelReady():
+	case <-conn.Done():
+		t.Fatalf("tunnel died instead of becoming ready: %v", conn.Err())
+	case <-time.After(5 * time.Second):
+		t.Fatal("TunnelReady never closed for a URL origin")
+	}
+	select {
+	case l := <-engine.got:
+		t.Errorf("a start trigger minted listener %v despite the URL origin", l.Addr())
+	default:
+	}
+	if err := conn.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil", err)
 	}
 }
 
@@ -492,6 +661,9 @@ func (failingEngine) CACerts() []*x509.Certificate                  { return nil
 func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
 func (failingEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
+	return nil
+}
+func (failingEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], u *url.URL) error {
 	return nil
 }
 

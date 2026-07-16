@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -153,8 +154,27 @@ func (b *Backend) CACerts() []*x509.Certificate {
 // WithListener dials the Cloudflare edge and proxies it onto l. It blocks
 // until the first edge connection is up; the supervisor keeps running in the
 // background for the tunnel's lifetime, reporting fatal errors through
-// t.Cancel.
+// t.Cancel. The origin scheme follows the backend's explicit WithTLS setting
+// (default false ⇒ http).
 func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) error {
+	scheme := "http"
+	if b.tls {
+		scheme = "https"
+	}
+	return b.connect(t, fmt.Sprintf("%s://%s", scheme, l.Addr().String()))
+}
+
+// WithLocalURL dials the Cloudflare edge and proxies it onto an
+// already-running local origin. The URL arrives validated and reduced to
+// scheme+host by the core, so its scheme — not WithTLS — declares how the
+// origin is dialed.
+func (b *Backend) WithLocalURL(t *v1alpha1.TunnelImpl[*Spec], u *url.URL) error {
+	return b.connect(t, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
+}
+
+// connect is the shared engine body behind WithListener and WithLocalURL:
+// service is the cloudflared ingress service URL the edge proxies to.
+func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	ctx := t.Context()
 	log := zerologger(t.Logger())
 	spec := t.Spec()
@@ -253,14 +273,10 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 			OriginDialerService: originDialer,
 		}
 
-		// The origin scheme and HTTP/2 follow the backend's explicit settings
-		// (WithTLS / WithHTTP2, both default false): WithTLS picks https vs http,
-		// WithHTTP2 toggles Http2Origin. TLS verification is always off — a local
-		// origin may carry a self-signed cert.
-		scheme := "http"
-		if b.tls {
-			scheme = "https"
-		}
+		// HTTP/2 follows the backend's explicit WithHTTP2 setting (default
+		// false); the service URL's scheme picks https vs http. TLS
+		// verification is always off — a local origin may carry a self-signed
+		// cert.
 		noTLSVerify := true
 		http2Origin := b.http2
 
@@ -272,11 +288,11 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 			},
 			WarpRouting: config.WarpRoutingConfig{},
 			Ingress: []config.UnvalidatedIngressRule{
-				{Service: fmt.Sprintf("%s://%s", scheme, l.Addr().String())},
+				{Service: service},
 			},
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse ingress for %s://%s: %w", scheme, l.Addr().String(), err)
+			return nil, fmt.Errorf("failed to parse ingress for %s: %w", service, err)
 		}
 		orchestrator, err := orchestration.NewOrchestrator(ctx, &orchestration.Config{
 			Ingress:             &parsed,

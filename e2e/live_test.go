@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -198,6 +199,36 @@ func TestLiveMintedListener(t *testing.T) {
 		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", tun.Err(), ctx.Err())
 	}
 	eventuallyBody(t, url.String(), "hello via minted listener", 30*time.Second)
+}
+
+// TestLiveLocalURL pins the attach shape (#86): the origin is an
+// already-running local HTTP server the tunnel does not own, provided as a
+// URL — the `cloudflared tunnel --url` equivalent. No listener crosses the
+// tunnel API.
+func TestLiveLocalURL(t *testing.T) {
+	gateLive(t)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	serveBody(l, "hello via local URL")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	conn := libtunnel.New(libtunnel.Cloudflare()).
+		WithContext(ctx).
+		WithLocalURL(&url.URL{Scheme: "http", Host: l.Addr().String()})
+
+	// WithContext is set, so URL waits for end-to-end readiness and returns
+	// nil if ctx expires first — bounded either way.
+	pub := conn.URL()
+	if pub == nil {
+		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", conn.Err(), ctx.Err())
+	}
+	eventuallyBody(t, pub.String(), "hello via local URL", 30*time.Second)
 }
 
 // TestLiveResurrection is the strongest form of the handoff promise: the
