@@ -7,16 +7,18 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cnuss/libtunnel/badge)](https://scorecard.dev/viewer/?uri=github.com/cnuss/libtunnel)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-`libtunnel` exposes a local `net.Listener` to the public internet through a
-tunnel backend — Cloudflare quick tunnels first, driven entirely in-process
-(no `cloudflared` binary required).
+`libtunnel` exposes a local origin to the public internet through a tunnel
+backend — Cloudflare quick tunnels first, driven entirely in-process (no
+`cloudflared` binary required).
 
 The API is pure-lazy: every getter resolves on first use, and the edge
 connection starts on first demand — `WithListener` provides the origin
-listener explicitly, while `Listener`, `URL`, and `TunnelReady` mint a
-loopback one if none was provided. Configuration is write-once: each `With*`
-mutator takes effect at most once and is a no-op after its value is fixed,
-whether by an earlier call or by the tunnel's first use of the default.
+listener explicitly, `WithLocalURL` points at an already-running local origin
+instead (the `cloudflared tunnel --url` shape), and `Listener`, `URL`, and
+`TunnelReady` mint a loopback listener if no origin was provided.
+Configuration is write-once: each `With*` mutator takes effect at most once
+and is a no-op after its value is fixed, whether by an earlier call or by the
+tunnel's first use of the default.
 
 ## Quick Start
 
@@ -91,7 +93,7 @@ For the file-by-file map, see
 // starts on first demand. Non-generic: the spec type is a construction-time
 // detail, so a tunnel reference stores without threading T through caller code.
 type Tunnel interface {
-    LocalPort() int  // local side, inferred from the listener
+    LocalPort() int  // local side, inferred from the origin (listener or URL)
     LocalIP() net.IP
     LocalHost() string
     LocalURL() *url.URL
@@ -116,6 +118,9 @@ type Tunnel interface {
     WithLogger(log *slog.Logger) Tunnel      // default: silent
     WithContext(ctx context.Context) Tunnel  // URL waits end-to-end, honors ctx
     WithListener(l net.Listener) Tunnel      // bring your own listener
+    WithLocalURL(u *url.URL) Tunnel          // attach to a running local origin
+                                             // (http://localhost:1234); mutually
+                                             // exclusive with WithListener
 }
 
 type Provider[T Spec] interface { Spec(ctx context.Context) (T, error) }

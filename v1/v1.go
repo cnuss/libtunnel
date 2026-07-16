@@ -2,11 +2,12 @@
 // are the contract callers depend on across releases; the implementation lives
 // in v1alpha1 and may change between alpha revisions.
 //
-// A tunnel exposes a local listener to the public internet through a backend
+// A tunnel exposes a local origin to the public internet through a backend
 // transport (Cloudflare quick tunnels first). The API is pure-lazy: every
 // getter resolves on first use, and the edge connection starts on first
-// demand — WithListener provides the origin listener explicitly, while
-// Listener, URL, and TunnelReady mint a loopback one if none was provided.
+// demand — WithListener provides the origin listener explicitly, WithLocalURL
+// points at an already-running local origin instead, and Listener, URL, and
+// TunnelReady mint a loopback listener if no origin was provided.
 package v1
 
 import (
@@ -71,10 +72,12 @@ type Backend[T Spec] interface {
 // Tunnel is the lazy tunnel handle returned by libtunnel.New. All getters
 // resolve on first use; getters that need state that is not yet available
 // block until it is (or until the tunnel is canceled), in which case they
-// return zero values. The edge connection starts on first demand:
-// WithListener provides the origin listener explicitly, while the start
-// triggers — Listener, URL, TunnelReady — mint a loopback one if none was
-// provided.
+// return zero values. The edge connection starts on first demand: the origin
+// is provided exactly once — WithListener provides it as a listener,
+// WithLocalURL as the URL of an already-running local service, and the start
+// triggers — Listener, URL, TunnelReady — mint a loopback listener if no
+// origin was provided. Providing an origin twice, by any combination of
+// those, cancels the tunnel (Err reports "origin already provided").
 //
 // Configuration is write-once: each With* mutator takes effect at most once
 // and is a no-op after its value is fixed, whether by an earlier call or by
@@ -84,19 +87,23 @@ type Backend[T Spec] interface {
 // does not outlive New, so callers can store a tunnel reference without
 // threading the spec type through their own code.
 type Tunnel interface {
-	// LocalPort is the listener's bound port. Blocks until a listener is
-	// provided.
+	// LocalPort is the origin's local port: the listener's bound port, or for
+	// a URL origin (WithLocalURL) the URL's port — 443 for https and 80 for
+	// http when the URL has none. Blocks until an origin is provided.
 	LocalPort() int
-	// LocalIP is the listener's bound IP. A listener bound to an unspecified
-	// address (0.0.0.0 / ::) falls back to the outbound-route IP, discovered
-	// with a UDP dial that sends no packets. Blocks until a listener is
-	// provided.
+	// LocalIP is the origin's local IP: the listener's bound IP, or for a URL
+	// origin the URL's host, parsed as an IP or resolved. A listener bound to
+	// an unspecified address (0.0.0.0 / ::) falls back to the outbound-route
+	// IP, discovered with a UDP dial that sends no packets. Blocks until an
+	// origin is provided.
 	LocalIP() net.IP
 	// LocalHost is the machine's hostname, truncated at the first dot.
 	LocalHost() string
-	// LocalURL is <scheme>://<LocalIP>:<LocalPort>/, where the scheme follows
-	// the backend's WithTLS (https when the origin terminates TLS, http
-	// otherwise). Blocks until a listener is provided.
+	// LocalURL is the local origin's URL: http://<LocalIP>:<LocalPort>/ for a
+	// listener origin (always http — the origin's scheme is a backend
+	// setting, WithTLS, and the public URL carries the real scheme), or the
+	// provided URL itself for a URL origin, scheme intact. Blocks until an
+	// origin is provided.
 	LocalURL() *url.URL
 
 	// Host is the first label of Hostname.
@@ -113,10 +120,12 @@ type Tunnel interface {
 
 	// Listener returns a tunnel-owned listener to serve on, starting the edge
 	// connection on first use. With a listener provided via WithListener it
-	// returns a tunnel-owned view of that one; with none provided it mints a
-	// loopback listener (127.0.0.1:0) and adopts it, so
+	// returns a tunnel-owned view of that one; with no origin provided it
+	// mints a loopback listener (127.0.0.1:0) and adopts it, so
 	// http.Serve(tun.Listener(), h) needs no net.Listen of your own.
-	// Idempotent: repeated calls return the same listener.
+	// Idempotent: repeated calls return the same listener. A URL origin
+	// (WithLocalURL) has no listener: calling Listener then cancels the
+	// tunnel and returns nil.
 	//
 	// Closing it closes the tunnel (Done fires, Err reports ErrClosed) — so an
 	// http.Server serving on it tears the tunnel down on Shutdown/Close. To
@@ -127,7 +136,7 @@ type Tunnel interface {
 	// URL is https://<Hostname>/. It blocks until the hostname resolves on
 	// the zone's authoritative nameservers (see HostnameReady). URL demands
 	// public reachability, so like Listener it is a start trigger: with no
-	// listener provided it mints a loopback one and starts the edge
+	// origin provided it mints a loopback listener and starts the edge
 	// connection, instead of waiting on readiness that could never arrive.
 	URL() *url.URL
 
@@ -138,8 +147,8 @@ type Tunnel interface {
 	// TunnelReady is closed when the edge connection is up and the hostname
 	// resolves publicly — the tunnel is reachable end to end. It is never
 	// closed on failure: select on Done alongside it. Like URL it is a start
-	// trigger: with no listener provided it mints a loopback one and starts
-	// the edge connection before handing back the channel.
+	// trigger: with no origin provided it mints a loopback listener and
+	// starts the edge connection before handing back the channel.
 	TunnelReady() <-chan struct{}
 	// Done is closed when the tunnel fails or shuts down. Waits on TunnelReady
 	// or HostnameReady should select on Done too, or a failed tunnel blocks
@@ -155,15 +164,30 @@ type Tunnel interface {
 	// context, instead of only for the hostname to resolve — and returns nil
 	// if the context is done first. Unset (or nil), URL waits on DNS alone.
 	WithContext(ctx context.Context) Tunnel
-	// WithListener provides the local listener and lazily starts the edge
-	// connection. The origin scheme is not inferred from the listener —
-	// declare it on the backend with WithTLS / WithHTTP2 (both default
-	// false).
+	// WithListener provides the local origin as a listener and lazily starts
+	// the edge connection. The origin scheme is not inferred from the
+	// listener — declare it on the backend with WithTLS / WithHTTP2 (both
+	// default false).
 	//
-	// The listener is provided exactly once. Providing it again — a second
-	// WithListener, or WithListener after a start trigger (Listener, URL,
-	// TunnelReady) minted one — cancels the tunnel (Err reports "listener
-	// already provided"). To let the tunnel supply the listener instead, skip
-	// WithListener and call Listener().
+	// The origin is provided exactly once, shared with WithLocalURL and the
+	// start-trigger mint. Providing it again — a second WithListener or
+	// WithLocalURL, or either after a start trigger (Listener, URL,
+	// TunnelReady) minted a listener — cancels the tunnel (Err reports
+	// "origin already provided"). To let the tunnel supply the listener
+	// instead, skip WithListener and call Listener().
 	WithListener(l net.Listener) Tunnel
+	// WithLocalURL provides the local origin as the URL of an already-running
+	// local service (e.g. http://localhost:1234) and lazily starts the edge
+	// connection — the cloudflared `tunnel --url` shape. Only the scheme and
+	// host are used: the scheme (http or https) declares how the origin is
+	// dialed, superseding the backend's WithTLS (which applies to listener
+	// origins only), and anything else (path, query, user info) is dropped. A
+	// nil URL, a scheme other than http/https, or an empty host cancels the
+	// tunnel.
+	//
+	// The origin is provided exactly once — see WithListener. A URL origin
+	// has no tunnel-owned listener: Listener must not be called (it cancels
+	// the tunnel), and there is no handle whose Close shuts the tunnel down,
+	// so the tunnel runs until the process exits or the tunnel fails.
+	WithLocalURL(u *url.URL) Tunnel
 }

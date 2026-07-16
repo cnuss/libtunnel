@@ -42,35 +42,61 @@ func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 	return t
 }
 
-// WithListener provides the local listener and lazily starts the edge
-// connection. The listener is the single source of local-side truth: LocalIP,
-// LocalPort, and LocalURL all derive from its address.
+// WithListener provides the local origin as a listener and lazily starts the
+// edge connection. The listener is the single source of local-side truth:
+// LocalIP, LocalPort, and LocalURL all derive from its address.
 //
-// The listener is provided exactly once. Providing it again — a second
-// WithListener, or WithListener after a start trigger (Listener, URL,
-// TunnelReady) already minted one — cancels the tunnel (Err reports "listener
-// already provided"). As an alternative to bringing your own, call Listener()
-// to have the tunnel mint a loopback listener for you.
+// The origin is provided exactly once, shared with WithLocalURL and the
+// start-trigger mint. Providing it again — a second WithListener or
+// WithLocalURL, or either after a start trigger (Listener, URL, TunnelReady)
+// already minted one — cancels the tunnel (Err reports "origin already
+// provided"). As an alternative to bringing your own, call Listener() to have
+// the tunnel mint a loopback listener for you.
 func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
 	provided := false
-	t.listenerOnce.Do(func() {
+	t.originOnce.Do(func() {
 		provided = true
 		t.provide(l, false)
 	})
 	if !provided {
-		t.cancel(fmt.Errorf("WithListener: listener already provided"))
+		t.cancel(fmt.Errorf("WithListener: origin already provided"))
+	}
+	return t
+}
+
+// WithLocalURL provides the local origin as the URL of an already-running
+// local service and lazily starts the edge connection — the cloudflared
+// `tunnel --url` shape. Only the scheme and host are kept: the scheme (http
+// or https) declares how the origin is dialed, superseding the backend's
+// WithTLS, and path/query/user info are dropped. A nil URL, a scheme other
+// than http/https, or an empty host cancels the tunnel.
+//
+// The origin is provided exactly once, shared with WithListener and the
+// start-trigger mint (see WithListener).
+func (t *TunnelImpl[T]) WithLocalURL(u *url.URL) v1.Tunnel {
+	provided := false
+	t.originOnce.Do(func() {
+		provided = true
+		if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			t.cancel(fmt.Errorf("WithLocalURL: origin must be an http(s) URL with a host, got %v", u))
+			return
+		}
+		t.provideURL(&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"})
+	})
+	if !provided {
+		t.cancel(fmt.Errorf("WithLocalURL: origin already provided"))
 	}
 	return t
 }
 
 // provide adopts l as the local origin and starts the edge connection. It
-// runs inside the caller's listenerOnce.Do, so exactly once. minted
-// marks a listener the tunnel owns (created by Listener), which is closed when
-// the tunnel ends; a caller-provided listener stays caller-owned.
+// runs inside the caller's originOnce.Do, so exactly once. minted
+// marks a listener the tunnel owns (created by a start trigger), which is
+// closed when the tunnel ends; a caller-provided listener stays caller-owned.
 func (t *TunnelImpl[T]) provide(l net.Listener, minted bool) {
 	t.Logger().Info("configuring tunnel with local listener", "address", l.Addr().String(), "minted", minted)
 	t.listener = l
-	close(t.listenerProvided)
+	close(t.originProvided)
 
 	if minted {
 		// The tunnel owns a minted listener; close it when the tunnel ends so a
@@ -81,20 +107,37 @@ func (t *TunnelImpl[T]) provide(l net.Listener, minted bool) {
 		}()
 	}
 
+	t.start(func() error { return t.engine.WithListener(t, l) })
+}
+
+// provideURL adopts u (already validated and reduced to scheme+host+"/") as
+// the local origin and starts the edge connection — provide's counterpart for
+// URL origins. It runs inside the caller's originOnce.Do, so exactly once.
+func (t *TunnelImpl[T]) provideURL(u *url.URL) {
+	t.Logger().Info("configuring tunnel with local origin URL", "url", u.String())
+	t.localURL = u
+	close(t.originProvided)
+
+	t.start(func() error { return t.engine.WithLocalURL(t, u) })
+}
+
+// start runs the connect sequence in the background: kick off the DNS
+// readiness poller (it waits on hostnameProvided) and mint the spec, both
+// before the edge connect — the record exists from spec-mint time, so DNS
+// propagation overlaps the (seconds-long) edge dial instead of queuing behind
+// it — then dial the edge via connect (which blocks until the connection is
+// up) and close tunnelReady once DNS readiness lands too. On a foreign
+// backend (nil engine, tunnel born canceled — see New) it does nothing.
+func (t *TunnelImpl[T]) start(connect func() error) {
 	if t.engine == nil {
-		// Foreign backend: the tunnel was born canceled (see New).
 		return
 	}
 
 	go func() {
-		t.Logger().Info("starting tunnel with local listener")
-		// Start the DNS readiness poller (it waits on hostnameProvided) and
-		// mint the spec, both before the edge connect: the record exists
-		// from spec-mint time, so DNS propagation overlaps the (seconds-long)
-		// edge dial instead of queuing behind it.
+		t.Logger().Info("starting tunnel")
 		go t.pollAuthoritative()
 		t.Spec()
-		if err := t.engine.WithListener(t, l); err != nil {
+		if err := connect(); err != nil {
 			t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
 			return
 		}
@@ -120,7 +163,20 @@ func (t *TunnelImpl[T]) provide(l net.Listener, minted bool) {
 // stays caller-owned, so closing that restarts the origin while the tunnel
 // persists; a minted one has no separate owner, so closing it is terminal.
 func (t *TunnelImpl[T]) Listener() net.Listener {
-	t.listenerOnce.Do(func() {
+	t.ensureOrigin()
+	if t.originURL() != nil {
+		t.cancel(fmt.Errorf("Listener: the origin is a URL (WithLocalURL); no listener exists"))
+		return nil
+	}
+	return t.boundListener()
+}
+
+// ensureOrigin is the shared start-trigger step behind Listener, URL, and
+// TunnelReady: with no origin provided yet it mints a loopback listener
+// (127.0.0.1:0) and adopts it; with one already provided — listener or URL —
+// it is a no-op.
+func (t *TunnelImpl[T]) ensureOrigin() {
+	t.originOnce.Do(func() {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			// boundListener below sees the canceled tunnel and returns nil.
@@ -129,18 +185,35 @@ func (t *TunnelImpl[T]) Listener() net.Listener {
 		}
 		t.provide(l, true)
 	})
-	return t.boundListener()
+}
+
+// originURL blocks until an origin is provided and returns the URL it was
+// provided as — nil for a listener origin, or for a tunnel canceled first.
+// The local-side getters branch on it before touching the listener.
+func (t *TunnelImpl[T]) originURL() *url.URL {
+	// The localURL field is only safe to read once originProvided is closed
+	// (the close is the happens-before edge for the write), so a cancellation
+	// wake returns nil instead of reading the field.
+	if !await(t.ctx, t.originProvided) {
+		return nil
+	}
+	return t.localURL
 }
 
 // boundListener blocks until a listener is provided (via WithListener or a
-// Listener mint) and returns a tunnel-owned view of it, or nil if the tunnel
-// is canceled first. It never mints — the local-side getters use it so
-// observing the bind address can't start a tunnel.
+// start-trigger mint) and returns a tunnel-owned view of it, or nil if the
+// tunnel is canceled first or the origin is a URL. It never mints — the
+// local-side getters use it so observing the bind address can't start a
+// tunnel.
 func (t *TunnelImpl[T]) boundListener() net.Listener {
-	// The listener field is only safe to read once listenerProvided is closed
+	// The listener field is only safe to read once originProvided is closed
 	// (the close is the happens-before edge for the write), so a cancellation
 	// wake returns nil instead of reading the field.
-	if !await(t.ctx, t.listenerProvided) {
+	if !await(t.ctx, t.originProvided) {
+		return nil
+	}
+	if t.listener == nil {
+		// URL origin: there is no listener to view.
 		return nil
 	}
 	return tunnelListener[T]{Listener: t.listener, t: t}
@@ -158,9 +231,19 @@ func (l tunnelListener[T]) Close() error {
 	return l.Listener.Close()
 }
 
-// LocalPort is the listener's bound port. Blocks until a listener is
-// provided.
+// LocalPort is the origin's local port: the listener's bound port, or for a
+// URL origin the URL's port — 443 for https and 80 for http when the URL has
+// none. Blocks until an origin is provided.
 func (t *TunnelImpl[T]) LocalPort() int {
+	if u := t.originURL(); u != nil {
+		if p, err := strconv.Atoi(u.Port()); err == nil {
+			return p
+		}
+		if u.Scheme == "https" {
+			return 443
+		}
+		return 80
+	}
 	l := t.boundListener()
 	if l == nil {
 		return 0
@@ -182,35 +265,48 @@ func (t *TunnelImpl[T]) LocalPort() int {
 	return p
 }
 
-// LocalIP is the listener's bound IP. A listener bound to an unspecified
-// address (0.0.0.0 / ::) has no concrete IP to report, so it falls back to
-// the outbound-route IP, discovered with a UDP dial (no packets are sent).
-// Blocks until a listener is provided.
+// LocalIP is the origin's local IP: the listener's bound IP, or for a URL
+// origin the URL's host, parsed as an IP or resolved. An unspecified address
+// (0.0.0.0 / ::) has no concrete IP to report, so it falls back to the
+// outbound-route IP, discovered with a UDP dial (no packets are sent).
+// Blocks until an origin is provided.
 func (t *TunnelImpl[T]) LocalIP() net.IP {
 	t.localIPOnce.Do(func() {
-		l := t.boundListener()
-		if l == nil {
-			return
-		}
-
 		var ip net.IP
-		if addr, ok := l.Addr().(*net.TCPAddr); ok {
-			ip = addr.IP
+		if u := t.originURL(); u != nil {
+			host := u.Hostname()
+			ip = net.ParseIP(host)
+			if ip == nil {
+				addrs, err := net.DefaultResolver.LookupIPAddr(t.ctx, host)
+				if err != nil || len(addrs) == 0 {
+					t.cancel(fmt.Errorf("unable to resolve local origin host %q: %w", host, err))
+					return
+				}
+				ip = addrs[0].IP
+			}
 		} else {
-			// Exotic listener: fall back to parsing the address string.
-			host, _, err := net.SplitHostPort(l.Addr().String())
-			if err != nil {
-				t.cancel(fmt.Errorf("unable to determine local IP from listener address %q: %w", l.Addr(), err))
+			l := t.boundListener()
+			if l == nil {
 				return
 			}
-			ip = net.ParseIP(host)
+			if addr, ok := l.Addr().(*net.TCPAddr); ok {
+				ip = addr.IP
+			} else {
+				// Exotic listener: fall back to parsing the address string.
+				host, _, err := net.SplitHostPort(l.Addr().String())
+				if err != nil {
+					t.cancel(fmt.Errorf("unable to determine local IP from listener address %q: %w", l.Addr(), err))
+					return
+				}
+				ip = net.ParseIP(host)
+			}
 		}
 		if ip != nil && !ip.IsUnspecified() {
 			t.localIP = ip
 			return
 		}
 
-		t.Logger().Info("listener bound to unspecified address, determining outbound-route IP")
+		t.Logger().Info("origin bound to unspecified address, determining outbound-route IP")
 		conn, err := net.Dial("udp", "1.1.1.1:53")
 		if err != nil {
 			t.cancel(fmt.Errorf("unable to get local IP: %w", err))
@@ -237,11 +333,16 @@ func (t *TunnelImpl[T]) LocalHost() string {
 	return t.localHost
 }
 
-// LocalURL is http://<LocalIP>:<LocalPort>/ — the local bind address. It is
-// always http: the origin's scheme is a backend setting (WithTLS), not derived
-// here, and the public URL carries the real scheme. Blocks until a listener is
-// provided.
+// LocalURL is the local origin's URL. For a listener origin it is
+// http://<LocalIP>:<LocalPort>/ — always http: the origin's scheme is a
+// backend setting (WithTLS), not derived here, and the public URL carries the
+// real scheme. For a URL origin it is the provided URL itself, scheme intact.
+// Blocks until an origin is provided.
 func (t *TunnelImpl[T]) LocalURL() *url.URL {
+	if u := t.originURL(); u != nil {
+		clone := *u
+		return &clone
+	}
 	ip := t.LocalIP()
 	if ip == nil {
 		return nil
@@ -313,13 +414,13 @@ func (t *TunnelImpl[T]) Port() int {
 // before that happens, per the v1 contract's zero-value-on-cancel rule.
 //
 // URL demands public reachability, so like Listener it is a start trigger:
-// with no listener provided it mints a loopback one and starts the edge
+// with no origin provided it mints a loopback listener and starts the edge
 // connection, instead of waiting on readiness that could never arrive.
 func (t *TunnelImpl[T]) URL() *url.URL {
-	// Ensure the tunnel is starting before waiting on it. Listener first, then
+	// Ensure the tunnel is starting before waiting on it. Origin first, then
 	// Hostname: provide kicks off the spec fetch in the background, so the
 	// edge dial and DNS propagation overlap the Hostname wait.
-	t.Listener()
+	t.ensureOrigin()
 	hostname := t.Hostname()
 
 	// Fix the userCtx field before reading it: an unset field freezes to nil
@@ -366,10 +467,10 @@ func (t *TunnelImpl[T]) CACerts() []*x509.Certificate {
 
 // TunnelReady is closed when the edge connection is up and the hostname
 // resolves publicly. Waiting on readiness demands a running tunnel, so like
-// URL it is a start trigger: with no listener provided it mints a loopback
-// one and starts the edge connection before handing back the channel.
+// URL it is a start trigger: with no origin provided it mints a loopback
+// listener and starts the edge connection before handing back the channel.
 func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
-	t.Listener()
+	t.ensureOrigin()
 	return t.tunnelReady
 }
 

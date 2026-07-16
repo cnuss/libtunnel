@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -301,6 +302,9 @@ func (e loggerEngine) CACerts() []*x509.Certificate                { return nil 
 func (e loggerEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e loggerEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
 func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
+	return nil
+}
+func (e loggerEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], u *url.URL) error {
 	return nil
 }
 

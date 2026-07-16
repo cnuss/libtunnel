@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"sync"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -38,6 +39,11 @@ type Engine[T v1.Spec] interface {
 	// through t.Cancel. The core closes TunnelReady once WithListener returns
 	// nil and the hostname resolves publicly.
 	WithListener(t *TunnelImpl[T], l net.Listener) error
+	// WithLocalURL is WithListener's counterpart for URL origins: the core
+	// hands down the validated origin URL (scheme http/https, host set, path
+	// "/") when the tunnel's WithLocalURL fires. Same contract — invoked
+	// once, in its own goroutine, blocking until the edge connection is up.
+	WithLocalURL(t *TunnelImpl[T], u *url.URL) error
 }
 
 // New returns an unstarted tunnel for the given backend, which also supplies
@@ -55,7 +61,7 @@ func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		ctx:              ctx,
 		cancel:           cancel,
 		backend:          backend,
-		listenerProvided: make(chan struct{}),
+		originProvided:   make(chan struct{}),
 		hostnameProvided: make(chan struct{}),
 		tunnelReady:      make(chan struct{}),
 		hostnameReady:    make(chan struct{}),
@@ -106,12 +112,15 @@ type TunnelImpl[T v1.Spec] struct {
 	// New. Nil means a foreign backend — the tunnel is born canceled.
 	engine Engine[T]
 
-	// listenerOnce guards the one-time provide: the first WithListener or
-	// start-trigger mint wins and sets listener; a later WithListener is a
-	// double-provide and cancels the tunnel.
-	listenerOnce     sync.Once
-	listener         net.Listener
-	listenerProvided chan struct{}
+	// originOnce guards the one-time origin provide: the first WithListener,
+	// WithLocalURL, or start-trigger mint wins and sets exactly one of
+	// listener / localURL; a later provide of either kind is a double-provide
+	// and cancels the tunnel. The originProvided close is the happens-before
+	// edge for reading both fields.
+	originOnce     sync.Once
+	listener       net.Listener
+	localURL       *url.URL
+	originProvided chan struct{}
 
 	// userCtxOnce fixes userCtx: the first WithContext wins; a URL read
 	// before any WithContext fixes it to nil (unset). Nil means URL waits on
