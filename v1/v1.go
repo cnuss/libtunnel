@@ -23,6 +23,56 @@ import (
 // closing the listener returned from Tunnel.Listener.
 var ErrClosed = errors.New("tunnel closed")
 
+// The environment variables, centralized: every code knob with an
+// env-expressible value has a mirror here, and env beats code — an operator
+// reconfigures a deployed binary without a rebuild. (The one exception is
+// noted on LogEnv.) Each variable is read lazily, where its knob takes
+// effect, so the pure-lazy contract holds. Backend-scoped variables follow
+// LIBTUNNEL__<BACKEND>_<FIELD> (double underscore) and live with their
+// backend package (e.g. cloudflare.IDEnv).
+const (
+	// SpecEnv carries a JSON-encoded spec across a process boundary — the
+	// parent→child handoff channel. A parent that mints a spec exports it
+	// here; a child adopts it at construction and connects under the same
+	// hostname and credentials. The value is a tagged envelope (the backend
+	// that minted it plus its spec), so a child running a different backend
+	// fails loudly. First in the credential chain: it beats FromEnv and a
+	// code-pinned From spec.
+	SpecEnv = "LIBTUNNEL_SPEC"
+	// HostnameEnv is a plain-text mirror of the exported spec's hostname, set
+	// alongside SpecEnv for tooling that wants the public hostname without
+	// parsing the envelope. Export-only: libtunnel never adopts it.
+	HostnameEnv = "LIBTUNNEL_HOSTNAME"
+	// FromEnv replays a serialized spec by reference — hostname, file path,
+	// or literal JSON, resolved exactly like libtunnel.From — as From's
+	// environment mirror. Second in the credential chain: after SpecEnv,
+	// before a code-pinned From spec and minting. An unresolvable or
+	// foreign-backend reference is an error, not a fallthrough.
+	FromEnv = "LIBTUNNEL_FROM"
+	// LocalURLEnv overrides the local origin with a URL — WithLocalURL's
+	// environment mirror. Consulted at origin-provide time (WithListener,
+	// WithLocalURL, or a start-trigger mint), a set value supersedes whatever
+	// the code provided. An unparsable or non-http(s) value cancels the
+	// tunnel.
+	LocalURLEnv = "LIBTUNNEL_LOCAL_URL"
+	// TLSEnv fixes Backend.WithTLS from the environment
+	// (strconv.ParseBool syntax): set, the mutator is a no-op. An unparsable
+	// value fails the tunnel at connect.
+	TLSEnv = "LIBTUNNEL_TLS"
+	// HTTP2Env fixes Backend.WithHTTP2 from the environment, under the same
+	// rules as TLSEnv.
+	HTTP2Env = "LIBTUNNEL_HTTP2"
+	// LogEnv names the level (debug|info|warn|error) of the default logger:
+	// set, a tunnel with no WithLogger call logs to stderr at that level
+	// instead of staying silent. The env-beats-code exception: an explicit
+	// WithLogger keeps its handler — the environment carries a level, not a
+	// sink. An unknown value reads as info, with a warning.
+	LogEnv = "LIBTUNNEL_LOG"
+	// CacheDirEnv overrides where minted specs are cached and where From and
+	// Hosts look. Unset, a per-user location under os.UserCacheDir() is used.
+	CacheDirEnv = "LIBTUNNEL_CACHE_DIR"
+)
+
 // Spec is the credential/identity set a Provider yields. Each backend defines
 // a concrete spec type (cloudflare.Spec for the Cloudflare backend); the core
 // only needs the public hostname the spec encodes — everything else is
@@ -61,11 +111,15 @@ type Backend[T Spec] interface {
 	// WithTLS declares whether the local origin terminates TLS. True dials the
 	// listener over https (verification is off, so a self-signed cert is fine);
 	// false over http. Default false. Chainable:
-	// libtunnel.Cloudflare().WithTLS(true).
+	// libtunnel.Cloudflare().WithTLS(true). The LIBTUNNEL_TLS environment
+	// variable (strconv.ParseBool syntax) fixes the knob at backend
+	// construction and makes this call a no-op — env beats code; an
+	// unparsable value fails the tunnel at connect.
 	WithTLS(bool) Backend[T]
 	// WithHTTP2 declares whether the origin is dialed over HTTP/2 rather than
 	// HTTP/1.1. Independent of WithTLS, though a stdlib http.Server only
-	// negotiates HTTP/2 over TLS. Default false. Chainable.
+	// negotiates HTTP/2 over TLS. Default false. Chainable. LIBTUNNEL_HTTP2
+	// fixes it from the environment under the same rules as WithTLS.
 	WithHTTP2(bool) Backend[T]
 }
 
@@ -157,7 +211,11 @@ type Tunnel interface {
 	// Err reports why the tunnel ended (nil while it is alive).
 	Err() error
 
-	// WithLogger sets the logger, once. Unset, the tunnel is silent.
+	// WithLogger sets the logger, once. Unset, the tunnel is silent — unless
+	// the LIBTUNNEL_LOG environment variable names a level
+	// (debug|info|warn|error); then the default logs to stderr at that level.
+	// An explicit WithLogger keeps its handler either way: the environment
+	// carries a level, not a sink.
 	WithLogger(log *slog.Logger) Tunnel
 	// WithContext threads a caller context into URL, once: set, URL waits for
 	// the tunnel to be reachable end to end (TunnelReady), honoring the
@@ -175,6 +233,12 @@ type Tunnel interface {
 	// TunnelReady) minted a listener — cancels the tunnel (Err reports
 	// "origin already provided"). To let the tunnel supply the listener
 	// instead, skip WithListener and call Listener().
+	//
+	// The LIBTUNNEL_LOCAL_URL environment variable supersedes any provide —
+	// this listener, a WithLocalURL argument, or the start-trigger mint: env
+	// beats code, so an operator can redirect a deployed binary's origin
+	// without a rebuild. The override makes the origin a URL, with everything
+	// that implies (see WithLocalURL); an invalid value cancels the tunnel.
 	WithListener(l net.Listener) Tunnel
 	// WithLocalURL provides the local origin as the URL of an already-running
 	// local service (e.g. http://localhost:1234) and lazily starts the edge
@@ -185,9 +249,11 @@ type Tunnel interface {
 	// nil URL, a scheme other than http/https, or an empty host cancels the
 	// tunnel.
 	//
-	// The origin is provided exactly once — see WithListener. A URL origin
-	// has no tunnel-owned listener: Listener must not be called (it cancels
-	// the tunnel), and there is no handle whose Close shuts the tunnel down,
-	// so the tunnel runs until the process exits or the tunnel fails.
+	// The origin is provided exactly once — see WithListener, including the
+	// LIBTUNNEL_LOCAL_URL environment override, which supersedes this
+	// argument too. A URL origin has no tunnel-owned listener: Listener must
+	// not be called (it cancels the tunnel), and there is no handle whose
+	// Close shuts the tunnel down, so the tunnel runs until the process exits
+	// or the tunnel fails.
 	WithLocalURL(u *url.URL) Tunnel
 }

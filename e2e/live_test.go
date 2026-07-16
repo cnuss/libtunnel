@@ -29,6 +29,7 @@ import (
 	"golang.org/x/net/websocket"
 
 	"github.com/cnuss/libtunnel"
+	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 )
 
@@ -45,7 +46,7 @@ func TestLiveTunnel(t *testing.T) {
 	// environment (the Cloudflare chain adopts LIBTUNNEL_SPEC before minting).
 	if preflightSpec != nil {
 		if entry, err := v1alpha1.SpecEnviron("cloudflare", preflightSpec); err == nil {
-			t.Setenv(v1alpha1.SpecEnv, strings.TrimPrefix(entry, v1alpha1.SpecEnv+"="))
+			t.Setenv(v1.SpecEnv, strings.TrimPrefix(entry, v1.SpecEnv+"="))
 		}
 	}
 

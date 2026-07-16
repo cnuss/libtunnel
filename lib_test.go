@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cnuss/libtunnel"
+	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
@@ -48,7 +49,7 @@ func TestFromFile(t *testing.T) {
 // hostname replays the cached spec for it.
 func TestFromCachedHostname(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(v1alpha1.CacheDirEnv, dir)
+	t.Setenv(v1.CacheDirEnv, dir)
 	spec := &cloudflare.Spec{Hostname: "cached.trycloudflare.com"}
 	if err := os.WriteFile(filepath.Join(dir, "cached.trycloudflare.com.spec.json"), []byte(spec.Serialize()), 0o600); err != nil {
 		t.Fatal(err)
@@ -147,7 +148,7 @@ func TestReExecInheritsSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(v1alpha1.SpecEnv, strings.TrimPrefix(entry, v1alpha1.SpecEnv+"="))
+	t.Setenv(v1.SpecEnv, strings.TrimPrefix(entry, v1.SpecEnv+"="))
 
 	out, err := reexec("TestReExecInheritsSpec", roleEnv+"=reexec-child").CombinedOutput()
 	t.Logf("child output:\n%s", out)
@@ -215,7 +216,7 @@ func TestMalformedSpecEnv(t *testing.T) {
 		os.Exit(0) // unexpected: parent will flag the zero exit
 	}
 
-	cmd := reexec("TestMalformedSpecEnv", roleEnv+"=malformed-child", v1alpha1.SpecEnv+"={this is not json")
+	cmd := reexec("TestMalformedSpecEnv", roleEnv+"=malformed-child", v1.SpecEnv+"={this is not json")
 	out, err := cmd.CombinedOutput()
 	t.Logf("child output:\n%s", out)
 	if err == nil {

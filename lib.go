@@ -45,9 +45,11 @@ import (
 // Storable as a plain field — the backend spec type does not appear in it.
 type TunnelV1 = v1.Tunnel
 
-// CloudflareV1 is the backend type returned by Cloudflare: an alias for
-// v1.Backend[*cloudflare.Spec], re-exported so callers can name it without
-// importing v1 or the cloudflare package.
+// CloudflareV1 is the Cloudflare backend's contract type: an alias for
+// v1.Backend[*cloudflare.Spec], re-exported so callers can declare fields and
+// parameters without importing v1 or the cloudflare package. Cloudflare()
+// returns the concrete *cloudflare.Backend (which satisfies this), so the
+// backend-specific setters (WithID and friends) stay reachable.
 type CloudflareV1 = v1.Backend[*cloudflare.Spec]
 
 // New returns an unstarted tunnel on the given backend, which also supplies
@@ -66,13 +68,23 @@ func New[T v1.Spec](backend v1.Backend[T]) TunnelV1 {
 
 // Cloudflare returns the Cloudflare backend: an in-process cloudflared
 // quick-tunnel engine (no cloudflared binary required). Its credential chain
-// adopts a spec from the LIBTUNNEL_SPEC environment variable when a parent
-// process handed one off, mints an anonymous *.trycloudflare.com quick
-// tunnel otherwise, and exports a freshly minted spec back into the
-// environment so spawned children inherit the same tunnel identity. A spec
-// this process exported itself is never re-adopted: a second in-process
-// tunnel mints its own identity.
-func Cloudflare() CloudflareV1 {
+// resolves env first: adopt a spec from the LIBTUNNEL_SPEC environment
+// variable when a parent process handed one off, replay the spec
+// LIBTUNNEL_FROM references (hostname, file path, or literal JSON — From's
+// resolution), and mint an anonymous *.trycloudflare.com quick tunnel
+// otherwise. A resolved spec is exported back into the environment so
+// spawned children inherit the same tunnel identity; a spec this process
+// exported itself is never re-adopted — a second in-process tunnel mints its
+// own identity.
+//
+// Individual spec fields can be overridden with the backend's setters —
+// WithID, WithName, WithHostname, WithAccountTag, WithSecret — or their
+// LIBTUNNEL__CLOUDFLARE_* environment mirrors (env beats code, field by
+// field); a complete credential set skips resolution entirely. WithApiURL
+// (LIBTUNNEL__CLOUDFLARE_API_URL) points the mint at a different quick-tunnel
+// endpoint. Chain the backend-specific setters before WithTLS / WithHTTP2,
+// which return the CloudflareV1 interface.
+func Cloudflare() *cloudflare.Backend {
 	return cloudflare.New()
 }
 
@@ -89,6 +101,11 @@ func Cloudflare() CloudflareV1 {
 // connection. A spec that can't be parsed, or whose backend tag is unknown,
 // yields a tunnel already canceled with that cause — surfaced through
 // Err()/Done(), per the façade's no-error contract.
+//
+// The LIBTUNNEL_FROM environment variable is From's operator-side mirror: it
+// takes the same spec reference and replays it through any backend's
+// credential chain — including over a code-pinned From spec, after
+// LIBTUNNEL_SPEC (env beats code; SPEC beats FROM).
 func From(spec string) TunnelV1 {
 	return v1alpha1.From(spec, func(backend string, raw json.RawMessage) (v1.Tunnel, error) {
 		switch backend {
@@ -97,7 +114,7 @@ func From(spec string) TunnelV1 {
 			if err := json.Unmarshal(raw, s); err != nil {
 				return nil, fmt.Errorf("invalid cloudflare spec: %w", err)
 			}
-			return v1alpha1.New(cloudflare.FromSpec(s)), nil
+			return v1alpha1.New(cloudflare.From(s)), nil
 		default:
 			return nil, fmt.Errorf("unknown backend %q", backend)
 		}

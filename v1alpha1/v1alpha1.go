@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"os"
+	"strconv"
 	"sync"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -172,10 +174,49 @@ func (t *TunnelImpl[T]) Cancel(cause error) {
 
 // Logger is the tunnel's logger (never nil; silent by default). Exposed for
 // Engine implementations in subpackages. The first read without a prior
-// WithLogger fixes the silent default — the log field is write-once.
+// WithLogger fixes the default — the log field is write-once. The default is
+// silent unless v1.LogEnv names a level; then it is a stderr text logger at that
+// level.
 func (t *TunnelImpl[T]) Logger() *slog.Logger {
 	t.logOnce.Do(func() {
-		t.log = slog.New(slog.DiscardHandler)
+		t.log = defaultLogger()
 	})
 	return t.log
+}
+
+// defaultLogger builds the logger used when no WithLogger call fixed one:
+// silent, unless v1.LogEnv names a level — then a stderr text logger at that
+// level. An unknown value gets info plus a warning, so a typo surfaces
+// instead of silencing logs.
+func defaultLogger() *slog.Logger {
+	env, ok := os.LookupEnv(v1.LogEnv)
+	if !ok || env == "" {
+		return slog.New(slog.DiscardHandler)
+	}
+	var level slog.Level
+	err := level.UnmarshalText([]byte(env))
+	if err != nil {
+		level = slog.LevelInfo
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	if err != nil {
+		log.Warn("unknown log level, defaulting to info", "var", v1.LogEnv, "value", env)
+	}
+	return log
+}
+
+// EnvBool reads an env-fixed boolean knob for a backend: fixed reports
+// whether name is set (its value then overrides code), and err carries an
+// unparsable value for the backend to surface at connect — loud beats a
+// silently ignored override.
+func EnvBool(name string) (value, fixed bool, err error) {
+	env, ok := os.LookupEnv(name)
+	if !ok || env == "" {
+		return false, false, nil
+	}
+	v, err := strconv.ParseBool(env)
+	if err != nil {
+		return false, true, fmt.Errorf("%s: %w", name, err)
+	}
+	return v, true, nil
 }

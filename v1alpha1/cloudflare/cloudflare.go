@@ -5,10 +5,13 @@
 package cloudflare
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -60,40 +63,137 @@ var promMu sync.Mutex
 // LIBTUNNEL_SPEC envelope) — one source of truth so the tag never drifts.
 const backendName = "cloudflare"
 
+// Backend-scoped environment variables, following the
+// LIBTUNNEL__<BACKEND>_<FIELD> pattern (double underscore namespaces the
+// backend; the core variables are centralized in the v1 package). Each
+// mirrors a spec-field setter — WithID, WithName, WithHostname,
+// WithAccountTag, WithSecret — and env beats code, field by field, applied
+// when the spec resolves. Secret is base64 (the JSON []byte encoding); an
+// undecodable value fails spec resolution.
+const (
+	IDEnv         = "LIBTUNNEL__CLOUDFLARE_ID"
+	NameEnv       = "LIBTUNNEL__CLOUDFLARE_NAME"
+	HostnameEnv   = "LIBTUNNEL__CLOUDFLARE_HOSTNAME"
+	AccountTagEnv = "LIBTUNNEL__CLOUDFLARE_ACCOUNT_TAG"
+	SecretEnv     = "LIBTUNNEL__CLOUDFLARE_SECRET"
+	// APIURLEnv mirrors WithApiURL: the quick-tunnel mint endpoint (default
+	// https://api.trycloudflare.com/tunnel). Only the mint path uses it.
+	APIURLEnv = "LIBTUNNEL__CLOUDFLARE_API_URL"
+)
+
 // Backend is the cloudflared quick-tunnel engine. It carries the origin-scheme
 // settings declared via WithTLS / WithHTTP2; obtain a fresh one per tunnel from
-// libtunnel.Cloudflare(). Both settings default false.
+// libtunnel.Cloudflare(). Both settings default false, and both can be fixed
+// from the environment (LIBTUNNEL_TLS / LIBTUNNEL_HTTP2) — a fixed knob makes
+// its mutator a no-op.
 type Backend struct {
-	tls   bool
-	http2 bool
-	// provider, when set, pins the credential chain to a fixed spec (FromSpec /
-	// libtunnel.From). Nil uses the default adopt-LIBTUNNEL_SPEC-else-mint chain.
+	tls        bool
+	tlsFixed   bool
+	http2      bool
+	http2Fixed bool
+	// envErr is the first unparsable env knob, surfaced at connect: an
+	// operator override that can't be honored fails the tunnel loudly instead
+	// of being silently ignored.
+	envErr error
+	// provider, when set, pins the credential chain to a fixed spec (From /
+	// libtunnel.From). Nil lets the env chain fall through to minting.
 	provider v1.Provider[*Spec]
+	// fields carries the spec-field overrides set via WithID and friends,
+	// applied by the overlay provider when the spec resolves.
+	fields Spec
+	// apiURL overrides the quick-tunnel mint endpoint (WithApiURL). Empty
+	// means the default; APIURLEnv supersedes either.
+	apiURL string
 }
 
-// New returns the Cloudflare backend.
+// New returns the Cloudflare backend. The origin-scheme knobs are fixed from
+// the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set.
 func New() *Backend {
-	return &Backend{}
+	b := &Backend{}
+	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
+	if b.envErr == nil {
+		b.http2, b.http2Fixed, b.envErr = v1alpha1.EnvBool(v1.HTTP2Env)
+	}
+	return b
 }
 
-// FromSpec returns a Cloudflare backend pinned to spec: it connects with the
-// given credentials instead of adopting LIBTUNNEL_SPEC or minting. It backs
-// libtunnel.From.
-func FromSpec(spec *Spec) *Backend {
-	return &Backend{provider: v1alpha1.Static[*Spec](spec)}
+// From returns a Cloudflare backend pinned to spec: it connects with the
+// given credentials instead of minting. It backs libtunnel.From. The pin sits
+// at the end of the env chain, so LIBTUNNEL_SPEC and LIBTUNNEL_FROM still
+// override it (env beats code).
+func From(spec *Spec) *Backend {
+	b := New()
+	b.provider = v1alpha1.Static(spec)
+	return b
 }
 
 // WithTLS declares whether the origin terminates TLS (https vs http ingress).
-// Default false. Returns the backend for chaining.
+// Default false. A no-op when LIBTUNNEL_TLS fixed the knob from the
+// environment. Returns the backend for chaining.
 func (b *Backend) WithTLS(tls bool) v1.Backend[*Spec] {
-	b.tls = tls
+	if !b.tlsFixed {
+		b.tls = tls
+	}
 	return b
 }
 
 // WithHTTP2 declares whether the origin is dialed over HTTP/2. Default false.
-// Returns the backend for chaining.
+// A no-op when LIBTUNNEL_HTTP2 fixed the knob from the environment. Returns
+// the backend for chaining.
 func (b *Backend) WithHTTP2(http2 bool) v1.Backend[*Spec] {
-	b.http2 = http2
+	if !b.http2Fixed {
+		b.http2 = http2
+	}
+	return b
+}
+
+// The spec-field setters override individual fields of whatever spec the
+// credential chain resolves — adopt, replay, pin, or mint — and a complete
+// credential set (id, hostname, account tag, secret) short-circuits the
+// resolve entirely. Each is superseded field-by-field by its
+// LIBTUNNEL__CLOUDFLARE_* variable (env beats code). They return the concrete
+// backend, so chain them before the v1.Backend mutators (WithTLS, WithHTTP2),
+// which return the interface.
+
+// WithID overrides the tunnel ID (a UUID). Env mirror: LIBTUNNEL__CLOUDFLARE_ID.
+func (b *Backend) WithID(id string) *Backend {
+	b.fields.ID = id
+	return b
+}
+
+// WithName overrides the tunnel name. Env mirror: LIBTUNNEL__CLOUDFLARE_NAME.
+func (b *Backend) WithName(name string) *Backend {
+	b.fields.Name = name
+	return b
+}
+
+// WithHostname overrides the public hostname. Env mirror:
+// LIBTUNNEL__CLOUDFLARE_HOSTNAME.
+func (b *Backend) WithHostname(hostname string) *Backend {
+	b.fields.Hostname = hostname
+	return b
+}
+
+// WithAccountTag overrides the account tag. Env mirror:
+// LIBTUNNEL__CLOUDFLARE_ACCOUNT_TAG.
+func (b *Backend) WithAccountTag(tag string) *Backend {
+	b.fields.AccountTag = tag
+	return b
+}
+
+// WithSecret overrides the tunnel secret. Env mirror:
+// LIBTUNNEL__CLOUDFLARE_SECRET (base64, the JSON []byte encoding).
+func (b *Backend) WithSecret(secret []byte) *Backend {
+	b.fields.Secret = secret
+	return b
+}
+
+// WithApiURL overrides the quick-tunnel mint endpoint (default
+// https://api.trycloudflare.com/tunnel). Env mirror:
+// LIBTUNNEL__CLOUDFLARE_API_URL (env beats code). Only the mint path uses
+// it — adopted, replayed, and pinned specs never hit the API.
+func (b *Backend) WithApiURL(apiURL string) *Backend {
+	b.apiURL = apiURL
 	return b
 }
 
@@ -108,16 +208,86 @@ func (b *Backend) Name() string {
 	return backendName
 }
 
-// Provider is the Cloudflare credential chain: adopt LIBTUNNEL_SPEC from the
-// environment when a parent process handed one off, otherwise mint an
-// anonymous quick tunnel from api.trycloudflare.com. A backend built by
-// FromSpec instead yields its pinned spec. Mutators for named tunnels / other
-// endpoints will hang off Cloudflare() when they exist.
+// Provider is the Cloudflare credential chain, env first: adopt
+// LIBTUNNEL_SPEC when a parent process handed one off; apply the spec-field
+// overrides (WithID and friends plus their LIBTUNNEL__CLOUDFLARE_* mirrors —
+// a complete credential set stops here); replay the spec LIBTUNNEL_FROM
+// references; then the code-pinned spec (From); and finally mint an anonymous
+// quick tunnel from api.trycloudflare.com.
 func (b *Backend) Provider() v1.Provider[*Spec] {
-	if b.provider != nil {
-		return b.provider
+	next := b.provider
+	if next == nil {
+		qt := QuickTunnel()
+		qt.URL = b.apiURL
+		stringEnv(APIURLEnv, &qt.URL)
+		next = qt
 	}
-	return v1alpha1.Env(b.Name(), QuickTunnel())
+	return v1alpha1.Env(b.Name(), overlay{fields: b.fields, next: v1alpha1.Replay(b.Name(), next)})
+}
+
+// overlay applies the spec-field overrides: fields (the WithID-family
+// setters), each superseded by its LIBTUNNEL__CLOUDFLARE_* variable. A
+// complete credential set — id, hostname, account tag, secret — is a spec of
+// its own and short-circuits the chain below; a partial one patches whatever
+// the chain resolves, non-zero fields only.
+type overlay struct {
+	fields Spec
+	next   v1.Provider[*Spec]
+}
+
+// SetLogger forwards the tunnel's logger to the wrapped provider.
+func (p overlay) SetLogger(log *slog.Logger) {
+	if pl, ok := p.next.(v1alpha1.LoggerSetter); ok {
+		pl.SetLogger(log)
+	}
+}
+
+func (p overlay) Spec(ctx context.Context) (*Spec, error) {
+	fields := p.fields
+	stringEnv(IDEnv, &fields.ID)
+	stringEnv(NameEnv, &fields.Name)
+	stringEnv(HostnameEnv, &fields.Hostname)
+	stringEnv(AccountTagEnv, &fields.AccountTag)
+	if v := os.Getenv(SecretEnv); v != "" {
+		secret, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", SecretEnv, err)
+		}
+		fields.Secret = secret
+	}
+
+	if fields.ID != "" && fields.Hostname != "" && fields.AccountTag != "" && len(fields.Secret) > 0 {
+		return &fields, nil
+	}
+
+	base, err := p.next.Spec(ctx)
+	if err != nil {
+		return nil, err
+	}
+	merged := *base
+	stringField(fields.ID, &merged.ID)
+	stringField(fields.Name, &merged.Name)
+	stringField(fields.Hostname, &merged.Hostname)
+	stringField(fields.AccountTag, &merged.AccountTag)
+	if len(fields.Secret) > 0 {
+		merged.Secret = fields.Secret
+	}
+	return &merged, nil
+}
+
+// stringEnv overwrites *field with the env variable's value when it is set
+// and non-empty.
+func stringEnv(name string, field *string) {
+	if v := os.Getenv(name); v != "" {
+		*field = v
+	}
+}
+
+// stringField overwrites *field with override when the override is non-zero.
+func stringField(override string, field *string) {
+	if override != "" {
+		*field = override
+	}
 }
 
 // caCerts parses the trust set once per process: the Mozilla bundle is a
@@ -175,6 +345,9 @@ func (b *Backend) WithLocalURL(t *v1alpha1.TunnelImpl[*Spec], u *url.URL) error 
 // connect is the shared engine body behind WithListener and WithLocalURL:
 // service is the cloudflared ingress service URL the edge proxies to.
 func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
+	if b.envErr != nil {
+		return b.envErr
+	}
 	ctx := t.Context()
 	log := zerologger(t.Logger())
 	spec := t.Spec()
