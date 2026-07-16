@@ -244,7 +244,7 @@ func TestLiveResurrection(t *testing.T) {
 			}
 		}
 		cmd.Wait()
-		t.Fatalf("child[%s] exited before the tunnel became ready", body)
+		t.Fatalf("child[%s] exited before the tunnel became ready (scan err: %v)", body, scanner.Err())
 		return nil
 	}
 
