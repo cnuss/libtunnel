@@ -63,24 +63,6 @@ var promMu sync.Mutex
 // LIBTUNNEL_SPEC envelope) — one source of truth so the tag never drifts.
 const backendName = "cloudflare"
 
-// Backend-scoped environment variables, following the
-// LIBTUNNEL__<BACKEND>_<FIELD> pattern (double underscore namespaces the
-// backend; the core variables are centralized in the v1 package). Each
-// mirrors a spec-field setter — WithID, WithName, WithHostname,
-// WithAccountTag, WithSecret — and env beats code, field by field, applied
-// when the spec resolves. Secret is base64 (the JSON []byte encoding); an
-// undecodable value fails spec resolution.
-const (
-	IDEnv         = "LIBTUNNEL__CLOUDFLARE_ID"
-	NameEnv       = "LIBTUNNEL__CLOUDFLARE_NAME"
-	HostnameEnv   = "LIBTUNNEL__CLOUDFLARE_HOSTNAME"
-	AccountTagEnv = "LIBTUNNEL__CLOUDFLARE_ACCOUNT_TAG"
-	SecretEnv     = "LIBTUNNEL__CLOUDFLARE_SECRET"
-	// APIURLEnv mirrors WithApiURL: the quick-tunnel mint endpoint (default
-	// https://api.trycloudflare.com/tunnel). Only the mint path uses it.
-	APIURLEnv = "LIBTUNNEL__CLOUDFLARE_API_URL"
-)
-
 // Backend is the cloudflared quick-tunnel engine. It carries the origin-scheme
 // settings declared via WithTLS / WithHTTP2; obtain a fresh one per tunnel from
 // libtunnel.Cloudflare(). Both settings default false, and both can be fixed
@@ -102,7 +84,7 @@ type Backend struct {
 	// applied by the overlay provider when the spec resolves.
 	fields Spec
 	// apiURL overrides the quick-tunnel mint endpoint (WithApiURL). Empty
-	// means the default; APIURLEnv supersedes either.
+	// means the default; v1.CloudflareAPIURLEnv supersedes either.
 	apiURL string
 }
 
@@ -219,7 +201,7 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 	if next == nil {
 		qt := QuickTunnel()
 		qt.URL = b.apiURL
-		stringEnv(APIURLEnv, &qt.URL)
+		stringEnv(v1.CloudflareAPIURLEnv, &qt.URL)
 		next = qt
 	}
 	return v1alpha1.Env(b.Name(), overlay{fields: b.fields, next: v1alpha1.Replay(b.Name(), next)})
@@ -244,14 +226,14 @@ func (p overlay) SetLogger(log *slog.Logger) {
 
 func (p overlay) Spec(ctx context.Context) (*Spec, error) {
 	fields := p.fields
-	stringEnv(IDEnv, &fields.ID)
-	stringEnv(NameEnv, &fields.Name)
-	stringEnv(HostnameEnv, &fields.Hostname)
-	stringEnv(AccountTagEnv, &fields.AccountTag)
-	if v := os.Getenv(SecretEnv); v != "" {
+	stringEnv(v1.CloudflareIDEnv, &fields.ID)
+	stringEnv(v1.CloudflareNameEnv, &fields.Name)
+	stringEnv(v1.CloudflareHostnameEnv, &fields.Hostname)
+	stringEnv(v1.CloudflareAccountTagEnv, &fields.AccountTag)
+	if v := os.Getenv(v1.CloudflareSecretEnv); v != "" {
 		secret, err := base64.StdEncoding.DecodeString(v)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", SecretEnv, err)
+			return nil, fmt.Errorf("%s: %w", v1.CloudflareSecretEnv, err)
 		}
 		fields.Secret = secret
 	}

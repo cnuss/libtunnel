@@ -78,8 +78,8 @@ func TestEnvKnobsUnsetLeaveCodeInCharge(t *testing.T) {
 // exactly the channel it stages.
 func clearSpecEnv(t *testing.T) {
 	t.Helper()
-	for _, v := range []string{v1.SpecEnv, v1.FromEnv, cloudflare.IDEnv, cloudflare.NameEnv,
-		cloudflare.HostnameEnv, cloudflare.AccountTagEnv, cloudflare.SecretEnv, cloudflare.APIURLEnv} {
+	for _, v := range []string{v1.SpecEnv, v1.FromEnv, v1.CloudflareIDEnv, v1.CloudflareNameEnv,
+		v1.CloudflareHostnameEnv, v1.CloudflareAccountTagEnv, v1.CloudflareSecretEnv, v1.CloudflareAPIURLEnv} {
 		t.Setenv(v, "")
 	}
 }
@@ -103,7 +103,7 @@ func TestSpecFieldSettersPatchResolvedSpec(t *testing.T) {
 // LIBTUNNEL__CLOUDFLARE_* variable wins over the WithX setter.
 func TestSpecFieldEnvBeatsCode(t *testing.T) {
 	clearSpecEnv(t)
-	t.Setenv(cloudflare.NameEnv, "from-env")
+	t.Setenv(v1.CloudflareNameEnv, "from-env")
 
 	b := cloudflare.From(&cloudflare.Spec{Hostname: "pinned.trycloudflare.com"}).WithName("from-code")
 	spec, err := b.Provider().Spec(context.Background())
@@ -120,11 +120,11 @@ func TestSpecFieldEnvBeatsCode(t *testing.T) {
 // (an attempted mint would fail offline against the bogus API URL).
 func TestCompleteFieldSetShortCircuitsMint(t *testing.T) {
 	clearSpecEnv(t)
-	t.Setenv(cloudflare.IDEnv, "3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6")
-	t.Setenv(cloudflare.HostnameEnv, "fields.trycloudflare.com")
-	t.Setenv(cloudflare.AccountTagEnv, "tag")
-	t.Setenv(cloudflare.SecretEnv, "c2VjcmV0")
-	t.Setenv(cloudflare.APIURLEnv, "http://127.0.0.1:1/nope")
+	t.Setenv(v1.CloudflareIDEnv, "3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6")
+	t.Setenv(v1.CloudflareHostnameEnv, "fields.trycloudflare.com")
+	t.Setenv(v1.CloudflareAccountTagEnv, "tag")
+	t.Setenv(v1.CloudflareSecretEnv, "c2VjcmV0")
+	t.Setenv(v1.CloudflareAPIURLEnv, "http://127.0.0.1:1/nope")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -140,11 +140,11 @@ func TestCompleteFieldSetShortCircuitsMint(t *testing.T) {
 // TestSecretEnvUndecodableErrors pins loud failure for a bad secret override.
 func TestSecretEnvUndecodableErrors(t *testing.T) {
 	clearSpecEnv(t)
-	t.Setenv(cloudflare.SecretEnv, "%%%not-base64%%%")
+	t.Setenv(v1.CloudflareSecretEnv, "%%%not-base64%%%")
 
 	_, err := cloudflare.From(&cloudflare.Spec{Hostname: "pinned.trycloudflare.com"}).Provider().Spec(context.Background())
-	if err == nil || !strings.Contains(err.Error(), cloudflare.SecretEnv) {
-		t.Errorf("Spec err = %v, want a %s decode failure", err, cloudflare.SecretEnv)
+	if err == nil || !strings.Contains(err.Error(), v1.CloudflareSecretEnv) {
+		t.Errorf("Spec err = %v, want a %s decode failure", err, v1.CloudflareSecretEnv)
 	}
 }
 
@@ -157,7 +157,7 @@ func TestApiURLEnvBeatsCode(t *testing.T) {
 		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
-	t.Setenv(cloudflare.APIURLEnv, srv.URL)
+	t.Setenv(v1.CloudflareAPIURLEnv, srv.URL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

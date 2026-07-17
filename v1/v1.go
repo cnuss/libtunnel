@@ -27,9 +27,7 @@ var ErrClosed = errors.New("tunnel closed")
 // env-expressible value has a mirror here, and env beats code — an operator
 // reconfigures a deployed binary without a rebuild. (The one exception is
 // noted on LogEnv.) Each variable is read lazily, where its knob takes
-// effect, so the pure-lazy contract holds. Backend-scoped variables follow
-// LIBTUNNEL__<BACKEND>_<FIELD> (double underscore) and live with their
-// backend package (e.g. cloudflare.IDEnv).
+// effect, so the pure-lazy contract holds.
 const (
 	// SpecEnv carries a JSON-encoded spec across a process boundary — the
 	// parent→child handoff channel. A parent that mints a spec exports it
@@ -71,6 +69,27 @@ const (
 	// CacheDirEnv overrides where minted specs are cached and where From and
 	// Hosts look. Unset, a per-user location under os.UserCacheDir() is used.
 	CacheDirEnv = "LIBTUNNEL_CACHE_DIR"
+)
+
+// The Cloudflare backend's variables, following the backend-scoped
+// LIBTUNNEL__<BACKEND>_<FIELD> pattern (double underscore namespaces the
+// backend). Each mirrors a spec-field setter on the Cloudflare backend —
+// WithID, WithName, WithHostname, WithAccountTag, WithSecret — and env beats
+// code, field by field, applied when the spec resolves: a complete credential
+// set (id, hostname, account tag, secret) is a spec of its own and skips
+// resolution, a partial one patches whatever the chain resolves.
+const (
+	CloudflareIDEnv         = "LIBTUNNEL__CLOUDFLARE_ID"
+	CloudflareNameEnv       = "LIBTUNNEL__CLOUDFLARE_NAME"
+	CloudflareHostnameEnv   = "LIBTUNNEL__CLOUDFLARE_HOSTNAME"
+	CloudflareAccountTagEnv = "LIBTUNNEL__CLOUDFLARE_ACCOUNT_TAG"
+	// CloudflareSecretEnv carries the tunnel secret, base64-encoded (the
+	// JSON []byte encoding); an undecodable value fails spec resolution.
+	CloudflareSecretEnv = "LIBTUNNEL__CLOUDFLARE_SECRET"
+	// CloudflareAPIURLEnv mirrors WithApiURL: the quick-tunnel mint endpoint
+	// (default https://api.trycloudflare.com/tunnel). Only the mint path
+	// uses it.
+	CloudflareAPIURLEnv = "LIBTUNNEL__CLOUDFLARE_API_URL"
 )
 
 // Spec is the credential/identity set a Provider yields. Each backend defines
