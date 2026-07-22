@@ -9,4 +9,4 @@ import "time"
 func (b *Backend) TLS() bool                     { return b.tls }
 func (b *Backend) HTTP2() bool                   { return b.http2 }
 func (b *Backend) EnvErr() error                 { return b.envErr }
-func (b *Backend) FlushInterval() *time.Duration { return b.chopInterval }
+func (b *Backend) FlushInterval() *time.Duration { return b.flushInterval }

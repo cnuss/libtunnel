@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"runtime"
@@ -86,13 +88,13 @@ type Backend struct {
 	// apiURL overrides the quick-tunnel mint endpoint (WithApiURL). Empty
 	// means the default; v1.CloudflareAPIURLEnv supersedes either.
 	apiURL string
-	// chopInterval, when non-nil, sets the wrapped listener's clean-close
-	// cadence (edge-flush trigger a) via WithFlushInterval — the shim "chops"
-	// the response to force the flush. Nil means off. chopFixed records that
-	// LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL fixed it, so WithFlushInterval is a
-	// no-op (env beats code).
-	chopInterval *time.Duration
-	chopFixed    bool
+	// flushInterval, when non-nil, engages the reverse-proxy shim
+	// (wrapped_listener.go) with httputil.ReverseProxy.FlushInterval set to its
+	// value. Nil means off (cloudflared dials the origin directly). flushFixed
+	// records that LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL fixed it, so
+	// WithFlushInterval is a no-op (env beats code).
+	flushInterval *time.Duration
+	flushFixed    bool
 }
 
 // New returns the Cloudflare backend. The origin-scheme knobs are fixed from
@@ -107,9 +109,9 @@ func New() *Backend {
 	}
 	if b.envErr == nil {
 		var d time.Duration
-		d, b.chopFixed, b.envErr = v1alpha1.EnvDuration(v1.CloudflareFlushIntervalEnv)
-		if b.chopFixed && b.envErr == nil {
-			b.chopInterval = &d
+		d, b.flushFixed, b.envErr = v1alpha1.EnvDuration(v1.CloudflareFlushIntervalEnv)
+		if b.flushFixed && b.envErr == nil {
+			b.flushInterval = &d
 		}
 	}
 	return b
@@ -195,28 +197,25 @@ func (b *Backend) WithApiURL(apiURL string) *Backend {
 	return b
 }
 
-// WithFlushInterval bounds streaming-response latency in TIME — the analog of
-// httputil.ReverseProxy.FlushInterval for the trycloudflare edge. A quick tunnel
-// buffers a chunked 200 response at the edge and only releases it on a clean
-// response end (terminal chunk) or once 128 KiB of body accumulates; a slow
-// watch stream can otherwise stall unboundedly. This knob interposes a session
-// shim between cloudflared and the origin (see wrapped_listener.go): it holds
-// ONE origin connection per logical request and ends the downstream response
-// cleanly every d — the mechanism "chops" the response — forcing the edge flush,
-// while a re-issuing client (the kubectl re-watch shape) reattaches to the same
-// origin stream. Per-event delivery latency is then bounded by ~d instead of the
-// edge's buffer.
+// WithFlushInterval interposes an httputil.ReverseProxy between cloudflared and
+// the origin (see wrapped_listener.go) and sets its FlushInterval to d, carrying
+// the stdlib semantics exactly: the client-facing response body is flushed every
+// d while it is being copied from the origin, so a slow streaming response is
+// pushed downstream on that cadence instead of pooling in a buffer. d <= 0 uses
+// the stdlib default (no periodic flush), and ReverseProxy flushes recognized
+// streaming responses immediately regardless of d. The proxy also owns the
+// origin dial, adding TLS (InsecureSkipVerify) when the origin scheme is https.
 //
-// The shim is contract-safe: it never mutates the origin's status, headers, or
-// body — it only re-frames the same bytes across successive clean-closed
-// responses. Default off (nil): no shim, cloudflared dials the origin directly.
-// Setting a positive d engages the shim. Env mirror:
+// Every response — streaming or fixed Content-Length — is relayed verbatim;
+// status, headers, and body are the origin's, untouched. Default off (nil): no
+// shim, cloudflared dials the origin directly. Setting the knob (any d,
+// including 0) engages the shim. Env mirror:
 // LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL (time.ParseDuration syntax) fixes the
 // knob and makes this call a no-op — env beats code. Returns the backend for
 // chaining.
 func (b *Backend) WithFlushInterval(d time.Duration) *Backend {
-	if !b.chopFixed {
-		b.chopInterval = &d
+	if !b.flushFixed {
+		b.flushInterval = &d
 	}
 	return b
 }
@@ -372,28 +371,23 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	if b.envErr != nil {
 		return b.envErr
 	}
-	// The flush-interval lever engages the session shim; unset, the origin is
-	// dialed directly (path untouched).
-	if b.chopInterval != nil {
-		u, err := url.Parse(service)
+	// The flush-interval lever interposes the reverse-proxy shim; unset, the
+	// origin is dialed directly (path untouched).
+	if b.flushInterval != nil {
+		origin, err := url.Parse(service)
 		if err != nil {
-			return fmt.Errorf("wrapped listener: %w", err)
+			return fmt.Errorf("reverse-proxy shim: %w", err)
 		}
-		// The origin scheme decides how the shim dials the origin; it is dropped
-		// from the ingress URL below because the shim itself owns the origin hop.
-		originTLS := u.Scheme == "https"
-		wl, err := newWrappedListener(t.Context(), t.Logger(), u.Host, originTLS, *b.chopInterval)
+		addr, err := interposeReverseProxy(t.Context(), t.Logger(), origin, *b.flushInterval)
 		if err != nil {
-			return fmt.Errorf("wrapped listener: %w", err)
+			return fmt.Errorf("reverse-proxy shim: %w", err)
 		}
 		// cloudflared -> shim is ALWAYS plaintext: the shim listens on a plain
 		// TCP socket, so the ingress service must be http regardless of the
 		// origin's scheme (a leftover https here would make cloudflared TLS-dial
 		// the plaintext shim → 502). The shim re-dials the origin itself, adding
-		// TLS back on that hop when originTLS is set.
-		u.Scheme = "http"
-		u.Host = wl.Addr().String()
-		service = u.String()
+		// TLS back on that hop when the origin scheme is https.
+		service = (&url.URL{Scheme: "http", Host: addr}).String()
 	}
 	ctx := t.Context()
 	log := zerologger(t.Logger())
@@ -550,6 +544,46 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	case <-connected.Wait():
 	}
 	return nil
+}
+
+// interposeReverseProxy binds a plaintext listener cloudflared can dial and
+// serves an httputil.ReverseProxy on it that relays to origin, returning the
+// listener's address. Engaged by WithFlushInterval: the proxy's FlushInterval is
+// set to flushInterval (stdlib semantics — flush the client response body every
+// flushInterval; streaming responses flush immediately). When the origin scheme
+// is https the Transport dials it over TLS with InsecureSkipVerify, matching the
+// engine's always-off origin verification; cloudflared reaches the shim itself
+// over plaintext. Every response is relayed verbatim — status, headers, body
+// untouched. The listener and its server are torn down when ctx is cancelled.
+func interposeReverseProxy(ctx context.Context, log *slog.Logger, origin *url.URL, flushInterval time.Duration) (string, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", err
+	}
+
+	transport := http.DefaultTransport
+	if origin.Scheme == "https" {
+		transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Transport:     transport,
+		FlushInterval: flushInterval,
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(origin)
+			// Preserve the inbound Host: the origin (e.g. an apiserver) may key
+			// on it, and the stdlib default would rewrite it to the origin host.
+			r.Out.Host = r.In.Host
+		},
+		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelDebug),
+	}
+
+	srv := &http.Server{Handler: proxy}
+	context.AfterFunc(ctx, func() { srv.Close() })
+	go srv.Serve(l)
+
+	log.Info("reverse-proxy shim interposed", "listen", l.Addr().String(), "origin", origin.Redacted(), "flushInterval", flushInterval)
+	return l.Addr().String(), nil
 }
 
 // noopImpl satisfies the metrics interfaces cloudflared insists on with
