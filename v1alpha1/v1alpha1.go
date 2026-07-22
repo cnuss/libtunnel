@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1/resolver"
@@ -219,6 +220,22 @@ func EnvBool(name string) (value, fixed bool, err error) {
 	v, err := strconv.ParseBool(env)
 	if err != nil {
 		return false, true, fmt.Errorf("%s: %w", name, err)
+	}
+	return v, true, nil
+}
+
+// EnvDuration reads an env-fixed duration knob for a backend, the sibling of
+// EnvBool: fixed reports whether name is set (its value then overrides code),
+// and err carries an unparsable value for the backend to surface at connect.
+// The value uses time.ParseDuration syntax (e.g. "1s", "500ms").
+func EnvDuration(name string) (value time.Duration, fixed bool, err error) {
+	env, ok := os.LookupEnv(name)
+	if !ok || env == "" {
+		return 0, false, nil
+	}
+	v, err := time.ParseDuration(env)
+	if err != nil {
+		return 0, true, fmt.Errorf("%s: %w", name, err)
 	}
 	return v, true, nil
 }

@@ -86,15 +86,31 @@ type Backend struct {
 	// apiURL overrides the quick-tunnel mint endpoint (WithApiURL). Empty
 	// means the default; v1.CloudflareAPIURLEnv supersedes either.
 	apiURL string
+	// chopInterval, when non-nil, sets the wrapped listener's clean-close
+	// cadence (edge-flush trigger a) via WithFlushInterval — the shim "chops"
+	// the response to force the flush. Nil means off. chopFixed records that
+	// LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL fixed it, so WithFlushInterval is a
+	// no-op (env beats code).
+	chopInterval *time.Duration
+	chopFixed    bool
 }
 
 // New returns the Cloudflare backend. The origin-scheme knobs are fixed from
-// the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set.
+// the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set, and the
+// streaming-buffer lever when LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL is set. The
+// first unparsable value wins and is surfaced at connect.
 func New() *Backend {
 	b := &Backend{}
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
 	if b.envErr == nil {
 		b.http2, b.http2Fixed, b.envErr = v1alpha1.EnvBool(v1.HTTP2Env)
+	}
+	if b.envErr == nil {
+		var d time.Duration
+		d, b.chopFixed, b.envErr = v1alpha1.EnvDuration(v1.CloudflareFlushIntervalEnv)
+		if b.chopFixed && b.envErr == nil {
+			b.chopInterval = &d
+		}
 	}
 	return b
 }
@@ -176,6 +192,32 @@ func (b *Backend) WithSecret(secret []byte) *Backend {
 // it — adopted, replayed, and pinned specs never hit the API.
 func (b *Backend) WithApiURL(apiURL string) *Backend {
 	b.apiURL = apiURL
+	return b
+}
+
+// WithFlushInterval bounds streaming-response latency in TIME — the analog of
+// httputil.ReverseProxy.FlushInterval for the trycloudflare edge. A quick tunnel
+// buffers a chunked 200 response at the edge and only releases it on a clean
+// response end (terminal chunk) or once 128 KiB of body accumulates; a slow
+// watch stream can otherwise stall unboundedly. This knob interposes a session
+// shim between cloudflared and the origin (see wrapped_listener.go): it holds
+// ONE origin connection per logical request and ends the downstream response
+// cleanly every d — the mechanism "chops" the response — forcing the edge flush,
+// while a re-issuing client (the kubectl re-watch shape) reattaches to the same
+// origin stream. Per-event delivery latency is then bounded by ~d instead of the
+// edge's buffer.
+//
+// The shim is contract-safe: it never mutates the origin's status, headers, or
+// body — it only re-frames the same bytes across successive clean-closed
+// responses. Default off (nil): no shim, cloudflared dials the origin directly.
+// Setting a positive d engages the shim. Env mirror:
+// LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL (time.ParseDuration syntax) fixes the
+// knob and makes this call a no-op — env beats code. Returns the backend for
+// chaining.
+func (b *Backend) WithFlushInterval(d time.Duration) *Backend {
+	if !b.chopFixed {
+		b.chopInterval = &d
+	}
 	return b
 }
 
@@ -329,6 +371,20 @@ func (b *Backend) WithLocalURL(t *v1alpha1.TunnelImpl[*Spec], u *url.URL) error 
 func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	if b.envErr != nil {
 		return b.envErr
+	}
+	// The flush-interval lever engages the session shim; unset, the origin is
+	// dialed directly (path untouched).
+	if b.chopInterval != nil {
+		u, err := url.Parse(service)
+		if err != nil {
+			return fmt.Errorf("wrapped listener: %w", err)
+		}
+		wl, err := newWrappedListener(t.Context(), t.Logger(), u.Host, *b.chopInterval)
+		if err != nil {
+			return fmt.Errorf("wrapped listener: %w", err)
+		}
+		u.Host = wl.Addr().String()
+		service = u.String()
 	}
 	ctx := t.Context()
 	log := zerologger(t.Logger())

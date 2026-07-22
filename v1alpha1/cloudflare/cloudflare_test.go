@@ -74,6 +74,46 @@ func TestEnvKnobsUnsetLeaveCodeInCharge(t *testing.T) {
 	}
 }
 
+// TestEnvFixesStreamingLevers pins env-beats-code for the Cloudflare streaming
+// lever: LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL fixes the knob at construction and
+// WithFlushInterval becomes a no-op.
+func TestEnvFixesStreamingLevers(t *testing.T) {
+	t.Setenv(v1.CloudflareFlushIntervalEnv, "500ms")
+
+	b := cloudflare.New()
+	b.WithFlushInterval(5 * time.Second) // loses: env fixed 500ms
+
+	if got := b.FlushInterval(); got == nil || *got != 500*time.Millisecond {
+		t.Errorf("FlushInterval = %v, want the LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL=500ms value to stick over WithFlushInterval(5s)", got)
+	}
+	if err := b.EnvErr(); err != nil {
+		t.Errorf("EnvErr = %v, want nil", err)
+	}
+}
+
+// TestStreamingLeversUnsetLeaveCodeInCharge pins the fallthrough: without the
+// env var the mutator works exactly as written.
+func TestStreamingLeversUnsetLeaveCodeInCharge(t *testing.T) {
+	t.Setenv(v1.CloudflareFlushIntervalEnv, "")
+
+	b := cloudflare.New().WithFlushInterval(2 * time.Second)
+
+	if got := b.FlushInterval(); got == nil || *got != 2*time.Second {
+		t.Errorf("FlushInterval = %v, want 2s from code", got)
+	}
+}
+
+// TestFlushIntervalEnvUnparsableSetsEnvErr pins loud failure for a bad duration
+// override: New records the parse error, which connect later surfaces (as
+// TestEnvKnobUnparsableFailsConnect proves for the bool knobs).
+func TestFlushIntervalEnvUnparsableSetsEnvErr(t *testing.T) {
+	t.Setenv(v1.CloudflareFlushIntervalEnv, "banana")
+
+	if err := cloudflare.New().EnvErr(); err == nil || !strings.Contains(err.Error(), v1.CloudflareFlushIntervalEnv) {
+		t.Errorf("EnvErr = %v, want a %s parse cause", err, v1.CloudflareFlushIntervalEnv)
+	}
+}
+
 // clearSpecEnv scrubs the credential-chain env vars so a test resolves
 // exactly the channel it stages.
 func clearSpecEnv(t *testing.T) {

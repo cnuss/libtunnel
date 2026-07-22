@@ -34,6 +34,7 @@ import (
 	"github.com/cnuss/libtunnel"
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
 // TestLiveTunnel mints one tunnel and runs every scenario that doesn't need
@@ -424,5 +425,98 @@ func TestLiveTwoTunnels(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
+	}
+}
+
+// TestLiveWatchFlushInterval is the LIVE end-to-end proof of the Cloudflare
+// backend's flush-interval lever (WithFlushInterval) on a kubernetes-shaped
+// watch: a long-lived (~30s) chunked HTTP 200 stream of 30 small events, 1s
+// apart. The events are tiny, so over 30s they never accumulate the edge's 128
+// KiB flush threshold — a PLAIN 200 would sit buffered and dump all 30 at the
+// 30s close. The shim ends the current downstream response CLEANLY every 1s (the
+// edge's other flush trigger), so each event reaches the client within ~interval
+// instead of bunching at close, while the origin sees exactly ONE watch request
+// across every reconnect.
+//
+// The client re-issues the IDENTICAL request after each short response (the
+// kubectl re-watch shape); the session table reattaches it to the live stream.
+func TestLiveWatchFlushInterval(t *testing.T) {
+	gateLive(t)
+	adoptPreflightSpec(t) // reuse the preflight mint instead of minting our own
+
+	srv, originHits := startWatchOrigin(t)
+	origin, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	const chop = 1 * time.Second
+	conn := libtunnel.New(cloudflare.New().WithFlushInterval(chop)).
+		WithLogger(slog.Default()).
+		WithContext(ctx).
+		WithLocalURL(origin)
+
+	pub := conn.URL()
+	if pub == nil {
+		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", conn.Err(), ctx.Err())
+	}
+	base := strings.TrimRight(pub.String(), "/")
+	t.Logf("tunnel up via chop shim (chop=%v): %s", chop, base)
+	warmup(t, ctx, base+"/watch?n=1&ms=1", 45*time.Second)
+
+	// One logical kube watch: 30 events, 1s apart (~30s of stream), requested
+	// with the SAME url every time so reconnects reattach to the session.
+	const (
+		total    = 30
+		interval = 1 * time.Second
+	)
+	watchURL := base + "/watch?probe=watch&n=30&ms=1000"
+
+	seen := map[int]bool{}
+	var ordered []int
+	var maxLat time.Duration
+	requests := 0
+	deadline := time.Now().Add(55 * time.Second)
+	for len(seen) < total && time.Now().Before(deadline) {
+		requests++
+		for _, ev := range chopStream(t, ctx, watchURL) {
+			if !seen[ev.seq] {
+				seen[ev.seq] = true
+				ordered = append(ordered, ev.seq)
+				if ev.latency > maxLat {
+					maxLat = ev.latency
+				}
+			}
+		}
+	}
+
+	t.Logf("collected %d/%d events over %d downstream requests; origin requests=%d; max per-event latency %v",
+		len(seen), total, requests, originHits.Load(), maxLat.Round(time.Millisecond))
+
+	if len(seen) != total {
+		t.Fatalf("collected %d events, want %d", len(seen), total)
+	}
+	for i, seq := range ordered {
+		if seq != i {
+			t.Fatalf("event %d arrived as seq %d — out of order or gapped across reconnects", i, seq)
+		}
+	}
+	// The core claims, in order of importance:
+	// 1. The origin saw ONE watch request across all the chops.
+	if got := originHits.Load(); got != 1 {
+		t.Errorf("origin received %d watch requests, want exactly 1 (session must shield the origin)", got)
+	}
+	// 2. Each event arrived promptly (~chop + edge/reconnect slop), NOT bunched
+	//    at the 30s close as a plain buffered 200 would.
+	if limit := chop + 2*time.Second; maxLat > limit {
+		t.Errorf("max per-event latency %v, want <= %v (chop should bound delivery, not bunch at close)", maxLat, limit)
+	}
+	// 3. The chop actually cycled — one giant response proves nothing.
+	if requests < 5 {
+		t.Errorf("only %d downstream request(s) for a %v stream with a %v chop — reconnect never exercised",
+			requests, time.Duration(total)*interval, chop)
 	}
 }

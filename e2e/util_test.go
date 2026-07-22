@@ -6,6 +6,7 @@ package e2e_test
 // role branch at the top of each test turns the process into the child.
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -13,18 +14,24 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
+	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
@@ -200,4 +207,165 @@ func serveBody(l net.Listener, body string) *http.Server {
 	})}
 	go srv.Serve(l)
 	return srv
+}
+
+// adoptPreflightSpec hands the shared preflight mint to a tunnel through the
+// environment, so a live test reuses that spec instead of minting its own (the
+// Cloudflare chain adopts LIBTUNNEL_SPEC before minting). Same move
+// TestLiveTunnel makes — it keeps the live tier's mint count down.
+func adoptPreflightSpec(t *testing.T) {
+	t.Helper()
+	if preflightSpec == nil {
+		return
+	}
+	if entry, err := v1alpha1.SpecEnviron("cloudflare", preflightSpec); err == nil {
+		t.Setenv(v1.SpecEnv, strings.TrimPrefix(entry, v1.SpecEnv+"="))
+	}
+}
+
+// startWatchOrigin starts a kube-apiserver `?watch=true` lookalike: GET /watch
+// returns a chunked application/json NDJSON stream that emits one
+// `{"type":"ADDED","object":{"seq":N,"ts":"<RFC3339Nano>","pad":"..."}}` event
+// per interval and flushes each — the exact shape a plain trycloudflare edge
+// buffers. Query params tune the stream: n (event count), ms (interval), pad
+// (filler bytes per event), since (first seq, so a reconnect resumes). The
+// returned counter tracks requests carrying probe=watch, so a test can assert
+// the session shim shielded the origin to exactly one request across reconnects.
+func startWatchOrigin(t *testing.T) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	hits := new(atomic.Int64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/watch" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("probe") == "watch" {
+			hits.Add(1)
+		}
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		h := w.Header()
+		h.Set("Content-Type", "application/json")
+		h.Set("Cache-Control", "no-cache, private")
+		// No Content-Length: chunked transfer, like the apiserver watch.
+		w.WriteHeader(http.StatusOK)
+		fl.Flush() // send the response head immediately
+
+		n := intQuery(r, "n", 10)
+		interval := time.Duration(intQuery(r, "ms", 500)) * time.Millisecond
+		pad := intQuery(r, "pad", 0)
+		since := intQuery(r, "since", 0)
+
+		enc := json.NewEncoder(w) // Encode appends '\n' -> NDJSON, like watch
+		for i := range n {
+			ev := map[string]any{
+				"type": "ADDED",
+				"object": map[string]any{
+					"seq": since + i,
+					"ts":  time.Now().UTC().Format(time.RFC3339Nano),
+					"pad": strings.Repeat("x", pad),
+				},
+			}
+			if err := enc.Encode(ev); err != nil {
+				return // client hung up
+			}
+			fl.Flush()
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(interval):
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, hits
+}
+
+// intQuery resolves an integer query param, falling back to def.
+func intQuery(r *http.Request, key string, def int) int {
+	if v := r.URL.Query().Get(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+// chopEvent is one delivered watch event: its sequence number and the
+// end-to-end delivery latency (arrival − embedded origin ts). Origin and client
+// share the host clock; only the tunnel is remote.
+type chopEvent struct {
+	seq     int
+	latency time.Duration
+}
+
+// chopStream reads one (possibly short) response from url and returns the events
+// it carried. It reads line-by-line with a 1 MB buffer, skips blank/unparsable
+// lines (partial frames at a boundary), and json-parses each NDJSON object.
+// Short responses and connection closes are the expected steady state under
+// chop, so an errored request is not fatal.
+func chopStream(t *testing.T, ctx context.Context, url string) []chopEvent {
+	t.Helper()
+	reqCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Logf("chopStream: build request: %v", err)
+		return nil
+	}
+	// DefaultClient, not httpClient: a long-lived response would trip a
+	// client-level timeout, so reqCtx bounds the read instead.
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Logf("chopStream: request ended: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var events []chopEvent
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var ev struct {
+			Object struct {
+				Seq int    `json:"seq"`
+				Ts  string `json:"ts"`
+			} `json:"object"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue // partial or non-JSON line at a boundary; drop it
+		}
+		ts, err := time.Parse(time.RFC3339Nano, ev.Object.Ts)
+		if err != nil {
+			continue
+		}
+		events = append(events, chopEvent{seq: ev.Object.Seq, latency: time.Since(ts)})
+	}
+	if err := sc.Err(); err != nil {
+		t.Logf("chopStream: body read ended with %v (after %d events)", err, len(events))
+	}
+	return events
+}
+
+// warmup blocks until url returns at least one event or timeout elapses — a
+// fresh connector's route can take a few seconds to propagate to the edge, and
+// the watch measurements below assume it is already live.
+func warmup(t *testing.T, ctx context.Context, url string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(chopStream(t, ctx, url)) > 0 {
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("warmup never got a response from %s within %v", url, timeout)
 }
