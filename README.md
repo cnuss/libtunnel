@@ -263,15 +263,17 @@ amd64/arm64, a `SHA256SUMS` manifest, and a cosign `.sigstore` bundle per
 file. To build locally instead: `make dist` (cross-compiles the matrix into
 `dist/`) or `make binary` (host only). CGO is off, so the binary is
 dependency-free and runs on a scratch/distroless base — [`Dockerfile`](./Dockerfile)
-targets `distroless/static:nonroot`:
+targets `distroless/static:nonroot`. Each release publishes a multi-arch
+(amd64/arm64), cosign-signed image to the GitHub Container Registry:
 
 ```sh
-docker build -t libtunnel .
 docker run --rm \
   -e LIBTUNNEL__CLOUDFLARE=1 \
   -e LIBTUNNEL_LOCAL_URL=http://host.docker.internal:8080 \
-  libtunnel
+  ghcr.io/cnuss/libtunnel:latest
 ```
+
+Or build it yourself: `docker build -t libtunnel .`
 
 ## Examples
 

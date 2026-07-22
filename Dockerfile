@@ -2,8 +2,10 @@
 
 # Build stage: compile the static, stripped launcher. CGO off so the result
 # links no libc and runs on a distroless/scratch base; -trimpath drops host
-# paths for a reproducible build.
-FROM golang:1.26 AS build
+# paths for a reproducible build. The builder runs on the native BUILDPLATFORM
+# and Go cross-compiles to the requested TARGETOS/TARGETARCH (both injected by
+# buildx), so a multi-arch image build stays a fast native compile — no QEMU.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 
 # Warm the module cache on the manifests alone, so a source-only change
@@ -13,7 +15,8 @@ RUN go mod download
 
 COPY . .
 ARG VERSION=docker
-RUN CGO_ENABLED=0 go build -trimpath \
+ARG TARGETOS TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags "-s -w -X main.version=${VERSION}" \
       -o /libtunnel ./cmd/libtunnel
 
