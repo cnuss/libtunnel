@@ -53,9 +53,11 @@ test:
 
 # End-to-end: the harness builds and drives every example binary. -count=1 disables
 # go test caching, since the harness builds the example binaries at runtime and the
-# cache key wouldn't otherwise pick up example source changes.
+# cache key wouldn't otherwise pick up example source changes. -timeout 20m gives
+# the live tier headroom: it runs serially with 30s inter-test pacing (shared
+# preflight spec), which on a slow runner exceeds go test's default 10m.
 e2e:
-	go test -count=1 -v ./e2e
+	go test -count=1 -v -timeout 20m ./e2e
 
 # Build the launcher for the host platform, stamped and stripped.
 binary:
