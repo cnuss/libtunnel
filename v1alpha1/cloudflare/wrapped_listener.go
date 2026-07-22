@@ -2,12 +2,10 @@ package cloudflare
 
 // wrappedListener is the disconnect/reconnect shim between cloudflared and the
 // origin for the quick-tunnel streaming-buffer problem. A trycloudflare quick
-// tunnel buffers a chunked 200 response at the edge and flushes on exactly two
-// triggers: (a) a CLEAN response end (terminal chunk), and (b) accumulating
-// exactly edgeFlushBytes (128 KiB) of response body, after which it refills and
-// re-flushes every edgeFlushBytes. Headers, content-type, transport, and idle
-// are all ignored; an abort discards the buffer. The shim exploits BOTH
-// triggers, each behind a public backend knob:
+// tunnel buffers a chunked 200 response at the edge and flushes on a CLEAN
+// response end (terminal chunk). Headers, content-type, transport, and idle
+// are all ignored; an abort discards the buffer. The shim exploits that
+// trigger behind a public backend knob:
 //
 //	cloudflared --dials--> wrappedListener ==session==> origin (one conn)
 //
@@ -15,13 +13,9 @@ package cloudflare
 //	         downstream conns come and go; each gets a replayed head and
 //	         re-chunked frames.
 //
-//	chop   (trigger a): every chop interval the current downstream response is
-//	         ended CLEANLY (terminal chunk) and closed — the edge flushes — and
-//	         the next reconnect resumes from the buffer.
-//	padding(trigger b): decoder-transparent whitespace ("\n") is injected as its
-//	         own chunked frame(s) after a real frame that would otherwise sit
-//	         buffered, filling the response body up to the next 128 KiB boundary
-//	         so the edge flushes the real frame within one long-lived response.
+//	chop: every chop interval the current downstream response is ended CLEANLY
+//	         (terminal chunk) and closed — the edge flushes — and the next
+//	         reconnect resumes from the buffer.
 //
 // The origin never sees the churn: its single connection streams into the
 // buffer for the session's whole life. Sessions are keyed by the request
@@ -30,7 +24,6 @@ package cloudflare
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -43,23 +36,16 @@ import (
 	"time"
 )
 
-// edgeFlushBytes is the trycloudflare edge's second flush trigger: it releases
-// a buffered chunked 200 response every 131072 (128 KiB) bytes of decoded body
-// payload (measured excluding chunk-size lines and CRLFs). Padding fills a
-// response up to the next multiple of this to force a flush.
-const edgeFlushBytes = 131072
-
 // wrappedListener implements net.Listener; cloudflared dials Addr(). It owns
-// the accept loop and the session table. chop and padding are fixed at
-// construction and never mutated after the serve loop starts.
+// the accept loop and the session table. chop is fixed at construction and
+// never mutated after the serve loop starts.
 type wrappedListener struct {
 	net.Listener // cf-facing TCP listener
 
-	target  string // origin host:port
-	log     *slog.Logger
-	ctx     context.Context
-	chop    time.Duration // downstream clean-close cadence; 0 = never chop
-	padding bool          // inject whitespace to the 128 KiB edge-flush boundary
+	target string // origin host:port
+	log    *slog.Logger
+	ctx    context.Context
+	chop   time.Duration // downstream clean-close cadence; 0 = never chop
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -67,8 +53,8 @@ type wrappedListener struct {
 
 // newWrappedListener binds the cf-facing listener and starts the accept loop.
 // target is the origin's host:port. chop is the clean-close cadence (0 = never
-// chop) and padding enables 128 KiB-boundary whitespace injection.
-func newWrappedListener(ctx context.Context, log *slog.Logger, target string, chop time.Duration, padding bool) (*wrappedListener, error) {
+// chop).
+func newWrappedListener(ctx context.Context, log *slog.Logger, target string, chop time.Duration) (*wrappedListener, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -79,7 +65,6 @@ func newWrappedListener(ctx context.Context, log *slog.Logger, target string, ch
 		log:      log,
 		ctx:      ctx,
 		chop:     chop,
-		padding:  padding,
 		sessions: map[string]*session{},
 	}
 	go func() {
@@ -87,7 +72,7 @@ func newWrappedListener(ctx context.Context, log *slog.Logger, target string, ch
 		l.Close()
 	}()
 	go w.serve()
-	log.Info("wrapped listener interposed", "listen", l.Addr().String(), "target", target, "chop", chop, "padding", padding)
+	log.Info("wrapped listener interposed", "listen", l.Addr().String(), "target", target, "chop", chop)
 	return w, nil
 }
 
@@ -329,12 +314,7 @@ func (s *session) downstream() {
 }
 
 // serveOne writes one downstream response on conn: head, frames until the
-// chop interval elapses or the stream ends, then a clean terminal chunk. When
-// padding is enabled, after a real frame that would otherwise sit buffered
-// (nothing else immediately ready) it injects whitespace up to the next
-// edgeFlushBytes boundary so the edge flushes that frame. written tracks the
-// response's cumulative payload bytes (real + padding, excluding chunk framing)
-// and resets to 0 per response — its own serveOne call.
+// chop interval elapses or the stream ends, then a clean terminal chunk.
 func (s *session) serveOne(conn net.Conn) {
 	defer conn.Close()
 
@@ -352,7 +332,6 @@ func (s *session) serveOne(conn net.Conn) {
 		deadline = time.After(s.w.chop)
 	}
 
-	written := 0
 	for {
 		frame, ok := s.frames.Read(deadline)
 		if frame != nil {
@@ -360,42 +339,12 @@ func (s *session) serveOne(conn net.Conn) {
 				return // downstream died mid-write; frame is lost (kube
 				// resourceVersion re-request would recover it in real use)
 			}
-			written += len(frame)
-			// Padding (edge-flush trigger b): only when the stream continues
-			// (ok) and nothing else is immediately queued — i.e. this frame
-			// would otherwise sit buffered at the edge. Fill to the next 128
-			// KiB boundary with decoder-transparent whitespace to force the
-			// flush. If more frames are ready they get written first (no waste);
-			// if the response is about to end (ok false) the clean close flushes
-			// instead, so no padding is needed there.
-			if s.w.padding && ok && s.frames.empty() {
-				n, err := writePad(conn, written)
-				if err != nil {
-					return
-				}
-				written = n
-			}
 		}
 		if !ok { // chop deadline or stream end: finish this response cleanly
 			_, _ = conn.Write([]byte("0\r\n\r\n"))
 			return
 		}
 	}
-}
-
-// writePad emits decoder-transparent whitespace ("\n") as a single valid
-// chunked frame to bring the response's cumulative payload bytes (written) up
-// to the next edgeFlushBytes boundary, forcing the edge's 128 KiB flush. The
-// whitespace lands BETWEEN whole NDJSON objects (its own chunk, never inside a
-// frame), so encoding/json.Decoder and bufio.Scanner skip it as blank lines and
-// it never reaches a watch client's decode. Returns the new cumulative total
-// (the boundary) or an error if the downstream write failed.
-func writePad(conn net.Conn, written int) (int, error) {
-	target := (written/edgeFlushBytes + 1) * edgeFlushBytes
-	if err := writeChunk(conn, bytes.Repeat([]byte("\n"), target-written)); err != nil {
-		return written, err
-	}
-	return target, nil
 }
 
 // frameBuffer is the session's payload queue: whole de-chunked frames in,
@@ -458,15 +407,6 @@ func (fb *frameBuffer) Read(deadline <-chan time.Time) ([]byte, bool) {
 		}
 		fb.cond.Wait()
 	}
-}
-
-// empty reports whether no frames are currently queued (non-blocking). Padding
-// uses it to tell whether the frame just written would sit buffered (empty) or
-// another frame is ready to write immediately (not empty).
-func (fb *frameBuffer) empty() bool {
-	fb.mu.Lock()
-	defer fb.mu.Unlock()
-	return len(fb.frames) == 0
 }
 
 // pop removes and returns the head frame; callers hold fb.mu.

@@ -4,13 +4,11 @@ package cloudflare
 // the private type directly and speak plain HTTP to its Addr() — no cloudflared,
 // no tunnel mint, no real edge. Since there is no edge offline, they cannot
 // assert edge-flush TIMING; instead they assert the shim's OUTPUT is correct:
-// the right events, in order, exactly once, with padding injected at the 128 KiB
-// boundaries and transparent to a json.Decoder. Any failure here is a shim bug,
-// not an edge or network artifact.
+// the right events, in order, exactly once. Any failure here is a shim bug, not
+// an edge or network artifact.
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -83,7 +81,7 @@ func qint(r *http.Request, key string, def int) int {
 	return def
 }
 
-// TestChopOffline exercises edge-flush trigger (a): chop set, padding off. The
+// TestChopOffline exercises the clean-close (chop) edge-flush trigger. The
 // client re-issues the identical URL (the kubectl re-watch shape); the session
 // table reattaches it to the one live origin stream. It asserts every event is
 // delivered exactly once and in order across >=3 short downstream responses,
@@ -97,7 +95,7 @@ func TestChopOffline(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	const chop = 300 * time.Millisecond
-	wl, err := newWrappedListener(ctx, logger, strings.TrimPrefix(srv.URL, "http://"), chop, false)
+	wl, err := newWrappedListener(ctx, logger, strings.TrimPrefix(srv.URL, "http://"), chop)
 	if err != nil {
 		t.Fatalf("newWrappedListener: %v", err)
 	}
@@ -155,95 +153,6 @@ func TestChopOffline(t *testing.T) {
 	}
 }
 
-// TestPaddingOffline exercises edge-flush trigger (b): padding on, chop off. The
-// origin emits small events slowly (n=6, ms=400) and the client makes ONE long
-// request. Offline there is no edge to flush, so instead it asserts the shim's
-// OUTPUT is correct: all 6 events in order exactly once; the response body is
-// padded with decoder-transparent whitespace that crosses >=1 128 KiB boundary
-// (so total bytes >> raw event bytes); and an encoding/json.Decoder over the raw
-// body decodes exactly the 6 objects and nothing else (whitespace transparent).
-func TestPaddingOffline(t *testing.T) {
-	srv, hits := newStreamOrigin(t)
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	wl, err := newWrappedListener(ctx, logger, strings.TrimPrefix(srv.URL, "http://"), 0, true)
-	if err != nil {
-		t.Fatalf("newWrappedListener: %v", err)
-	}
-
-	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-	const total = 6
-	watchURL := "http://" + wl.Addr().String() + "/watch?n=6&ms=400&pad=8"
-
-	reqCtx, reqCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer reqCancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, watchURL, nil)
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("request: %v", err)
-	}
-	// The transport de-chunks: body is the raw payload the shim wrote (real
-	// event JSON lines + injected whitespace), which is exactly what padding is
-	// measured against.
-	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-
-	total0 := len(body)
-	boundaries := total0 / edgeFlushBytes
-	newlines := bytes.Count(body, []byte("\n"))
-	padNewlines := newlines - total // real events contribute `total` NDJSON newlines
-
-	// Decode the raw body with a json.Decoder: whitespace between objects (the
-	// injected blank lines) must be skipped transparently, yielding exactly the
-	// 6 event objects in order and then a clean io.EOF.
-	dec := json.NewDecoder(bytes.NewReader(body))
-	var ordered []int
-	for {
-		var ev streamEvent
-		err := dec.Decode(&ev)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("json.Decoder over padded body failed at event %d: %v (whitespace not transparent)", len(ordered), err)
-		}
-		ordered = append(ordered, ev.Seq)
-	}
-
-	t.Logf("padding: body=%d bytes, %d KiB-boundaries, %d padding newlines, decoded %d events %v; origin requests=%d",
-		total0, boundaries, padNewlines, len(ordered), ordered, hits.Load())
-
-	if len(ordered) != total {
-		t.Fatalf("decoded %d events, want %d (%v)", len(ordered), total, ordered)
-	}
-	for i, seq := range ordered {
-		if seq != i {
-			t.Fatalf("event %d decoded as seq %d — out of order or duplicated", i, seq)
-		}
-	}
-	if got := hits.Load(); got != 1 {
-		t.Errorf("origin received %d requests, want exactly 1 (single long-lived downstream response)", got)
-	}
-	// Padding must have injected to the boundary: at least one 128 KiB boundary
-	// crossed, and the injected whitespace dwarfs the raw event bytes.
-	if boundaries < 1 {
-		t.Errorf("body is %d bytes (%d boundaries); padding did not reach a 128 KiB boundary", total0, boundaries)
-	}
-	if padNewlines < edgeFlushBytes {
-		t.Errorf("only %d padding newlines; expected >= %d (one full flush window)", padNewlines, edgeFlushBytes)
-	}
-}
-
 // readEvent is one delivered event: its sequence number and end-to-end delivery
 // latency (arrival − embedded origin ts; origin and client share the host clock).
 type readEvent struct {
@@ -252,8 +161,8 @@ type readEvent struct {
 }
 
 // readResponse reads one (possibly short) downstream response and returns the
-// events it carried. Unparsable lines (a boundary partial, or a padding blank
-// line) are skipped. A 1 MB scanner buffer covers padded lines.
+// events it carried. Unparsable lines (a boundary partial or a blank line) are
+// skipped. A 1 MB scanner buffer covers long lines.
 func readResponse(t *testing.T, ctx context.Context, client *http.Client, url string) []readEvent {
 	t.Helper()
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)

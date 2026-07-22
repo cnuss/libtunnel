@@ -225,7 +225,6 @@ credential set (id, hostname, account tag, secret) skips resolution entirely:
 | `LIBTUNNEL__CLOUDFLARE_SECRET` | `WithSecret()` (base64) |
 | `LIBTUNNEL__CLOUDFLARE_API_URL` | `WithApiURL()` — quick-tunnel mint endpoint, default `https://api.trycloudflare.com/tunnel` |
 | `LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL` | `WithFlushInterval()` — streaming-buffer lever; duration (`time.ParseDuration`, e.g. `1s`). Fixed at construction, later calls are no-ops; unparsable value fails at connect. |
-| `LIBTUNNEL__CLOUDFLARE_PADDING` | `WithPadding()` — streaming-buffer lever; bool (`strconv.ParseBool`). `false` disables it even when code calls `WithPadding`. Same fixing rules. |
 
 The Cloudflare backend also has a bare activation switch, `LIBTUNNEL__CLOUDFLARE=1`,
 used by the binary below to select it without a spec handoff.

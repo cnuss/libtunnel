@@ -93,19 +93,12 @@ type Backend struct {
 	// no-op (env beats code).
 	chopInterval *time.Duration
 	chopFixed    bool
-	// padding, when true, enables the wrapped listener's 128 KiB-boundary
-	// whitespace injection (edge-flush trigger b) via WithPadding. paddingFixed
-	// records that LIBTUNNEL__CLOUDFLARE_PADDING fixed it, so WithPadding is a
-	// no-op (env beats code).
-	padding      bool
-	paddingFixed bool
 }
 
 // New returns the Cloudflare backend. The origin-scheme knobs are fixed from
 // the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set, and the
-// streaming-buffer levers when LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL /
-// LIBTUNNEL__CLOUDFLARE_PADDING are set. The first unparsable value wins and is
-// surfaced at connect.
+// streaming-buffer lever when LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL is set. The
+// first unparsable value wins and is surfaced at connect.
 func New() *Backend {
 	b := &Backend{}
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
@@ -118,9 +111,6 @@ func New() *Backend {
 		if b.chopFixed && b.envErr == nil {
 			b.chopInterval = &d
 		}
-	}
-	if b.envErr == nil {
-		b.padding, b.paddingFixed, b.envErr = v1alpha1.EnvBool(v1.CloudflarePaddingEnv)
 	}
 	return b
 }
@@ -220,42 +210,13 @@ func (b *Backend) WithApiURL(apiURL string) *Backend {
 // The shim is contract-safe: it never mutates the origin's status, headers, or
 // body — it only re-frames the same bytes across successive clean-closed
 // responses. Default off (nil): no shim, cloudflared dials the origin directly.
-// Setting a positive d engages the shim. Composes with WithPadding — the flush
-// interval bounds time, padding bounds bytes, whichever triggers first delivers
-// pending events. Env mirror: LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL
-// (time.ParseDuration syntax) fixes the knob and makes this call a no-op — env
-// beats code. Returns the backend for chaining.
+// Setting a positive d engages the shim. Env mirror:
+// LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL (time.ParseDuration syntax) fixes the
+// knob and makes this call a no-op — env beats code. Returns the backend for
+// chaining.
 func (b *Backend) WithFlushInterval(d time.Duration) *Backend {
 	if !b.chopFixed {
 		b.chopInterval = &d
-	}
-	return b
-}
-
-// WithPadding bounds streaming-response latency in BYTES. It exploits the edge's
-// second flush trigger: a buffered chunked 200 response is released every 128
-// KiB of body. With padding on, the session shim (see wrapped_listener.go)
-// injects decoder-transparent whitespace ("\n") as its own chunked frame(s)
-// after a real event that would otherwise sit buffered, filling the response
-// body up to the next 128 KiB boundary so the edge flushes the real event —
-// all within one long-lived downstream response (no reconnect needed).
-//
-// Contract-safe: the whitespace lands strictly BETWEEN whole NDJSON objects,
-// never inside a frame, so encoding/json.Decoder and bufio.Scanner skip it as
-// blank lines and it never reaches a watch client's decode; status, headers,
-// and event bytes are untouched. The cost is bandwidth: up to ~128 KiB of
-// filler per flush window (per delivered event when events are sparse).
-//
-// Default off. Engages the shim on its own (chop stays off, so a single
-// long-lived response is padded in place) or composes with WithFlushInterval —
-// the flush interval bounds time, padding bounds bytes, whichever triggers first
-// delivers.
-// Env mirror: LIBTUNNEL__CLOUDFLARE_PADDING (strconv.ParseBool syntax) fixes the
-// knob and makes this call a no-op — env beats code, so a value of false
-// disables padding even when code calls this. Returns the backend for chaining.
-func (b *Backend) WithPadding() *Backend {
-	if !b.paddingFixed {
-		b.padding = true
 	}
 	return b
 }
@@ -411,19 +372,14 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	if b.envErr != nil {
 		return b.envErr
 	}
-	// Either edge-flush lever engages the session shim; with neither set the
-	// origin is dialed directly (path untouched). chopInterval nil => 0 (never
-	// time-chop), so padding-only interposes the shim with chop off.
-	if b.chopInterval != nil || b.padding {
+	// The flush-interval lever engages the session shim; unset, the origin is
+	// dialed directly (path untouched).
+	if b.chopInterval != nil {
 		u, err := url.Parse(service)
 		if err != nil {
 			return fmt.Errorf("wrapped listener: %w", err)
 		}
-		chop := time.Duration(0)
-		if b.chopInterval != nil {
-			chop = *b.chopInterval
-		}
-		wl, err := newWrappedListener(t.Context(), t.Logger(), u.Host, chop, b.padding)
+		wl, err := newWrappedListener(t.Context(), t.Logger(), u.Host, *b.chopInterval)
 		if err != nil {
 			return fmt.Errorf("wrapped listener: %w", err)
 		}

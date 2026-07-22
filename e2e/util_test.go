@@ -303,10 +303,10 @@ type chopEvent struct {
 }
 
 // chopStream reads one (possibly short) response from url and returns the events
-// it carried. It reads line-by-line with a 1 MB buffer to tolerate padding
-// whitespace runs, skips blank/unparsable lines (partial frames at a boundary),
-// and json-parses each NDJSON object. Short responses and connection closes are
-// the expected steady state under chop, so an errored request is not fatal.
+// it carried. It reads line-by-line with a 1 MB buffer, skips blank/unparsable
+// lines (partial frames at a boundary), and json-parses each NDJSON object.
+// Short responses and connection closes are the expected steady state under
+// chop, so an errored request is not fatal.
 func chopStream(t *testing.T, ctx context.Context, url string) []chopEvent {
 	t.Helper()
 	reqCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -317,8 +317,8 @@ func chopStream(t *testing.T, ctx context.Context, url string) []chopEvent {
 		t.Logf("chopStream: build request: %v", err)
 		return nil
 	}
-	// DefaultClient, not httpClient: the padding case reads a single ~30s
-	// response, so a client-level timeout would truncate it — reqCtx bounds it.
+	// DefaultClient, not httpClient: a long-lived response would trip a
+	// client-level timeout, so reqCtx bounds the read instead.
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Logf("chopStream: request ended: %v", err)

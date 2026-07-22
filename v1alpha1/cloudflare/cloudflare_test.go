@@ -75,21 +75,16 @@ func TestEnvKnobsUnsetLeaveCodeInCharge(t *testing.T) {
 }
 
 // TestEnvFixesStreamingLevers pins env-beats-code for the Cloudflare streaming
-// levers: LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL / _PADDING fix the knobs at
-// construction and WithFlushInterval / WithPadding become no-ops.
+// lever: LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL fixes the knob at construction and
+// WithFlushInterval becomes a no-op.
 func TestEnvFixesStreamingLevers(t *testing.T) {
 	t.Setenv(v1.CloudflareFlushIntervalEnv, "500ms")
-	t.Setenv(v1.CloudflarePaddingEnv, "false")
 
 	b := cloudflare.New()
 	b.WithFlushInterval(5 * time.Second) // loses: env fixed 500ms
-	b.WithPadding()                      // loses: env fixed padding=false
 
 	if got := b.FlushInterval(); got == nil || *got != 500*time.Millisecond {
 		t.Errorf("FlushInterval = %v, want the LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL=500ms value to stick over WithFlushInterval(5s)", got)
-	}
-	if b.Padding() {
-		t.Error("Padding = true; want the LIBTUNNEL__CLOUDFLARE_PADDING=false value to stick over WithPadding()")
 	}
 	if err := b.EnvErr(); err != nil {
 		t.Errorf("EnvErr = %v, want nil", err)
@@ -97,19 +92,14 @@ func TestEnvFixesStreamingLevers(t *testing.T) {
 }
 
 // TestStreamingLeversUnsetLeaveCodeInCharge pins the fallthrough: without the
-// env vars the mutators work exactly as written.
+// env var the mutator works exactly as written.
 func TestStreamingLeversUnsetLeaveCodeInCharge(t *testing.T) {
 	t.Setenv(v1.CloudflareFlushIntervalEnv, "")
-	t.Setenv(v1.CloudflarePaddingEnv, "")
 
 	b := cloudflare.New().WithFlushInterval(2 * time.Second)
-	b.WithPadding()
 
 	if got := b.FlushInterval(); got == nil || *got != 2*time.Second {
 		t.Errorf("FlushInterval = %v, want 2s from code", got)
-	}
-	if !b.Padding() {
-		t.Error("Padding = false after WithPadding() with no env, want true")
 	}
 }
 

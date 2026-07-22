@@ -24,7 +24,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -519,88 +518,5 @@ func TestLiveWatchFlushInterval(t *testing.T) {
 	if requests < 5 {
 		t.Errorf("only %d downstream request(s) for a %v stream with a %v chop — reconnect never exercised",
 			requests, time.Duration(total)*interval, chop)
-	}
-}
-
-// TestLiveWatchPadding is the LIVE end-to-end proof of the Cloudflare backend's
-// padding lever (WithPadding) on the same kubernetes-shaped watch: a long-lived
-// (~30s) chunked HTTP 200 stream of 30 small events, 1s apart. Small events over
-// 30s never reach the edge's 128 KiB flush threshold on their own, so a PLAIN
-// 200 bunches at the 30s close. The padding shim keeps ONE downstream response
-// open (no chop) and injects decoder-transparent whitespace after each real
-// event to reach the next 128 KiB boundary, forcing the edge to flush that event
-// — so the client makes ONE long request and events arrive as they happen.
-//
-// The collector skips those blank whitespace lines and json-parses exactly the
-// 30 event objects, proving the padding is decoder-transparent.
-func TestLiveWatchPadding(t *testing.T) {
-	gateLive(t)
-	adoptPreflightSpec(t) // reuse the preflight mint instead of minting our own
-
-	srv, originHits := startWatchOrigin(t)
-	origin, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	conn := libtunnel.New(cloudflare.New().WithPadding()).
-		WithLogger(slog.Default()).
-		WithContext(ctx).
-		WithLocalURL(origin)
-
-	pub := conn.URL()
-	if pub == nil {
-		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", conn.Err(), ctx.Err())
-	}
-	base := strings.TrimRight(pub.String(), "/")
-	t.Logf("tunnel up via padding shim: %s", base)
-	warmup(t, ctx, base+"/watch?n=1&ms=1", 45*time.Second)
-
-	// The kube watch: 30 events, 1s apart (~30s). With padding the edge flushes
-	// each within ONE long-lived response; the client reads that single response
-	// (chopStream skips the whitespace blank lines and json-parses each event).
-	const total = 30
-	watchURL := base + "/watch?probe=watch&n=30&ms=1000"
-
-	events := chopStream(t, ctx, watchURL)
-	seen := map[int]bool{}
-	var ordered []int
-	var maxLat time.Duration
-	for _, ev := range events {
-		if !seen[ev.seq] {
-			seen[ev.seq] = true
-			ordered = append(ordered, ev.seq)
-			if ev.latency > maxLat {
-				maxLat = ev.latency
-			}
-		}
-	}
-	sort.Ints(ordered)
-
-	t.Logf("padding-live: collected %d/%d events in one response; origin requests=%d; max per-event latency %v",
-		len(seen), total, originHits.Load(), maxLat.Round(time.Millisecond))
-
-	if len(seen) != total {
-		t.Fatalf("collected %d events, want %d (padding whitespace must be decoder-transparent)", len(seen), total)
-	}
-	for i, seq := range ordered {
-		if seq != i {
-			t.Fatalf("event %d present as seq %d — gap or duplicate", i, seq)
-		}
-	}
-	// chopStream json-parsed every event out of a body dominated by ~128 KiB
-	// whitespace runs per event: 30 clean objects == decoder-transparent padding.
-	t.Logf("decoder-transparency confirmed: %d event objects parsed from the padded body, no partial/garbage lines admitted", len(seen))
-	// One long response — the origin saw ONE watch request, no reconnect.
-	if got := originHits.Load(); got != 1 {
-		t.Errorf("origin received %d watch requests, want exactly 1", got)
-	}
-	// Each event arrived promptly (time to push ~128 KiB + edge flush), NOT
-	// bunched at the 30s close.
-	if limit := 5 * time.Second; maxLat > limit {
-		t.Errorf("max per-event latency %v, want <= %v (padding should force a per-event flush, not bunch at close)", maxLat, limit)
 	}
 }

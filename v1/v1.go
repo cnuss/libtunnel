@@ -106,11 +106,6 @@ const (
 	// value engages the streaming-buffer shim (see the Cloudflare backend's
 	// WithFlushInterval); an unparsable value fails the tunnel at connect.
 	CloudflareFlushIntervalEnv = "LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL"
-	// CloudflarePaddingEnv fixes WithPadding from the environment
-	// (strconv.ParseBool syntax): true engages the padding lever and makes
-	// WithPadding a no-op; false disables it even when code calls WithPadding
-	// (env beats code). An unparsable value fails the tunnel at connect.
-	CloudflarePaddingEnv = "LIBTUNNEL__CLOUDFLARE_PADDING"
 )
 
 // Spec is the credential/identity set a Provider yields. Each backend defines
