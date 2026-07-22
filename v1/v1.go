@@ -99,6 +99,18 @@ const (
 	// (default https://api.trycloudflare.com/tunnel). Only the mint path
 	// uses it.
 	CloudflareAPIURLEnv = "LIBTUNNEL__CLOUDFLARE_API_URL"
+
+	// CloudflareFlushIntervalEnv fixes WithFlushInterval from the environment
+	// (time.ParseDuration syntax, e.g. "1s", "500ms"): set, the mutator is a
+	// no-op and the session shim's flush cadence is the env value. A positive
+	// value engages the streaming-buffer shim (see the Cloudflare backend's
+	// WithFlushInterval); an unparsable value fails the tunnel at connect.
+	CloudflareFlushIntervalEnv = "LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL"
+	// CloudflarePaddingEnv fixes WithPadding from the environment
+	// (strconv.ParseBool syntax): true engages the padding lever and makes
+	// WithPadding a no-op; false disables it even when code calls WithPadding
+	// (env beats code). An unparsable value fails the tunnel at connect.
+	CloudflarePaddingEnv = "LIBTUNNEL__CLOUDFLARE_PADDING"
 )
 
 // Spec is the credential/identity set a Provider yields. Each backend defines

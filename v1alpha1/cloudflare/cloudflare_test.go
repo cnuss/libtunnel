@@ -74,6 +74,56 @@ func TestEnvKnobsUnsetLeaveCodeInCharge(t *testing.T) {
 	}
 }
 
+// TestEnvFixesStreamingLevers pins env-beats-code for the Cloudflare streaming
+// levers: LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL / _PADDING fix the knobs at
+// construction and WithFlushInterval / WithPadding become no-ops.
+func TestEnvFixesStreamingLevers(t *testing.T) {
+	t.Setenv(v1.CloudflareFlushIntervalEnv, "500ms")
+	t.Setenv(v1.CloudflarePaddingEnv, "false")
+
+	b := cloudflare.New()
+	b.WithFlushInterval(5 * time.Second) // loses: env fixed 500ms
+	b.WithPadding()                      // loses: env fixed padding=false
+
+	if got := b.FlushInterval(); got == nil || *got != 500*time.Millisecond {
+		t.Errorf("FlushInterval = %v, want the LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL=500ms value to stick over WithFlushInterval(5s)", got)
+	}
+	if b.Padding() {
+		t.Error("Padding = true; want the LIBTUNNEL__CLOUDFLARE_PADDING=false value to stick over WithPadding()")
+	}
+	if err := b.EnvErr(); err != nil {
+		t.Errorf("EnvErr = %v, want nil", err)
+	}
+}
+
+// TestStreamingLeversUnsetLeaveCodeInCharge pins the fallthrough: without the
+// env vars the mutators work exactly as written.
+func TestStreamingLeversUnsetLeaveCodeInCharge(t *testing.T) {
+	t.Setenv(v1.CloudflareFlushIntervalEnv, "")
+	t.Setenv(v1.CloudflarePaddingEnv, "")
+
+	b := cloudflare.New().WithFlushInterval(2 * time.Second)
+	b.WithPadding()
+
+	if got := b.FlushInterval(); got == nil || *got != 2*time.Second {
+		t.Errorf("FlushInterval = %v, want 2s from code", got)
+	}
+	if !b.Padding() {
+		t.Error("Padding = false after WithPadding() with no env, want true")
+	}
+}
+
+// TestFlushIntervalEnvUnparsableSetsEnvErr pins loud failure for a bad duration
+// override: New records the parse error, which connect later surfaces (as
+// TestEnvKnobUnparsableFailsConnect proves for the bool knobs).
+func TestFlushIntervalEnvUnparsableSetsEnvErr(t *testing.T) {
+	t.Setenv(v1.CloudflareFlushIntervalEnv, "banana")
+
+	if err := cloudflare.New().EnvErr(); err == nil || !strings.Contains(err.Error(), v1.CloudflareFlushIntervalEnv) {
+		t.Errorf("EnvErr = %v, want a %s parse cause", err, v1.CloudflareFlushIntervalEnv)
+	}
+}
+
 // clearSpecEnv scrubs the credential-chain env vars so a test resolves
 // exactly the channel it stages.
 func clearSpecEnv(t *testing.T) {
