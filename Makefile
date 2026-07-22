@@ -15,7 +15,7 @@ export CGO_ENABLED = 0
 #                the build is reproducible.
 #   PLATFORMS — the release OS/arch matrix.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-GO_LDFLAGS = -s -w -X main.version=$(VERSION)
+GO_LDFLAGS = -s -w -X github.com/cnuss/libtunnel.version=$(VERSION)
 PLATFORMS = linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
 # Default: everything CI runs except the auto-bump release step.
