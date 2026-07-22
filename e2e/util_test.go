@@ -48,10 +48,39 @@ func reexec(test string, extraEnv ...string) *exec.Cmd {
 	return cmd
 }
 
-// gateLive skips the test unless the live tier is enabled, fails fast when
-// the preflight comms check failed, scrubs any inherited LIBTUNNEL_SPEC so live
-// scenarios always mint their own, and paces the suite.
+// gateLive gates a live scenario and, by default, hands it the ONE shared
+// preflight mint: it skips unless the live tier is enabled, fails fast when the
+// preflight comms check failed, paces the suite, then adopts the preflight spec
+// so the tunnel reuses that hostname instead of minting its own. Quick-tunnel
+// minting is rate-limited and the live tier runs three OS cells in parallel, so
+// a per-test mint bursts the limiter; sharing the preflight spec keeps the
+// whole live tier to a handful of mints.
+//
+// Adopt-by-default REQUIRES serial execution — one connector at a time on the
+// shared hostname — so no live test may call t.Parallel(). Scenarios that own a
+// hostname's whole lifecycle (a distinct hostname, or a connector they kill and
+// resurrect) use gateLiveOwnSpec to mint their own instead.
 func gateLive(t *testing.T) {
+	t.Helper()
+	gateLiveBare(t)
+	adoptPreflightSpec(t)
+}
+
+// gateLiveOwnSpec is gateLive for the few scenarios that must mint their own
+// identity: it scrubs any inherited LIBTUNNEL_SPEC so the tunnel mints a fresh
+// hostname rather than adopting the shared preflight spec. Used by
+// TestLiveResurrection (kills and resurrects a connector on its own hostname —
+// reusing the shared one risks a sticky 530 after unregister) and
+// TestLiveTwoTunnels (needs two distinct hostnames).
+func gateLiveOwnSpec(t *testing.T) {
+	t.Helper()
+	gateLiveBare(t)
+	t.Setenv(v1.SpecEnv, "")
+}
+
+// gateLiveBare is the shared gate — enable check, preflight, pace — behind both
+// gateLive (adopt the shared spec) and gateLiveOwnSpec (mint your own).
+func gateLiveBare(t *testing.T) {
 	t.Helper()
 	if os.Getenv("LIBTUNNEL_E2E_LIVE") != "1" {
 		t.Skip("live scenario (mints a real quick tunnel); set LIBTUNNEL_E2E_LIVE=1 to run")
@@ -59,7 +88,6 @@ func gateLive(t *testing.T) {
 	if err := preflight(); err != nil {
 		t.Fatalf("live preflight failed (skipping the expensive part): %v", err)
 	}
-	t.Setenv(v1.SpecEnv, "")
 	paceLive()
 }
 
@@ -87,12 +115,18 @@ func preflight() error {
 // lastLiveStart paces back-to-back live tests. The quick-tunnel API and edge
 // provisioning are burst-sensitive: minting a dozen tunnels in a few minutes
 // drew 429s and route-propagation failures live, while the same tests pass
-// individually. Tests run sequentially (no t.Parallel), so a plain variable
-// suffices.
+// individually. The gap does double duty now that SHARE tests reconnect a fresh
+// connector to the ONE preflight hostname in sequence: after a connector's
+// context is canceled the edge can briefly serve its stale route, so the pace
+// also gives the edge time to release the sticky route before the next
+// connector registers. Tests run sequentially (no t.Parallel), so a plain
+// variable suffices.
 var lastLiveStart time.Time
 
 func paceLive() {
-	const gap = 20 * time.Second
+	// 30s, up from 20s: the extra headroom covers sticky-route release on the
+	// shared hostname between sequential SHARE connectors, not just mint spacing.
+	const gap = 30 * time.Second
 	if since := time.Since(lastLiveStart); since < gap {
 		time.Sleep(gap - since)
 	}
@@ -220,6 +254,22 @@ func adoptPreflightSpec(t *testing.T) {
 	}
 	if entry, err := v1alpha1.SpecEnviron("cloudflare", preflightSpec); err == nil {
 		t.Setenv(v1.SpecEnv, strings.TrimPrefix(entry, v1.SpecEnv+"="))
+	}
+}
+
+// drain cancels a SHARE test's tunnel and blocks until its context reports Done,
+// so the connector on the shared preflight hostname is torn down deterministically
+// before the test returns (and before the next SHARE test's paceLive begins its
+// sticky-route release window). Done fires on cancel propagation, not on the
+// edge's own route release — that release is what paceLive's gap covers — so the
+// wait is short and bounded.
+func drain(t *testing.T, conn v1.Tunnel, cancel context.CancelFunc) {
+	t.Helper()
+	cancel()
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Log("connector did not report Done within 5s of cancel")
 	}
 }
 

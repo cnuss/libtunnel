@@ -5,11 +5,17 @@ package e2e_test
 // restarts, process kills, concurrent tunnels — and not meant for human
 // consumption; the examples stay simple.
 //
-// The quick-tunnel API and edge provisioning are burst-sensitive, so the
-// tests are stingy with mints: TestLiveTunnel runs every single-tunnel
-// scenario as subtests of ONE shared tunnel, and only scenarios that
-// inherently need their own tunnel lifecycle (TLS origin, resurrection,
-// two tunnels) mint separately — paced by gateLive.
+// The quick-tunnel API and edge provisioning are burst-sensitive, so the tests
+// are stingy with mints: preflight mints ONE spec and every SHARE test adopts it
+// (gateLive), reconnecting a fresh connector to that one hostname in sequence.
+// Only scenarios that own a hostname's whole lifecycle mint their own
+// (gateLiveOwnSpec): TestLiveResurrection (kills/resurrects a connector) and
+// TestLiveTwoTunnels (two distinct hostnames). The SHARE tests run first and
+// contiguous so the preflight spec stays continuously connected (well inside its
+// ~5min idle TTL); the two OWN tests run last, where preflight GC is moot. This
+// all REQUIRES serial execution (no t.Parallel): one connector at a time on the
+// shared hostname. Sticky-route release between sequential SHARE connectors is
+// paced by gateLive and ridden out by the retrying body/warmup polls.
 
 import (
 	"bufio"
@@ -33,7 +39,6 @@ import (
 
 	"github.com/cnuss/libtunnel"
 	v1 "github.com/cnuss/libtunnel/v1"
-	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
@@ -44,15 +49,7 @@ import (
 // the whole test also covers the https-ingress path — the plain-HTTP path
 // rides with the examples and the other live tests.
 func TestLiveTunnel(t *testing.T) {
-	gateLive(t)
-
-	// Reuse the preflight mint: hand its spec to this tunnel through the
-	// environment (the Cloudflare chain adopts LIBTUNNEL_SPEC before minting).
-	if preflightSpec != nil {
-		if entry, err := v1alpha1.SpecEnviron("cloudflare", preflightSpec); err == nil {
-			t.Setenv(v1.SpecEnv, strings.TrimPrefix(entry, v1.SpecEnv+"="))
-		}
-	}
+	gateLive(t) // adopts the shared preflight spec
 
 	tlsConfig := selfSignedTLS(t)
 	l, err := cryptotls.Listen("tcp", "127.0.0.1:0", tlsConfig)
@@ -79,7 +76,9 @@ func TestLiveTunnel(t *testing.T) {
 	// the tunnel must persist. (Serving conn.Listener() would tie the tunnel
 	// to the server's lifetime — that teardown is exercised at the end.)
 	go srv.Serve(l)
-	// Free the hostname when done — TestLiveResurrection reuses this spec.
+	// Tear the connector down when done: closing the tunnel-owned listener view
+	// cancels the tunnel, so this connector releases the shared preflight
+	// hostname before the next SHARE test (paced by gateLive) reconnects to it.
 	defer conn.Listener().Close()
 
 	// LocalURL is the local bind address — always http, regardless of the
@@ -180,16 +179,18 @@ func TestLiveTunnel(t *testing.T) {
 // bounds every wait, so a regression fails the test instead of hanging it.
 // (URL-before-listener start ordering is pinned by the unit tests.)
 func TestLiveMintedListener(t *testing.T) {
-	gateLive(t)
+	gateLive(t) // adopts the shared preflight spec
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
 
 	// The exact construction from the report: context and logger threaded,
 	// no listener of the caller's own.
 	tun := libtunnel.New(libtunnel.Cloudflare()).
 		WithContext(ctx).
 		WithLogger(slog.Default())
+	// Cancel and wait for teardown so the connector releases the shared hostname
+	// before the next SHARE test reconnects to it.
+	defer drain(t, tun, cancel)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -203,7 +204,10 @@ func TestLiveMintedListener(t *testing.T) {
 	if url == nil {
 		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", tun.Err(), ctx.Err())
 	}
-	eventuallyBody(t, url.String(), "hello via minted listener", 30*time.Second)
+	// 60s: a fresh connector on the just-released shared hostname can see a
+	// transient 5xx while the edge re-resolves the sticky route; the poll retries
+	// through it.
+	eventuallyBody(t, url.String(), "hello via minted listener", 60*time.Second)
 }
 
 // TestLiveLocalURL pins the attach shape (#86): the origin is an
@@ -211,7 +215,7 @@ func TestLiveMintedListener(t *testing.T) {
 // URL — the `cloudflared tunnel --url` equivalent. No listener crosses the
 // tunnel API.
 func TestLiveLocalURL(t *testing.T) {
-	gateLive(t)
+	gateLive(t) // adopts the shared preflight spec
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -221,11 +225,13 @@ func TestLiveLocalURL(t *testing.T) {
 	serveBody(l, "hello via local URL")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
 
 	conn := libtunnel.New(libtunnel.Cloudflare()).
 		WithContext(ctx).
 		WithLocalURL(&url.URL{Scheme: "http", Host: l.Addr().String()})
+	// Cancel and wait for teardown so the connector releases the shared hostname
+	// before the next SHARE test reconnects to it.
+	defer drain(t, conn, cancel)
 
 	// WithContext is set, so URL waits for end-to-end readiness and returns
 	// nil if ctx expires first — bounded either way.
@@ -233,16 +239,21 @@ func TestLiveLocalURL(t *testing.T) {
 	if pub == nil {
 		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", conn.Err(), ctx.Err())
 	}
-	eventuallyBody(t, pub.String(), "hello via local URL", 30*time.Second)
+	// 60s: rides out a transient 5xx while the edge re-resolves the shared
+	// hostname's sticky route to this fresh connector.
+	eventuallyBody(t, pub.String(), "hello via local URL", 60*time.Second)
 }
 
 // TestLiveBinary pins cmd/libtunnel (#90): the env-only launcher. A local
 // server is the origin (LIBTUNNEL_LOCAL_URL), Cloudflare is activated by the
-// switch (LIBTUNNEL__CLOUDFLARE=1) with no spec handoff, and the built binary
-// prints the public URL to stdout and serves the origin through the edge. No
-// flags, no listener plumbing — the whole configuration is environment.
+// switch (LIBTUNNEL__CLOUDFLARE=1), and the built binary prints the public URL
+// to stdout and serves the origin through the edge. No flags, no listener
+// plumbing — the whole configuration is environment. gateLive adopts the shared
+// preflight spec into this process's environment, and the child binary inherits
+// it (LIBTUNNEL_SPEC) through os.Environ() and adopts it too — so this exercises
+// the launcher without minting.
 func TestLiveBinary(t *testing.T) {
-	gateLive(t)
+	gateLive(t) // adopts the shared preflight spec
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -260,8 +271,10 @@ func TestLiveBinary(t *testing.T) {
 	}
 
 	cmd := exec.Command(bin)
-	// gateLive scrubbed LIBTUNNEL_SPEC, so the switch is the only activation
-	// and the binary mints its own tunnel.
+	// gateLive exported the shared preflight spec into this process's
+	// environment; os.Environ() carries LIBTUNNEL_SPEC to the child, which adopts
+	// it instead of minting. The switch is set too, so the activation path is
+	// covered even when a spec is present.
 	cmd.Env = append(os.Environ(),
 		v1.CloudflareEnv+"=1",
 		v1.LocalURLEnv+"=http://"+l.Addr().String(),
@@ -287,7 +300,106 @@ func TestLiveBinary(t *testing.T) {
 	}
 	t.Logf("binary URL: %s", pub)
 
-	eventuallyBody(t, pub, "hello via the binary", 45*time.Second)
+	// 60s: the child adopts the shared hostname, so its first request can hit a
+	// transient 5xx while the edge re-resolves the sticky route to the child's
+	// connector.
+	eventuallyBody(t, pub, "hello via the binary", 60*time.Second)
+}
+
+// TestLiveWatchFlushInterval is the LIVE end-to-end proof of the Cloudflare
+// backend's flush-interval lever (WithFlushInterval) on a kubernetes-shaped
+// watch: a long-lived (~30s) chunked HTTP 200 stream of 30 small events, 1s
+// apart. The events are tiny, so over 30s they never accumulate the edge's 128
+// KiB flush threshold — a PLAIN 200 would sit buffered and dump all 30 at the
+// 30s close. The shim ends the current downstream response CLEANLY every 1s (the
+// edge's other flush trigger), so each event reaches the client within ~interval
+// instead of bunching at close, while the origin sees exactly ONE watch request
+// across every reconnect.
+//
+// The client re-issues the IDENTICAL request after each short response (the
+// kubectl re-watch shape); the session table reattaches it to the live stream.
+func TestLiveWatchFlushInterval(t *testing.T) {
+	gateLive(t) // adopts the shared preflight spec
+
+	srv, originHits := startWatchOrigin(t)
+	origin, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+
+	const chop = 1 * time.Second
+	conn := libtunnel.New(cloudflare.New().WithFlushInterval(chop)).
+		WithLogger(slog.Default()).
+		WithContext(ctx).
+		WithLocalURL(origin)
+	// Cancel and wait for teardown so the connector releases the shared hostname
+	// before the next SHARE test reconnects to it.
+	defer drain(t, conn, cancel)
+
+	pub := conn.URL()
+	if pub == nil {
+		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", conn.Err(), ctx.Err())
+	}
+	base := strings.TrimRight(pub.String(), "/")
+	t.Logf("tunnel up via chop shim (chop=%v): %s", chop, base)
+	// 60s: this fresh connector adopts the shared hostname, so warmup may ride
+	// out a transient 5xx while the edge re-resolves the sticky route.
+	warmup(t, ctx, base+"/watch?n=1&ms=1", 60*time.Second)
+
+	// One logical kube watch: 30 events, 1s apart (~30s of stream), requested
+	// with the SAME url every time so reconnects reattach to the session.
+	const (
+		total    = 30
+		interval = 1 * time.Second
+	)
+	watchURL := base + "/watch?probe=watch&n=30&ms=1000"
+
+	seen := map[int]bool{}
+	var ordered []int
+	var maxLat time.Duration
+	requests := 0
+	deadline := time.Now().Add(55 * time.Second)
+	for len(seen) < total && time.Now().Before(deadline) {
+		requests++
+		for _, ev := range chopStream(t, ctx, watchURL) {
+			if !seen[ev.seq] {
+				seen[ev.seq] = true
+				ordered = append(ordered, ev.seq)
+				if ev.latency > maxLat {
+					maxLat = ev.latency
+				}
+			}
+		}
+	}
+
+	t.Logf("collected %d/%d events over %d downstream requests; origin requests=%d; max per-event latency %v",
+		len(seen), total, requests, originHits.Load(), maxLat.Round(time.Millisecond))
+
+	if len(seen) != total {
+		t.Fatalf("collected %d events, want %d", len(seen), total)
+	}
+	for i, seq := range ordered {
+		if seq != i {
+			t.Fatalf("event %d arrived as seq %d — out of order or gapped across reconnects", i, seq)
+		}
+	}
+	// The core claims, in order of importance:
+	// 1. The origin saw ONE watch request across all the chops.
+	if got := originHits.Load(); got != 1 {
+		t.Errorf("origin received %d watch requests, want exactly 1 (session must shield the origin)", got)
+	}
+	// 2. Each event arrived promptly (~chop + edge/reconnect slop), NOT bunched
+	//    at the 30s close as a plain buffered 200 would.
+	if limit := chop + 2*time.Second; maxLat > limit {
+		t.Errorf("max per-event latency %v, want <= %v (chop should bound delivery, not bunch at close)", maxLat, limit)
+	}
+	// 3. The chop actually cycled — one giant response proves nothing.
+	if requests < 5 {
+		t.Errorf("only %d downstream request(s) for a %v stream with a %v chop — reconnect never exercised",
+			requests, time.Duration(total)*interval, chop)
+	}
 }
 
 // TestLiveResurrection is the strongest form of the handoff promise: the
@@ -299,7 +411,7 @@ func TestLiveResurrection(t *testing.T) {
 		liveServeChild()
 		return
 	}
-	gateLive(t)
+	gateLiveOwnSpec(t) // owns its hostname's lifecycle; mints its own spec
 
 	// Mint a fresh spec: resurrection is about a hostname surviving killed
 	// connectors. (Reusing TestLiveTunnel's deliberately closed hostname
@@ -375,7 +487,7 @@ func liveServeChild() {
 // swap, etc.) could surface. The second tunnel binds an unspecified address,
 // covering the LocalIP outbound-route fallback in the same mints.
 func TestLiveTwoTunnels(t *testing.T) {
-	gateLive(t)
+	gateLiveOwnSpec(t) // needs two distinct hostnames; mints its own
 
 	cases := []struct {
 		bind string
@@ -425,98 +537,5 @@ func TestLiveTwoTunnels(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
-	}
-}
-
-// TestLiveWatchFlushInterval is the LIVE end-to-end proof of the Cloudflare
-// backend's flush-interval lever (WithFlushInterval) on a kubernetes-shaped
-// watch: a long-lived (~30s) chunked HTTP 200 stream of 30 small events, 1s
-// apart. The events are tiny, so over 30s they never accumulate the edge's 128
-// KiB flush threshold — a PLAIN 200 would sit buffered and dump all 30 at the
-// 30s close. The shim ends the current downstream response CLEANLY every 1s (the
-// edge's other flush trigger), so each event reaches the client within ~interval
-// instead of bunching at close, while the origin sees exactly ONE watch request
-// across every reconnect.
-//
-// The client re-issues the IDENTICAL request after each short response (the
-// kubectl re-watch shape); the session table reattaches it to the live stream.
-func TestLiveWatchFlushInterval(t *testing.T) {
-	gateLive(t)
-	adoptPreflightSpec(t) // reuse the preflight mint instead of minting our own
-
-	srv, originHits := startWatchOrigin(t)
-	origin, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	const chop = 1 * time.Second
-	conn := libtunnel.New(cloudflare.New().WithFlushInterval(chop)).
-		WithLogger(slog.Default()).
-		WithContext(ctx).
-		WithLocalURL(origin)
-
-	pub := conn.URL()
-	if pub == nil {
-		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", conn.Err(), ctx.Err())
-	}
-	base := strings.TrimRight(pub.String(), "/")
-	t.Logf("tunnel up via chop shim (chop=%v): %s", chop, base)
-	warmup(t, ctx, base+"/watch?n=1&ms=1", 45*time.Second)
-
-	// One logical kube watch: 30 events, 1s apart (~30s of stream), requested
-	// with the SAME url every time so reconnects reattach to the session.
-	const (
-		total    = 30
-		interval = 1 * time.Second
-	)
-	watchURL := base + "/watch?probe=watch&n=30&ms=1000"
-
-	seen := map[int]bool{}
-	var ordered []int
-	var maxLat time.Duration
-	requests := 0
-	deadline := time.Now().Add(55 * time.Second)
-	for len(seen) < total && time.Now().Before(deadline) {
-		requests++
-		for _, ev := range chopStream(t, ctx, watchURL) {
-			if !seen[ev.seq] {
-				seen[ev.seq] = true
-				ordered = append(ordered, ev.seq)
-				if ev.latency > maxLat {
-					maxLat = ev.latency
-				}
-			}
-		}
-	}
-
-	t.Logf("collected %d/%d events over %d downstream requests; origin requests=%d; max per-event latency %v",
-		len(seen), total, requests, originHits.Load(), maxLat.Round(time.Millisecond))
-
-	if len(seen) != total {
-		t.Fatalf("collected %d events, want %d", len(seen), total)
-	}
-	for i, seq := range ordered {
-		if seq != i {
-			t.Fatalf("event %d arrived as seq %d — out of order or gapped across reconnects", i, seq)
-		}
-	}
-	// The core claims, in order of importance:
-	// 1. The origin saw ONE watch request across all the chops.
-	if got := originHits.Load(); got != 1 {
-		t.Errorf("origin received %d watch requests, want exactly 1 (session must shield the origin)", got)
-	}
-	// 2. Each event arrived promptly (~chop + edge/reconnect slop), NOT bunched
-	//    at the 30s close as a plain buffered 200 would.
-	if limit := chop + 2*time.Second; maxLat > limit {
-		t.Errorf("max per-event latency %v, want <= %v (chop should bound delivery, not bunch at close)", maxLat, limit)
-	}
-	// 3. The chop actually cycled — one giant response proves nothing.
-	if requests < 5 {
-		t.Errorf("only %d downstream request(s) for a %v stream with a %v chop — reconnect never exercised",
-			requests, time.Duration(total)*interval, chop)
 	}
 }
