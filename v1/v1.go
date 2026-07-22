@@ -245,10 +245,13 @@ type Tunnel interface {
 	// An explicit WithLogger keeps its handler either way: the environment
 	// carries a level, not a sink.
 	WithLogger(log *slog.Logger) Tunnel
-	// WithContext threads a caller context into URL, once: set, URL waits for
-	// the tunnel to be reachable end to end (TunnelReady), honoring the
-	// context, instead of only for the hostname to resolve — and returns nil
-	// if the context is done first. Unset (or nil), URL waits on DNS alone.
+	// WithContext threads a caller context into the tunnel, once. It does two
+	// things. First, URL waits for the tunnel to be reachable end to end
+	// (TunnelReady), honoring the context, instead of only for the hostname to
+	// resolve — and returns nil if the context is done first. Unset (or nil),
+	// URL waits on DNS alone. Second, the context is the tunnel's shutdown
+	// handle: canceling it tears the tunnel down (Done fires, Err reports the
+	// context's cause) — the teardown a WithLocalURL origin otherwise lacks.
 	WithContext(ctx context.Context) Tunnel
 	// WithListener provides the local origin as a listener and lazily starts
 	// the edge connection. The origin scheme is not inferred from the
@@ -280,8 +283,9 @@ type Tunnel interface {
 	// The origin is provided exactly once — see WithListener, including the
 	// LIBTUNNEL_LOCAL_URL environment override, which supersedes this
 	// argument too. A URL origin has no tunnel-owned listener: Listener must
-	// not be called (it cancels the tunnel), and there is no handle whose
-	// Close shuts the tunnel down, so the tunnel runs until the process exits
-	// or the tunnel fails.
+	// not be called (it cancels the tunnel), and Close is not the teardown
+	// path. To shut a URL-origin tunnel down, set a context with WithContext
+	// and cancel it; otherwise it runs until the process exits or the tunnel
+	// fails.
 	WithLocalURL(u *url.URL) Tunnel
 }

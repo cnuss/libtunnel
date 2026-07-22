@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -29,15 +30,28 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel {
 	return t
 }
 
-// WithContext threads a caller context into URL: once set, URL upgrades from
-// "the hostname resolves" to "the tunnel is reachable end to end" — it waits
-// for TunnelReady, honoring this context, and returns nil if the context is
-// done first. Write-once: the first call wins, a nil ctx is ignored, and a
-// URL call that already fixed the field (to nil, unset) makes this a no-op.
+// WithContext threads a caller context into the tunnel: once set, URL upgrades
+// from "the hostname resolves" to "the tunnel is reachable end to end" — it
+// waits for TunnelReady, honoring this context, and returns nil if the context
+// is done first. It is also the tunnel's shutdown handle: canceling the
+// context tears the tunnel down (Done fires, Err reports the context's cause),
+// which is the only teardown a WithLocalURL origin has. Write-once: the first
+// call wins, a nil ctx is ignored, and a URL call that already fixed the field
+// (to nil, unset) makes this a no-op.
 func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 	if ctx != nil {
 		t.userCtxOnce.Do(func() {
 			t.userCtx = ctx
+			// Propagate cancellation into the engine context so the caller's
+			// context is a real shutdown handle, not just a cap on URL's wait.
+			// The watcher retires when either context ends, so it never leaks.
+			go func() {
+				select {
+				case <-ctx.Done():
+					t.cancel(context.Cause(ctx))
+				case <-t.ctx.Done():
+				}
+			}()
 		})
 	}
 	return t
@@ -556,7 +570,7 @@ func (t *TunnelImpl[T]) pollAuthoritative() {
 	}
 	host := dnsName(t.Hostname())
 	for round := 0; ; round++ {
-		if rec, ok := authoritativeProbe(t.ctx, t.Logger(), t.Domain(), host); ok {
+		if rec, ok := (*authoritativeProbe.Load())(t.ctx, t.Logger(), t.Domain(), host); ok {
 			t.markHostnameReady(host, rec)
 			return
 		}
@@ -574,11 +588,21 @@ func (t *TunnelImpl[T]) pollAuthoritative() {
 	}
 }
 
-// authoritativeProbe runs one readiness probe for host in zone domain: it
-// returns records and true as soon as one authoritative nameserver serves a
-// non-empty A+AAAA set. It is a package var so tests can drive readiness
-// deterministically without live DNS; production uses realAuthoritativeProbe.
-var authoritativeProbe = realAuthoritativeProbe
+// probeFunc runs one readiness probe for host in zone domain, returning
+// records and true as soon as one authoritative nameserver serves a non-empty
+// A+AAAA set.
+type probeFunc = func(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool)
+
+// authoritativeProbe holds the readiness probe as a swappable hook. It is
+// atomic because tests replace it (SetAuthoritativeProbe) while background
+// pollAuthoritative goroutines from other tests may still be reading it —
+// production only reads it, set once here to realAuthoritativeProbe.
+var authoritativeProbe = func() *atomic.Pointer[probeFunc] {
+	var p atomic.Pointer[probeFunc]
+	fn := probeFunc(realAuthoritativeProbe)
+	p.Store(&fn)
+	return &p
+}()
 
 // realAuthoritativeProbe queries the zone's nameservers for host's A+AAAA and
 // returns the first non-empty answer — one authoritative nameserver serving the
