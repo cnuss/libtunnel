@@ -387,7 +387,43 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	if b.flushInterval != nil {
 		flushInterval = *b.flushInterval
 	}
-	srv := &http.Server{Handler: newOriginProxy(origin, flushInterval, t.Logger())}
+	proxy := newOriginProxy(origin, flushInterval, t.Logger())
+	// HACK (experimental): a ?watch=true request gets its cloudflared conn cut
+	// 5s after it lands. Cutting the live conn ends the request; cloudflared
+	// re-dials the (unchanged) listen port and re-issues the watch, which lands
+	// here and arms another 5s cut — a ~5s disconnect/reconnect loop for the
+	// life of the origin watch. Conns tracked via srv.ConnState. Everything
+	// hardcoded on purpose.
+	var mu sync.Mutex
+	conns := map[net.Conn]struct{}{}
+	srv := &http.Server{}
+	srv.ConnState = func(c net.Conn, s http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch s {
+		case http.StateNew:
+			conns[c] = struct{}{}
+		case http.StateClosed, http.StateHijacked:
+			delete(conns, c)
+		}
+	}
+	killConns := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for c := range conns {
+			c.Close()
+		}
+		t.Logger().Info("cycle: cut cloudflared conns", "n", len(conns))
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("watch") == "true" {
+			t.Logger().Info("watch request: arming 5s conn cut", "url", r.URL.String())
+			timer := time.AfterFunc(5*time.Second, killConns)
+			defer timer.Stop() // origin response ended on its own → disarm
+		}
+		proxy.ServeHTTP(w, r)
+	})
+	srv.Handler = handler
 	context.AfterFunc(t.Context(), func() { srv.Close() })
 	go srv.Serve(l)
 	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origin", origin.Redacted(), "flushInterval", flushInterval)
