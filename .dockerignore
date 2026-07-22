@@ -1,0 +1,21 @@
+# Keep the build context minimal: only source and module manifests are needed
+# to build cmd/libtunnel. Everything below is either irrelevant to the build
+# or regenerated inside it.
+.git
+.github
+.claude
+dist
+bin
+build
+libtunnel
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+examples/serve/serve
+examples/serve-tls/serve-tls
+examples/subprocess/subprocess
+Dockerfile
+.dockerignore
+*.md

@@ -255,7 +255,23 @@ It prints the public URL to stdout (one line; logs go to stderr via
 `LIBTUNNEL_TLS`, `LIBTUNNEL_FROM`, the `LIBTUNNEL__CLOUDFLARE_*` fields —
 flows straight through the library. Minting also exports
 `LIBTUNNEL_SPEC`/`LIBTUNNEL_HOSTNAME`, so a child it later spawns inherits the
-same tunnel identity.
+same tunnel identity. `libtunnel version` prints the build id and exits — the
+only argument it accepts, since configuration is environment-only.
+
+Each release attaches static, stripped binaries for linux/darwin/windows ×
+amd64/arm64, a `SHA256SUMS` manifest, and a cosign `.sigstore` bundle per
+file. To build locally instead: `make dist` (cross-compiles the matrix into
+`dist/`) or `make binary` (host only). CGO is off, so the binary is
+dependency-free and runs on a scratch/distroless base — [`Dockerfile`](./Dockerfile)
+targets `distroless/static:nonroot`:
+
+```sh
+docker build -t libtunnel .
+docker run --rm \
+  -e LIBTUNNEL__CLOUDFLARE=1 \
+  -e LIBTUNNEL_LOCAL_URL=http://host.docker.internal:8080 \
+  libtunnel
+```
 
 ## Examples
 

@@ -120,6 +120,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
       - name: resolve tag
         id: tag
         run: |
@@ -176,6 +180,29 @@ jobs:
       - name: install cosign
         if: steps.tag.outputs.skip != 'true'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: build release binaries
+        if: steps.tag.outputs.skip != 'true'
+        run: make dist VERSION="${{ steps.tag.outputs.tag }}"
+
+      - name: sign and upload release binaries
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+
+          # Cross-compiled launcher binaries plus their checksum manifest,
+          # each signed with cosign in keyless mode (OIDC -> Fulcio cert ->
+          # Rekor transparency log) — the .sigstore bundle carries signature,
+          # cert, and log entry. Runs before "sign source archives" because
+          # `make dist` recreates dist/ from scratch.
+          for f in dist/libtunnel_* dist/SHA256SUMS; do
+            cosign sign-blob --yes --bundle "${f}.sigstore" "$f"
+          done
+
+          gh release upload "${tag}" dist/libtunnel_* dist/SHA256SUMS dist/*.sigstore
 
       - name: sign source archives
         if: steps.tag.outputs.skip != 'true'

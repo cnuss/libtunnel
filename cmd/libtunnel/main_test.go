@@ -8,6 +8,53 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 )
 
+// TestDispatchVersion pins the `version` argument: it prints the banner to
+// the writer and signals exit with no error.
+func TestDispatchVersion(t *testing.T) {
+	var out strings.Builder
+	done, err := dispatch([]string{"version"}, &out)
+	if !done || err != nil {
+		t.Fatalf("dispatch(version) = (%v, %v), want (true, nil)", done, err)
+	}
+	if got := strings.TrimSpace(out.String()); !strings.HasPrefix(got, "libtunnel ") {
+		t.Errorf("version banner = %q, want it to start with %q", got, "libtunnel ")
+	}
+}
+
+// TestDispatchNoArgs pins the normal path: no arguments proceeds to the run.
+func TestDispatchNoArgs(t *testing.T) {
+	var out strings.Builder
+	done, err := dispatch(nil, &out)
+	if done || err != nil {
+		t.Fatalf("dispatch(nil) = (%v, %v), want (false, nil)", done, err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("dispatch(nil) wrote %q, want nothing", out.String())
+	}
+}
+
+// TestDispatchUnexpectedArg pins rejection: any argument other than `version`
+// exits with an error rather than silently ignoring it.
+func TestDispatchUnexpectedArg(t *testing.T) {
+	var out strings.Builder
+	done, err := dispatch([]string{"--serve"}, &out)
+	if !done || err == nil {
+		t.Fatalf("dispatch(--serve) = (%v, %v), want (true, non-nil)", done, err)
+	}
+	if !strings.Contains(err.Error(), "environment") {
+		t.Errorf("error %q does not point the operator at env configuration", err)
+	}
+}
+
+// TestBuildVersionNonEmpty pins that the binary always self-identifies: even
+// a plain `go test` build (no ldflags stamp) resolves a non-empty id from the
+// VCS stamp or module version.
+func TestBuildVersionNonEmpty(t *testing.T) {
+	if got := buildVersion(); got == "" {
+		t.Error("buildVersion() = empty, want a build identifier")
+	}
+}
+
 // clearEnv scrubs every variable build() consults so each case starts from a
 // known-empty environment regardless of the host's.
 func clearEnv(t *testing.T) {
