@@ -18,7 +18,8 @@ import (
 
 // WithLogger sets the logger, once: the first call wins, and a nil logger is
 // ignored. A no-op after the log field is fixed — by an earlier WithLogger,
-// or by the tunnel's first internal Logger read fixing the silent default.
+// or by the tunnel's first internal Logger read fixing the default (silent,
+// or a stderr logger when v1.LogEnv is set).
 func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel {
 	if log != nil {
 		t.logOnce.Do(func() {
@@ -56,6 +57,9 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
 	provided := false
 	t.originOnce.Do(func() {
 		provided = true
+		if t.provideFromEnv() {
+			return
+		}
 		t.provide(l, false)
 	})
 	if !provided {
@@ -77,16 +81,53 @@ func (t *TunnelImpl[T]) WithLocalURL(u *url.URL) v1.Tunnel {
 	provided := false
 	t.originOnce.Do(func() {
 		provided = true
-		if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			t.cancel(fmt.Errorf("WithLocalURL: origin must be an http(s) URL with a host, got %v", u))
+		if t.provideFromEnv() {
 			return
 		}
-		t.provideURL(&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"})
+		normalized, err := normalizeLocalURL(u)
+		if err != nil {
+			t.cancel(fmt.Errorf("WithLocalURL: %w", err))
+			return
+		}
+		t.provideURL(normalized)
 	})
 	if !provided {
 		t.cancel(fmt.Errorf("WithLocalURL: origin already provided"))
 	}
 	return t
+}
+
+// normalizeLocalURL validates a local origin URL and reduces it to
+// scheme+host+"/" — the form provideURL and the engines consume. Shared by
+// WithLocalURL and the v1.LocalURLEnv override.
+func normalizeLocalURL(u *url.URL) (*url.URL, error) {
+	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("origin must be an http(s) URL with a host, got %v", u)
+	}
+	return &url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}, nil
+}
+
+// provideFromEnv applies the v1.LocalURLEnv override: set, it provides the
+// origin from the environment — superseding whatever the caller was about to
+// provide — and reports true. An invalid value also reports true, with the
+// tunnel canceled: the provide slot is spent either way. Unset, it reports
+// false and the caller provides as usual. Runs inside originOnce.Do.
+func (t *TunnelImpl[T]) provideFromEnv() bool {
+	env, ok := os.LookupEnv(v1.LocalURLEnv)
+	if !ok || env == "" {
+		return false
+	}
+	parsed, err := url.Parse(env)
+	if err == nil {
+		parsed, err = normalizeLocalURL(parsed)
+	}
+	if err != nil {
+		t.cancel(fmt.Errorf("%s: %w", v1.LocalURLEnv, err))
+		return true
+	}
+	t.Logger().Info("local origin overridden from the environment", "var", v1.LocalURLEnv, "url", parsed.String())
+	t.provideURL(parsed)
+	return true
 }
 
 // provide adopts l as the local origin and starts the edge connection. It
@@ -172,11 +213,14 @@ func (t *TunnelImpl[T]) Listener() net.Listener {
 }
 
 // ensureOrigin is the shared start-trigger step behind Listener, URL, and
-// TunnelReady: with no origin provided yet it mints a loopback listener
-// (127.0.0.1:0) and adopts it; with one already provided — listener or URL —
-// it is a no-op.
+// TunnelReady: with no origin provided yet it adopts the v1.LocalURLEnv override
+// when set, else mints a loopback listener (127.0.0.1:0) and adopts that;
+// with an origin already provided — listener or URL — it is a no-op.
 func (t *TunnelImpl[T]) ensureOrigin() {
 	t.originOnce.Do(func() {
+		if t.provideFromEnv() {
+			return
+		}
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			// boundListener below sees the canceled tunnel and returns nil.

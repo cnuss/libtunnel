@@ -190,6 +190,38 @@ bad/unknown spec yields a tunnel already canceled with the cause (off `Err()`).
 conn := libtunnel.From("foo.trycloudflare.com").WithListener(l)
 ```
 
+## Environment variables
+
+Every code knob with an env-expressible value has an environment mirror, and
+**env beats code**: an operator can redirect a deployed binary without a
+rebuild. (The one exception is noted below.)
+
+| Variable | Mirrors | Behavior |
+| -------- | ------- | -------- |
+| `LIBTUNNEL_SPEC` | — | Parent→child handoff: a serialized spec adopted at construction (see above). Beats everything, including a code-pinned `From` spec. |
+| `LIBTUNNEL_FROM` | `From()` | Replay a spec by hostname, file path, or literal JSON — `From`'s resolution. Applies after `LIBTUNNEL_SPEC`, before the code-pinned spec and minting. |
+| `LIBTUNNEL_LOCAL_URL` | `WithLocalURL()` | Origin override, applied at origin-provide time: supersedes a `WithListener` listener, a `WithLocalURL` argument, and the start-trigger mint. Invalid value cancels the tunnel. |
+| `LIBTUNNEL_TLS` | `WithTLS()` | Bool (`strconv.ParseBool`). Fixed at backend construction; later `WithTLS` calls are no-ops. Unparsable value fails at connect. |
+| `LIBTUNNEL_HTTP2` | `WithHTTP2()` | Same rules as `LIBTUNNEL_TLS`. |
+| `LIBTUNNEL_LOG` | `WithLogger()` | `debug`\|`info`\|`warn`\|`error`: the default logger becomes a stderr text logger at that level instead of silent. *The exception:* an explicit `WithLogger` keeps its handler — env carries a level, not a sink. |
+| `LIBTUNNEL_HOSTNAME` | — | Export-only mirror of the minted spec's hostname, for tooling; never adopted. |
+| `LIBTUNNEL_CACHE_DIR` | — | Where minted specs are cached and `From`/`Hosts` look. |
+
+Backend-scoped variables follow `LIBTUNNEL__<BACKEND>_<FIELD>` (double
+underscore namespaces the backend) and live with their backend package. For
+Cloudflare, each mirrors a spec-field setter on the backend — env beats code,
+field by field, patched onto whatever spec the chain resolves; a complete
+credential set (id, hostname, account tag, secret) skips resolution entirely:
+
+| Variable | Mirrors |
+| -------- | ------- |
+| `LIBTUNNEL__CLOUDFLARE_ID` | `WithID()` |
+| `LIBTUNNEL__CLOUDFLARE_NAME` | `WithName()` |
+| `LIBTUNNEL__CLOUDFLARE_HOSTNAME` | `WithHostname()` |
+| `LIBTUNNEL__CLOUDFLARE_ACCOUNT_TAG` | `WithAccountTag()` |
+| `LIBTUNNEL__CLOUDFLARE_SECRET` | `WithSecret()` (base64) |
+| `LIBTUNNEL__CLOUDFLARE_API_URL` | `WithApiURL()` — quick-tunnel mint endpoint, default `https://api.trycloudflare.com/tunnel` |
+
 ## Examples
 
 Self-contained programs in [`./examples`](./examples):

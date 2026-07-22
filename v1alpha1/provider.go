@@ -14,23 +14,7 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 )
 
-// SpecEnv is the environment variable carrying a JSON-encoded spec across a
-// process boundary — the parent→child handoff channel. A parent process mints
-// a tunnel spec and exports it (ExportSpec / SpecEnviron); a child process
-// adopts it through Env and connects with the same hostname and credentials.
-// The value is a specEnvelope: the spec tagged with the backend that minted
-// it, so a child running a different backend fails loudly instead of
-// unmarshaling a foreign spec into its own type.
-const SpecEnv = "LIBTUNNEL_SPEC"
-
-// HostnameEnv is a plain-text mirror of the spec's hostname, set by ExportSpec
-// alongside SpecEnv. It is export-only convenience — tooling or a child process
-// can read the public hostname without parsing the SpecEnv envelope. libtunnel
-// itself never adopts it: connecting needs the full credential in SpecEnv, not
-// a hostname alone.
-const HostnameEnv = "LIBTUNNEL_HOSTNAME"
-
-// specEnvelope is the wire form of SpecEnv: the backend name plus the
+// specEnvelope is the wire form of v1.SpecEnv: the backend name plus the
 // backend's own spec encoding.
 type specEnvelope struct {
 	Backend string `json:"backend"`
@@ -41,7 +25,7 @@ type specEnvelope struct {
 	Spec     json.RawMessage `json:"spec"`
 }
 
-// selfExported records SpecEnv values this process exported itself, so
+// selfExported records v1.SpecEnv values this process exported itself, so
 // SpecFromEnv never re-adopts them: the handoff is parent→child inheritance,
 // not tunnel→tunnel within a process. Without this, a second in-process
 // tunnel would race to adopt the first tunnel's identity the moment its mint
@@ -129,7 +113,7 @@ func (p envProvider[E, T]) Spec(ctx context.Context) (T, error) {
 }
 
 // EncodeSpec returns spec as a tagged-envelope JSON string — the value carried
-// by SpecEnv and returned by Spec.Serialize. backend tags which engine minted
+// by v1.SpecEnv and returned by Spec.Serialize. backend tags which engine minted
 // it so a decoder routes to the right spec type.
 func EncodeSpec[T v1.Spec](backend string, spec T) (string, error) {
 	data, err := json.Marshal(spec)
@@ -143,7 +127,7 @@ func EncodeSpec[T v1.Spec](backend string, spec T) (string, error) {
 	return string(envelope), nil
 }
 
-// DecodeSpec splits an envelope (EncodeSpec output / SpecEnv value) into its
+// DecodeSpec splits an envelope (EncodeSpec output / v1.SpecEnv value) into its
 // backend tag and the raw backend spec JSON, for a caller to unmarshal into the
 // matching spec type. A value with no backend tag is not an envelope.
 func DecodeSpec(envelope string) (backend string, spec json.RawMessage, err error) {
@@ -164,28 +148,28 @@ func SpecEnviron[T v1.Spec](backend string, spec T) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return SpecEnv + "=" + value, nil
+	return v1.SpecEnv + "=" + value, nil
 }
 
 // ExportSpec publishes spec into this process's own environment so re-exec'd
 // or spawned children inherit it. The exported value is remembered and never
 // re-adopted by this process's own SpecFromEnv (see Env). It also sets
-// HostnameEnv to the spec's plain hostname as a convenience mirror.
+// v1.HostnameEnv to the spec's plain hostname as a convenience mirror.
 func ExportSpec[T v1.Spec](backend string, spec T) error {
 	entry, err := SpecEnviron(backend, spec)
 	if err != nil {
 		return err
 	}
-	value := entry[len(SpecEnv)+1:]
+	value := entry[len(v1.SpecEnv)+1:]
 	selfExportedMu.Lock()
 	selfExported[value] = true
 	selfExportedMu.Unlock()
-	if err := os.Setenv(SpecEnv, value); err != nil {
+	if err := os.Setenv(v1.SpecEnv, value); err != nil {
 		return err
 	}
 	// Best effort: the hostname mirror is convenience only, not the channel
 	// libtunnel adopts, so a failure here shouldn't fail the export.
-	_ = os.Setenv(HostnameEnv, spec.GetHostname())
+	_ = os.Setenv(v1.HostnameEnv, spec.GetHostname())
 	return nil
 }
 
@@ -195,7 +179,7 @@ func ExportSpec[T v1.Spec](backend string, spec T) error {
 // (ExportSpec) reads as absent — the handoff channel carries parent→child
 // inheritance only.
 func SpecFromEnv[T v1.Spec](backend string, spec T) (bool, error) {
-	env, ok := os.LookupEnv(SpecEnv)
+	env, ok := os.LookupEnv(v1.SpecEnv)
 	if !ok || env == "" {
 		return false, nil
 	}
@@ -209,26 +193,22 @@ func SpecFromEnv[T v1.Spec](backend string, spec T) (bool, error) {
 
 	tag, raw, err := DecodeSpec(env)
 	if err != nil {
-		return false, fmt.Errorf("unable to parse %s: %w", SpecEnv, err)
+		return false, fmt.Errorf("unable to parse %s: %w", v1.SpecEnv, err)
 	}
 	if tag != backend {
-		return false, fmt.Errorf("%s was minted by backend %q, not %q", SpecEnv, tag, backend)
+		return false, fmt.Errorf("%s was minted by backend %q, not %q", v1.SpecEnv, tag, backend)
 	}
 	if err := json.Unmarshal(raw, spec); err != nil {
-		return false, fmt.Errorf("unable to parse %s: %w", SpecEnv, err)
+		return false, fmt.Errorf("unable to parse %s: %w", v1.SpecEnv, err)
 	}
 	return true, nil
 }
 
-// CacheDirEnv overrides where specs are cached and looked up (cache write,
-// Hosts, From). Unset, the per-user os.UserCacheDir()/libtunnel is used.
-const CacheDirEnv = "LIBTUNNEL_CACHE_DIR"
-
-// CacheDir is the directory specs are cached to and replayed from: CacheDirEnv
+// CacheDir is the directory specs are cached to and replayed from: v1.CacheDirEnv
 // when set (used as-is), otherwise os.UserCacheDir() namespaced by the stable
 // v1 contract package path (e.g. .../github.com/cnuss/libtunnel/v1).
 func CacheDir() (string, error) {
-	if d := os.Getenv(CacheDirEnv); d != "" {
+	if d := os.Getenv(v1.CacheDirEnv); d != "" {
 		return d, nil
 	}
 	base, err := os.UserCacheDir()
@@ -247,7 +227,7 @@ func packagePath() string {
 }
 
 // cacheSpec writes a freshly minted spec to CacheDir as <hostname>.spec.json
-// (Serialize output, the SpecEnv envelope). Best effort: callers ignore the
+// (Serialize output, the v1.SpecEnv envelope). Best effort: callers ignore the
 // error — the cache is a convenience, not the source of truth. Only minted
 // specs are cached (see envProvider.Spec); adopted or From-loaded specs are
 // not re-written.

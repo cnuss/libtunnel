@@ -474,6 +474,82 @@ func TestWithLocalURLReadiness(t *testing.T) {
 	}
 }
 
+// TestEnvLocalURLOverridesProvides pins the LIBTUNNEL_LOCAL_URL env-beats-code
+// rule at every origin-provide path: the env URL supersedes a WithListener
+// listener, a WithLocalURL argument, and the start-trigger mint — the engine
+// receives the env URL and never a listener.
+func TestEnvLocalURLOverridesProvides(t *testing.T) {
+	for name, provide := range map[string]func(v1.Tunnel, net.Listener){
+		"WithListener": func(tun v1.Tunnel, l net.Listener) { tun.WithListener(l) },
+		"WithLocalURL": func(tun v1.Tunnel, _ net.Listener) {
+			tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:9"})
+		},
+		"StartTriggerMint": func(tun v1.Tunnel, _ net.Listener) { tun.TunnelReady() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			stubReady(t)
+			t.Setenv(v1.LocalURLEnv, "http://127.0.0.1:4321")
+			engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"})
+			tun := v1alpha1.New(engine)
+
+			provide(tun, listen(t))
+
+			select {
+			case got := <-engine.gotURL:
+				if got.String() != "http://127.0.0.1:4321/" {
+					t.Errorf("engine received %v, want the env override http://127.0.0.1:4321/", got)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("engine never received the env origin URL")
+			}
+			select {
+			case l := <-engine.got:
+				t.Errorf("engine received listener %v despite the env override", l.Addr())
+			default:
+			}
+			if got := tun.LocalPort(); got != 4321 {
+				t.Errorf("LocalPort() = %d, want 4321 (the env URL's port)", got)
+			}
+		})
+	}
+}
+
+// TestEnvLocalURLInvalidCancels pins loud failure for a bad override: the
+// provide slot is spent and the tunnel dies with the variable named.
+func TestEnvLocalURLInvalidCancels(t *testing.T) {
+	t.Setenv(v1.LocalURLEnv, "ftp://127.0.0.1:21")
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	tun.WithListener(listen(t))
+
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), v1.LocalURLEnv) {
+			t.Errorf("Err() = %v, want a %s cause", err, v1.LocalURLEnv)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed for an invalid LIBTUNNEL_LOCAL_URL")
+	}
+}
+
+// TestEnvLogSetsDefaultLevel pins LIBTUNNEL_LOG: the default logger stops
+// being silent and enables the named level — while an explicit WithLogger
+// keeps its handler (env carries a level, not a sink).
+func TestEnvLogSetsDefaultLevel(t *testing.T) {
+	t.Setenv(v1.LogEnv, "debug")
+
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	if !tun.Logger().Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("Logger() does not enable debug with LIBTUNNEL_LOG=debug")
+	}
+
+	own := slog.New(slog.DiscardHandler)
+	tun2 := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
+	tun2.WithLogger(own)
+	if got := tun2.Logger(); got != own {
+		t.Errorf("Logger() = %p with WithLogger set, want the explicit logger %p (env must not replace a sink)", got, own)
+	}
+}
+
 // TestWithLoggerWriteOnce pins the write-once mutator contract: the first
 // WithLogger fixes the logger; a later call is a no-op, not a mutation.
 func TestWithLoggerWriteOnce(t *testing.T) {
