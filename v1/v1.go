@@ -79,6 +79,15 @@ const (
 // set (id, hostname, account tag, secret) is a spec of its own and skips
 // resolution, a partial one patches whatever the chain resolves.
 const (
+	// CloudflareEnv activates the Cloudflare backend in an env-only launcher
+	// (cmd/libtunnel): set it to "1" to select Cloudflare when no spec
+	// handoff is present. It follows the LIBTUNNEL__<BACKEND> switch pattern
+	// (the backend name, no field suffix); future backends get their own
+	// switch. The library's own New(Cloudflare()) path does not consult it —
+	// it is the launcher's backend selector. LIBTUNNEL_SPEC also activates
+	// Cloudflare, since the handoff envelope already names its backend.
+	CloudflareEnv = "LIBTUNNEL__CLOUDFLARE"
+
 	CloudflareIDEnv         = "LIBTUNNEL__CLOUDFLARE_ID"
 	CloudflareNameEnv       = "LIBTUNNEL__CLOUDFLARE_NAME"
 	CloudflareHostnameEnv   = "LIBTUNNEL__CLOUDFLARE_HOSTNAME"

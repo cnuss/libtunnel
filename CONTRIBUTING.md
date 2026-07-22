@@ -24,6 +24,7 @@ Deep-link by filename; line numbers will drift.
 | godoc examples                                 | [`v1/example_test.go`](./v1/example_test.go)                     |
 | e2e harness + runner                           | [`e2e/e2e_test.go`](./e2e/e2e_test.go)                           |
 | Worked examples                                | [`examples/`](./examples)                                        |
+| Env-only launcher binary                       | [`cmd/libtunnel/main.go`](./cmd/libtunnel/main.go)              |
 | Build / lint / test commands                   | [`Makefile`](./Makefile)                                         |
 | Release + skip release regex                   | [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)         |
 | CodeQL scan                                    | [`.github/workflows/codeql.yml`](./.github/workflows/codeql.yml) |
@@ -46,6 +47,8 @@ github.com/cnuss/libtunnel/v1alpha1             — lazy tunnel core + generic
                                                   alpha revisions.
 github.com/cnuss/libtunnel/v1alpha1/cloudflare  — the cloudflared quick-tunnel
                                                   engine + its Spec type.
+github.com/cnuss/libtunnel/cmd/libtunnel        — env-only launcher binary
+                                                  (main package, not imported).
 ```
 
 Application code imports the root (`libtunnel.New(...)`). Code that needs to

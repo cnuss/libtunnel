@@ -21,6 +21,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -230,6 +233,60 @@ func TestLiveLocalURL(t *testing.T) {
 		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", conn.Err(), ctx.Err())
 	}
 	eventuallyBody(t, pub.String(), "hello via local URL", 30*time.Second)
+}
+
+// TestLiveBinary pins cmd/libtunnel (#90): the env-only launcher. A local
+// server is the origin (LIBTUNNEL_LOCAL_URL), Cloudflare is activated by the
+// switch (LIBTUNNEL__CLOUDFLARE=1) with no spec handoff, and the built binary
+// prints the public URL to stdout and serves the origin through the edge. No
+// flags, no listener plumbing — the whole configuration is environment.
+func TestLiveBinary(t *testing.T) {
+	gateLive(t)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	serveBody(l, "hello via the binary")
+
+	bin := filepath.Join(t.TempDir(), "libtunnel")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	if out, err := exec.Command("go", "build", "-o", bin, "../cmd/libtunnel").CombinedOutput(); err != nil {
+		t.Fatalf("build cmd/libtunnel: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(bin)
+	// gateLive scrubbed LIBTUNNEL_SPEC, so the switch is the only activation
+	// and the binary mints its own tunnel.
+	cmd.Env = append(os.Environ(),
+		v1.CloudflareEnv+"=1",
+		v1.LocalURLEnv+"=http://"+l.Addr().String(),
+	)
+	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cmd.Process.Kill(); cmd.Wait() }()
+
+	// The binary prints the public URL as its first (and only) stdout line.
+	var pub string
+	scanner := bufio.NewScanner(stdout)
+	if scanner.Scan() {
+		pub = strings.TrimSpace(scanner.Text())
+	}
+	if pub == "" {
+		t.Fatalf("binary printed no URL before exiting (scan err: %v)", scanner.Err())
+	}
+	t.Logf("binary URL: %s", pub)
+
+	eventuallyBody(t, pub, "hello via the binary", 45*time.Second)
 }
 
 // TestLiveResurrection is the strongest form of the handoff promise: the

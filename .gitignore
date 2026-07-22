@@ -40,3 +40,6 @@ go.work.sum
 examples/serve/serve
 examples/serve-tls/serve-tls
 examples/subprocess/subprocess
+
+# make binary output (host build of the launcher)
+/libtunnel
