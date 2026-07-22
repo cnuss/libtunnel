@@ -86,10 +86,12 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 
 	// Surface why the tunnel context was canceled. cancel is a
 	// CancelCauseFunc, so every t.Cancel(err) records a cause that
-	// context.Cause reports here when Done fires.
+	// context.Cause reports here when Done fires. Logged at Info: a cancel is
+	// as often a clean shutdown (a signal, a caller context) as a failure, so
+	// it is not inherently a warning.
 	go func() {
 		<-t.ctx.Done()
-		t.Logger().Warn("tunnel context canceled", "cause", context.Cause(t.ctx))
+		t.Logger().Info("tunnel context canceled", "cause", context.Cause(t.ctx))
 	}()
 
 	return t
