@@ -278,7 +278,11 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           # The release job resolves its own tag, so feed that to the semver
           # extractor via value= instead of letting it read github.ref.
+          # The raw v-prefixed tag matches libtunnel.Version() exactly, so
+          # `ghcr.io/cnuss/libtunnel:` + Version() resolves; the bare semver
+          # tags are the conventional Docker form.
           tags: |
+            type=raw,value=${{ steps.tag.outputs.tag }}
             type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }}
             type=raw,value=latest

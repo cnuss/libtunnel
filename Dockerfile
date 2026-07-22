@@ -17,7 +17,7 @@ COPY . .
 ARG VERSION=docker
 ARG TARGETOS TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
-      -ldflags "-s -w -X main.version=${VERSION}" \
+      -ldflags "-s -w -X github.com/cnuss/libtunnel.version=${VERSION}" \
       -o /libtunnel ./cmd/libtunnel
 
 # Runtime stage: distroless static with a nonroot user. libtunnel embeds its

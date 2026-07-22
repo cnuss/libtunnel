@@ -46,12 +46,11 @@ func TestDispatchUnexpectedArg(t *testing.T) {
 	}
 }
 
-// TestBuildVersionNonEmpty pins that the binary always self-identifies: even
-// a plain `go test` build (no ldflags stamp) resolves a non-empty id from the
-// VCS stamp or module version.
-func TestBuildVersionNonEmpty(t *testing.T) {
-	if got := buildVersion(); got == "" {
-		t.Error("buildVersion() = empty, want a build identifier")
+// TestVersionLineNonEmpty pins that the banner carries a version: it delegates
+// to libtunnel.Version(), which always resolves a non-empty identifier.
+func TestVersionLineNonEmpty(t *testing.T) {
+	if got := versionLine(); !strings.HasPrefix(got, "libtunnel ") || strings.HasSuffix(got, "libtunnel ") {
+		t.Errorf("versionLine() = %q, want a non-empty libtunnel banner", got)
 	}
 }
 

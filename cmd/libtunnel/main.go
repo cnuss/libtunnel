@@ -33,17 +33,11 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"runtime/debug"
 	"syscall"
 
 	"github.com/cnuss/libtunnel"
 	v1 "github.com/cnuss/libtunnel/v1"
 )
-
-// version is the build identifier, stamped by the release build via
-// -ldflags "-X main.version=<tag>". Left empty by a plain `go build` / `go
-// run`, in which case buildVersion falls back to the embedded VCS stamp.
-var version string
 
 func main() {
 	if done, err := dispatch(os.Args[1:], os.Stdout); done {
@@ -118,7 +112,7 @@ func build(ctx context.Context) (libtunnel.TunnelV1, error) {
 		return nil, fmt.Errorf("no origin: set %s to the local service URL (e.g. http://localhost:8080)", v1.LocalURLEnv)
 	}
 	log := logger()
-	log.Info("libtunnel starting", "version", buildVersion())
+	log.Info("libtunnel starting", "version", libtunnel.Version())
 	return libtunnel.New(libtunnel.Cloudflare()).WithLogger(log).WithContext(ctx), nil
 }
 
@@ -137,43 +131,10 @@ func logger() *slog.Logger {
 }
 
 // versionLine is the human-facing build banner: "libtunnel <id> (built <go>)".
+// The id comes from the library so the binary and the imported package always
+// report the same version.
 func versionLine() string {
-	return fmt.Sprintf("libtunnel %s (built %s)", buildVersion(), runtime.Version())
-}
-
-// buildVersion resolves the build identifier: the -ldflags-stamped version
-// when present (release builds), else the embedded VCS revision — short, with
-// a -dirty suffix for an uncommitted tree — else the module version, else
-// "unknown". So a plain `go build` still self-identifies.
-func buildVersion() string {
-	if version != "" {
-		return version
-	}
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "unknown"
-	}
-	var revision, dirty string
-	for _, s := range info.Settings {
-		switch s.Key {
-		case "vcs.revision":
-			revision = s.Value
-		case "vcs.modified":
-			if s.Value == "true" {
-				dirty = "-dirty"
-			}
-		}
-	}
-	if revision != "" {
-		if len(revision) > 12 {
-			revision = revision[:12]
-		}
-		return revision + dirty
-	}
-	if info.Main.Version != "" {
-		return info.Main.Version
-	}
-	return "unknown"
+	return fmt.Sprintf("libtunnel %s (built %s)", libtunnel.Version(), runtime.Version())
 }
 
 // cloudflareActivated reports whether the environment selects the Cloudflare

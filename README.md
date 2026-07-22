@@ -141,6 +141,9 @@ func Cloudflare() v1.Backend[*cloudflare.Spec]   // in-process cloudflared engin
 func From(spec string) v1.Tunnel                 // replay a serialized spec (JSON,
                                                  // file path, or cached hostname)
 func Hosts() []string                            // public URLs of cached specs
+func Version() string                            // the libtunnel release this build
+                                                 // links against (matches the git tag
+                                                 // and the container image tag)
 
 // parent→child handoff — no API: minting exports the LIBTUNNEL_SPEC env var,
 // construction adopts it
@@ -274,6 +277,15 @@ docker run --rm \
 ```
 
 Or build it yourself: `docker build -t libtunnel .`
+
+The image is tagged with the release version (`v0.0.29`), the bare semver
+(`0.0.29`, `0.0`), and `latest`. `libtunnel.Version()` returns the v-prefixed
+tag, so a consumer can pin the image to the exact library version it links
+against without any string munging:
+
+```go
+image := "ghcr.io/cnuss/libtunnel:" + libtunnel.Version()
+```
 
 ## Examples
 

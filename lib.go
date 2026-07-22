@@ -34,11 +34,94 @@ package libtunnel
 import (
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
+
+// modulePath is libtunnel's import path — used to find libtunnel's own entry
+// in an importer's build info.
+const modulePath = "github.com/cnuss/libtunnel"
+
+// version is stamped into libtunnel's own release binaries via
+// -ldflags "-X github.com/cnuss/libtunnel.version=<tag>" (the Makefile,
+// Dockerfile, and release workflow all pass the release tag). It is empty in
+// a plain `go build` and in every downstream consumer's build, where Version
+// derives the value from build info instead.
+var version string
+
+// Version reports the libtunnel release this build links against — e.g.
+// "v0.0.29". It matches the git tag and the published container image tag, so
+// a consumer can pin the image to the exact library version it compiles
+// against:
+//
+//	image := "ghcr.io/cnuss/libtunnel:" + libtunnel.Version()
+//
+// Resolution, in order: the release stamp (set only in libtunnel's own
+// release binaries); the module version recorded in the importer's build info
+// (the common consumer case — the version required in their go.mod); the
+// main-module version; and finally the short VCS revision of a local build
+// (with a -dirty suffix for an uncommitted tree). A build carrying no version
+// information at all returns "unknown".
+//
+// Image tag convention: each release publishes ghcr.io/cnuss/libtunnel tagged
+// with both the v-prefixed release tag (matching Version exactly) and the
+// bare semver ("0.0.29", "0.0"), plus "latest" — so concatenating Version
+// onto the image name resolves to the matching image with no trimming.
+func Version() string {
+	if version != "" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	// Consumer build: libtunnel is a dependency — return the module version
+	// the importer pinned (following a replace directive if one redirects it).
+	for _, dep := range info.Deps {
+		if dep.Path != modulePath {
+			continue
+		}
+		if dep.Replace != nil {
+			dep = dep.Replace
+		}
+		if dep.Version != "" {
+			return dep.Version
+		}
+	}
+	// libtunnel is the main module (its own binary, or its tests): the main
+	// module version, then the VCS stamp.
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	return vcsVersion(info)
+}
+
+// vcsVersion is the local-build fallback: the short VCS revision with a
+// -dirty suffix for an uncommitted tree, or "unknown" when the build carries
+// no VCS stamp.
+func vcsVersion(info *debug.BuildInfo) string {
+	var revision, dirty string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	if revision == "" {
+		return "unknown"
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	return revision + dirty
+}
 
 // TunnelV1 is the tunnel handle returned by New: a non-generic alias for
 // v1.Tunnel, re-exported so callers can name the type without importing v1.
