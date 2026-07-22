@@ -222,6 +222,41 @@ credential set (id, hostname, account tag, secret) skips resolution entirely:
 | `LIBTUNNEL__CLOUDFLARE_SECRET` | `WithSecret()` (base64) |
 | `LIBTUNNEL__CLOUDFLARE_API_URL` | `WithApiURL()` — quick-tunnel mint endpoint, default `https://api.trycloudflare.com/tunnel` |
 
+The Cloudflare backend also has a bare activation switch, `LIBTUNNEL__CLOUDFLARE=1`,
+used by the binary below to select it without a spec handoff.
+
+## Binary
+
+[`cmd/libtunnel`](./cmd/libtunnel) is a standalone launcher configured
+**only** by the environment — no flags, no config files — the operator-side
+face of the variables above. Shaped for `docker run -e ...`:
+
+```sh
+go run ./cmd/libtunnel
+# or: go build -o libtunnel ./cmd/libtunnel
+```
+
+It needs two things:
+
+- a **backend**, activated by `LIBTUNNEL_SPEC` (a spec handoff) or
+  `LIBTUNNEL__CLOUDFLARE=1` (the explicit switch); and
+- an **origin**, `LIBTUNNEL_LOCAL_URL` — a standalone binary has no listener
+  to inherit, so it points at an already-running local service.
+
+```sh
+LIBTUNNEL__CLOUDFLARE=1 \
+LIBTUNNEL_LOCAL_URL=http://localhost:8080 \
+LIBTUNNEL_LOG=info \
+  libtunnel
+```
+
+It prints the public URL to stdout (one line; logs go to stderr via
+`LIBTUNNEL_LOG`) and runs until `SIGINT`/`SIGTERM`. Every other knob —
+`LIBTUNNEL_TLS`, `LIBTUNNEL_FROM`, the `LIBTUNNEL__CLOUDFLARE_*` fields —
+flows straight through the library. Minting also exports
+`LIBTUNNEL_SPEC`/`LIBTUNNEL_HOSTNAME`, so a child it later spawns inherits the
+same tunnel identity.
+
 ## Examples
 
 Self-contained programs in [`./examples`](./examples):
