@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -569,7 +570,7 @@ func (t *TunnelImpl[T]) pollAuthoritative() {
 	}
 	host := dnsName(t.Hostname())
 	for round := 0; ; round++ {
-		if rec, ok := authoritativeProbe(t.ctx, t.Logger(), t.Domain(), host); ok {
+		if rec, ok := (*authoritativeProbe.Load())(t.ctx, t.Logger(), t.Domain(), host); ok {
 			t.markHostnameReady(host, rec)
 			return
 		}
@@ -587,11 +588,21 @@ func (t *TunnelImpl[T]) pollAuthoritative() {
 	}
 }
 
-// authoritativeProbe runs one readiness probe for host in zone domain: it
-// returns records and true as soon as one authoritative nameserver serves a
-// non-empty A+AAAA set. It is a package var so tests can drive readiness
-// deterministically without live DNS; production uses realAuthoritativeProbe.
-var authoritativeProbe = realAuthoritativeProbe
+// probeFunc runs one readiness probe for host in zone domain, returning
+// records and true as soon as one authoritative nameserver serves a non-empty
+// A+AAAA set.
+type probeFunc = func(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool)
+
+// authoritativeProbe holds the readiness probe as a swappable hook. It is
+// atomic because tests replace it (SetAuthoritativeProbe) while background
+// pollAuthoritative goroutines from other tests may still be reading it —
+// production only reads it, set once here to realAuthoritativeProbe.
+var authoritativeProbe = func() *atomic.Pointer[probeFunc] {
+	var p atomic.Pointer[probeFunc]
+	fn := probeFunc(realAuthoritativeProbe)
+	p.Store(&fn)
+	return &p
+}()
 
 // realAuthoritativeProbe queries the zone's nameservers for host's A+AAAA and
 // returns the first non-empty answer — one authoritative nameserver serving the
