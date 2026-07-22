@@ -89,8 +89,8 @@ type Backend struct {
 	// means the default; v1.CloudflareAPIURLEnv supersedes either.
 	apiURL string
 	// flushInterval, when non-nil, engages the reverse-proxy shim
-	// (wrapped_listener.go) with httputil.ReverseProxy.FlushInterval set to its
-	// value. Nil means off (cloudflared dials the origin directly). flushFixed
+	// (interposeReverseProxy) with httputil.ReverseProxy.FlushInterval set to
+	// its value. Nil means off (cloudflared dials the origin directly). flushFixed
 	// records that LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL fixed it, so
 	// WithFlushInterval is a no-op (env beats code).
 	flushInterval *time.Duration
@@ -198,7 +198,7 @@ func (b *Backend) WithApiURL(apiURL string) *Backend {
 }
 
 // WithFlushInterval interposes an httputil.ReverseProxy between cloudflared and
-// the origin (see wrapped_listener.go) and sets its FlushInterval to d, carrying
+// the origin (see interposeReverseProxy) and sets its FlushInterval to d, carrying
 // the stdlib semantics exactly: the client-facing response body is flushed every
 // d while it is being copied from the origin, so a slow streaming response is
 // pushed downstream on that cadence instead of pooling in a buffer. d <= 0 uses
