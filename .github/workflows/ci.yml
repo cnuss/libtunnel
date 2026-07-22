@@ -247,6 +247,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: image metadata
+        id: meta
+        if: steps.tag.outputs.skip != 'true'
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # The release job resolves its own tag, so feed that to the semver
+          # extractor via value= instead of letting it read github.ref.
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }}
+            type=raw,value=latest
+
       - name: build and push image
         id: image
         if: steps.tag.outputs.skip != 'true'
@@ -258,9 +271,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: VERSION=${{ steps.tag.outputs.tag }}
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
 
       - name: sign image
         if: steps.tag.outputs.skip != 'true'
