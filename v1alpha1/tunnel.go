@@ -29,15 +29,28 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel {
 	return t
 }
 
-// WithContext threads a caller context into URL: once set, URL upgrades from
-// "the hostname resolves" to "the tunnel is reachable end to end" — it waits
-// for TunnelReady, honoring this context, and returns nil if the context is
-// done first. Write-once: the first call wins, a nil ctx is ignored, and a
-// URL call that already fixed the field (to nil, unset) makes this a no-op.
+// WithContext threads a caller context into the tunnel: once set, URL upgrades
+// from "the hostname resolves" to "the tunnel is reachable end to end" — it
+// waits for TunnelReady, honoring this context, and returns nil if the context
+// is done first. It is also the tunnel's shutdown handle: canceling the
+// context tears the tunnel down (Done fires, Err reports the context's cause),
+// which is the only teardown a WithLocalURL origin has. Write-once: the first
+// call wins, a nil ctx is ignored, and a URL call that already fixed the field
+// (to nil, unset) makes this a no-op.
 func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 	if ctx != nil {
 		t.userCtxOnce.Do(func() {
 			t.userCtx = ctx
+			// Propagate cancellation into the engine context so the caller's
+			// context is a real shutdown handle, not just a cap on URL's wait.
+			// The watcher retires when either context ends, so it never leaks.
+			go func() {
+				select {
+				case <-ctx.Done():
+					t.cancel(context.Cause(ctx))
+				case <-t.ctx.Done():
+				}
+			}()
 		})
 	}
 	return t

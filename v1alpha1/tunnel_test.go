@@ -649,12 +649,12 @@ func TestWithContextURLWaitsForTunnelReady(t *testing.T) {
 	}
 }
 
-// TestWithContextURLReturnsNilOnContextCancel pins that the caller's context
-// caps URL's wait without killing the tunnel: a canceled context yields nil
-// from URL, but the tunnel stays alive (Err stays nil). The .invalid hostname
-// never resolves, so TunnelReady never fires — only the canceled context can
-// unblock URL, making the nil deterministic.
-func TestWithContextURLReturnsNilOnContextCancel(t *testing.T) {
+// TestWithContextCancelReturnsNilURLAndTearsDown pins the WithContext
+// shutdown contract (#97): canceling the caller's context both unblocks URL
+// (returning nil) and tears the tunnel down — Done fires and Err reports the
+// context's cause. The .invalid hostname never resolves, so only the canceled
+// context can end the wait, making the outcome deterministic.
+func TestWithContextCancelReturnsNilURLAndTearsDown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // caller gives up immediately; the tunnel is still coming up
 
@@ -665,8 +665,46 @@ func TestWithContextURLReturnsNilOnContextCancel(t *testing.T) {
 	if u := conn.URL(); u != nil {
 		t.Errorf("URL() = %v with a canceled context, want nil", u)
 	}
-	if err := tun.Err(); err != nil {
-		t.Errorf("Err() = %v, want nil — the caller's context must not cancel the tunnel", err)
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); !errors.Is(err, context.Canceled) {
+			t.Errorf("Err() = %v, want context.Canceled (the caller's context is the shutdown handle)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never fired after the caller's context was canceled")
+	}
+}
+
+// TestWithContextCancelTearsDownURLOrigin pins the motivating case (#97): a
+// WithLocalURL origin has no listener and no Close, so the caller's context
+// is its only teardown. Canceling it after the tunnel is up must retire the
+// tunnel, not leak it until process exit.
+func TestWithContextCancelTearsDownURLOrigin(t *testing.T) {
+	stubReady(t)
+	ctx, cancel := context.WithCancelCause(context.Background())
+
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"})).
+		WithContext(ctx).
+		WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
+
+	select {
+	case <-conn.TunnelReady():
+	case <-conn.Done():
+		t.Fatalf("tunnel died before becoming ready: %v", conn.Err())
+	case <-time.After(5 * time.Second):
+		t.Fatal("tunnel never became ready")
+	}
+
+	wantErr := errors.New("caller done")
+	cancel(wantErr)
+
+	select {
+	case <-conn.Done():
+		if err := conn.Err(); !errors.Is(err, wantErr) {
+			t.Errorf("Err() = %v, want the context cause %v", err, wantErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never fired after the caller canceled the context — URL origin leaked")
 	}
 }
 
