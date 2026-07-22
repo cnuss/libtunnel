@@ -1,6 +1,6 @@
 package cloudflare
 
-// Offline tests for the reverse-proxy shim (interposeReverseProxy) below build
+// Offline tests for the origin reverse proxy (newOriginProxy) below build
 // the proxy directly and speak plain HTTP to its listener address — no
 // cloudflared, no tunnel mint, no real edge. There is no edge offline, so they
 // cannot assert edge-flush timing; they assert the proxy relays the origin's
@@ -255,12 +255,15 @@ func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server, flushInt
 	if err != nil {
 		t.Fatalf("parse origin url: %v", err)
 	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	addr, err := interposeReverseProxy(ctx, logger, origin, flushInterval)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("interposeReverseProxy: %v", err)
+		t.Fatalf("listen: %v", err)
 	}
-	return "http://" + addr
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ps := &http.Server{Handler: newOriginProxy(origin, flushInterval, logger)}
+	context.AfterFunc(ctx, func() { ps.Close() })
+	go ps.Serve(l)
+	return "http://" + l.Addr().String()
 }
 
 func qint(r *http.Request, key string, def int) int {
