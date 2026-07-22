@@ -21,10 +21,22 @@ package cloudflare
 // buffer for the session's whole life. Sessions are keyed by the request
 // line, so a client re-issuing the identical request (kubectl re-watching)
 // reattaches; a different request starts its own session.
+//
+// Only STREAMING origin responses (Transfer-Encoding: chunked with no
+// Content-Length) take the de-chunk/chop path above. A FIXED response
+// (Content-Length, or a close-delimited body — e.g. apiserver /healthz) is
+// relayed VERBATIM to one downstream conn — exact head bytes, body copied
+// through untouched — then the session finishes; there is nothing to chop.
+//
+// cloudflared reaches the shim over plaintext (the shim listens on a plain TCP
+// socket); the shim re-dials the origin itself, adding TLS on that hop when the
+// origin scheme is https (InsecureSkipVerify, matching the engine's always-off
+// origin verification).
 
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -42,37 +54,40 @@ import (
 type wrappedListener struct {
 	net.Listener // cf-facing TCP listener
 
-	target string // origin host:port
-	log    *slog.Logger
-	ctx    context.Context
-	chop   time.Duration // downstream clean-close cadence; 0 = never chop
+	target    string // origin host:port
+	originTLS bool   // dial the origin over TLS (InsecureSkipVerify) when set
+	log       *slog.Logger
+	ctx       context.Context
+	chop      time.Duration // downstream clean-close cadence; 0 = never chop
 
 	mu       sync.Mutex
 	sessions map[string]*session
 }
 
 // newWrappedListener binds the cf-facing listener and starts the accept loop.
-// target is the origin's host:port. chop is the clean-close cadence (0 = never
-// chop).
-func newWrappedListener(ctx context.Context, log *slog.Logger, target string, chop time.Duration) (*wrappedListener, error) {
+// target is the origin's host:port; originTLS dials that origin over TLS
+// (InsecureSkipVerify, matching the backend's always-off origin verification).
+// chop is the clean-close cadence (0 = never chop).
+func newWrappedListener(ctx context.Context, log *slog.Logger, target string, originTLS bool, chop time.Duration) (*wrappedListener, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
 	w := &wrappedListener{
-		Listener: l,
-		target:   target,
-		log:      log,
-		ctx:      ctx,
-		chop:     chop,
-		sessions: map[string]*session{},
+		Listener:  l,
+		target:    target,
+		originTLS: originTLS,
+		log:       log,
+		ctx:       ctx,
+		chop:      chop,
+		sessions:  map[string]*session{},
 	}
 	go func() {
 		<-ctx.Done()
 		l.Close()
 	}()
 	go w.serve()
-	log.Info("wrapped listener interposed", "listen", l.Addr().String(), "target", target, "chop", chop)
+	log.Info("wrapped listener interposed", "listen", l.Addr().String(), "target", target, "originTLS", originTLS, "chop", chop)
 	return w, nil
 }
 
@@ -133,13 +148,30 @@ type session struct {
 	head   []byte       // origin response head (status line + headers + CRLF)
 	frames *frameBuffer // de-chunked payload frames from the origin
 
+	// Fixed-response passthrough (non-streaming origin). Set by upstream before
+	// headReady closes, so headReady's close synchronizes them for downstream.
+	// When fixed, upstream hands the live origin conn/reader to downstream for a
+	// verbatim relay instead of de-chunking into frames.
+	fixed      bool
+	originConn net.Conn      // live origin conn, owned by downstream on the fixed path
+	originBR   *bufio.Reader // buffered origin reader positioned at the body start
+	originStop func() bool   // cancels the ctx-cancel AfterFunc on originConn
+	bodyLen    int64         // Content-Length, or -1 for a close-delimited body
+
 	headReady chan struct{} // closed once head is parsed
 	doneCh    chan struct{} // closed when the origin stream has fully ended
+	doneOnce  sync.Once     // guards the single close of doneCh
 	closedCh  chan struct{} // closed when the session is finished and unroutable
 
 	mu       sync.Mutex
 	upErr    error
 	attached chan net.Conn // reconnecting downstream conns queue here
+}
+
+// closeDone marks the origin stream ended, exactly once. Both upstream (on the
+// streaming path / failures) and downstream (on the fixed relay) reach it.
+func (s *session) closeDone() {
+	s.doneOnce.Do(func() { close(s.doneCh) })
 }
 
 func newSession(w *wrappedListener, reqLine string, reqHead []byte) *session {
@@ -201,36 +233,60 @@ func (s *session) attach(conn net.Conn) {
 }
 
 // upstream owns the session's single origin connection: it forwards the
-// original request head, parses the response head, then de-chunks body
-// frames into the buffer until the origin finishes.
+// original request head and parses the response head, then branches on framing.
+// A STREAMING response (chunked, no Content-Length — the watch shape) is
+// de-chunked into the buffer here until the origin finishes. A FIXED response
+// (Content-Length, or otherwise not chunked) is handed to downstream for a
+// verbatim relay: upstream stashes the live conn/reader and returns, leaving
+// origin teardown to downstream.
 func (s *session) upstream(reqHead []byte) {
-	// Only the origin stream ends here; the session stays routable (in the
-	// table) until downstream has served every buffered frame. downstream owns
-	// closedCh and the table drop, so a reconnect during drain reattaches
-	// instead of re-dialing the origin.
-	defer close(s.doneCh)
-
-	up, err := net.Dial("tcp", s.w.target)
+	up, err := s.dialOrigin()
 	if err != nil {
 		s.fail(fmt.Errorf("origin dial: %w", err))
+		s.closeDone()
 		return
 	}
-	defer up.Close()
 	stop := context.AfterFunc(s.w.ctx, func() { up.Close() })
-	defer stop()
 
 	if _, err := up.Write(reqHead); err != nil {
+		stop()
+		up.Close()
 		s.fail(fmt.Errorf("origin request: %w", err))
+		s.closeDone()
 		return
 	}
 
 	br := bufio.NewReader(up)
 	_, head, err := readHeadFrom(br)
 	if err != nil {
+		stop()
+		up.Close()
 		s.fail(fmt.Errorf("origin response head: %w", err))
+		s.closeDone()
 		return
 	}
 	s.head = head
+
+	if !streamingHead(head) {
+		// Fixed-length or close-delimited: relay verbatim. Hand the live origin
+		// conn/reader to downstream (which serves exactly one response and tears
+		// the origin down); upstream is done. No de-chunking, no frameBuffer.
+		s.fixed = true
+		s.originConn = up
+		s.originBR = br
+		s.originStop = stop
+		s.bodyLen = contentLength(head)
+		close(s.headReady)
+		return
+	}
+
+	// Streaming path. Only the origin stream ends here; the session stays
+	// routable (in the table) until downstream has served every buffered frame.
+	// downstream owns closedCh and the table drop, so a reconnect during drain
+	// reattaches instead of re-dialing the origin.
+	defer stop()
+	defer up.Close()
+	defer s.closeDone()
 	close(s.headReady)
 
 	// De-chunk the body into whole frames. The origin flushes complete
@@ -251,6 +307,17 @@ func (s *session) upstream(reqHead []byte) {
 		}
 		s.frames.Write(frame)
 	}
+}
+
+// dialOrigin opens the session's origin connection, adding TLS on the origin
+// hop when the ingress scheme was https. Verification is off (InsecureSkipVerify)
+// to match the rest of the engine, which sets NoTLSVerify for the origin — a
+// local origin may carry a self-signed cert.
+func (s *session) dialOrigin() (net.Conn, error) {
+	if s.w.originTLS {
+		return tls.Dial("tcp", s.w.target, &tls.Config{InsecureSkipVerify: true})
+	}
+	return net.Dial("tcp", s.w.target)
 }
 
 func (s *session) fail(err error) {
@@ -313,8 +380,11 @@ func (s *session) downstream() {
 	}
 }
 
-// serveOne writes one downstream response on conn: head, frames until the
-// chop interval elapses or the stream ends, then a clean terminal chunk.
+// serveOne writes one downstream response on conn. For a STREAMING session:
+// head, frames until the chop interval elapses or the stream ends, then a clean
+// terminal chunk. For a FIXED session: the exact origin head, then the body
+// copied through verbatim, then the origin is torn down and the session
+// finished — it serves this one response only.
 func (s *session) serveOne(conn net.Conn) {
 	defer conn.Close()
 
@@ -323,6 +393,29 @@ func (s *session) serveOne(conn net.Conn) {
 	case <-s.doneCh:
 		return // upstream failed before a head existed; nothing to replay
 	}
+
+	if s.fixed {
+		// Verbatim relay of a non-streaming response. Teardown runs regardless
+		// of write outcome, so the session finishes as soon as this one response
+		// is served (or the client vanishes): origin conn closed, doneCh closed,
+		// frames closed so downstream sees Drained and returns.
+		defer func() {
+			s.originStop()
+			s.originConn.Close()
+			s.frames.CloseWriter()
+			s.closeDone()
+		}()
+		if _, err := conn.Write(s.head); err != nil {
+			return
+		}
+		if s.bodyLen >= 0 {
+			_, _ = io.CopyN(conn, s.originBR, s.bodyLen)
+		} else {
+			_, _ = io.Copy(conn, s.originBR) // close-delimited: to EOF
+		}
+		return
+	}
+
 	if _, err := conn.Write(s.head); err != nil {
 		return
 	}
@@ -456,6 +549,48 @@ func readHeadFrom(br *bufio.Reader) (string, []byte, error) {
 			return "", nil, errors.New("head too large")
 		}
 	}
+}
+
+// streamingHead reports whether an origin response head describes a streaming
+// body the shim should de-chunk and chop: Transfer-Encoding: chunked (case
+// -insensitive) AND no Content-Length. Everything else — fixed Content-Length,
+// or an HTTP/1.0-style close-delimited body — is a non-streaming response the
+// shim relays verbatim. The watch path (chunked, no length) is streaming;
+// /healthz (Content-Length: 2) is not.
+func streamingHead(head []byte) bool {
+	te := strings.ToLower(headerValue(head, "Transfer-Encoding"))
+	return strings.Contains(te, "chunked") && headerValue(head, "Content-Length") == ""
+}
+
+// contentLength returns the response's Content-Length, or -1 when absent or
+// unparsable (relay to EOF).
+func contentLength(head []byte) int64 {
+	v := headerValue(head, "Content-Length")
+	if v == "" {
+		return -1
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// headerValue returns the first value of header name (case-insensitive) from a
+// raw HTTP head (status line + header lines + blank line), or "" if absent.
+func headerValue(head []byte, name string) string {
+	want := strings.ToLower(name)
+	for _, line := range strings.Split(string(head), "\n") {
+		line = trimCRLF(line)
+		i := strings.IndexByte(line, ':')
+		if i < 0 {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(line[:i])) == want {
+			return strings.TrimSpace(line[i+1:])
+		}
+	}
+	return ""
 }
 
 // readChunk reads one chunk of a chunked body: (payload, nil) for a data

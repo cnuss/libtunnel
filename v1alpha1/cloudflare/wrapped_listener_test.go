@@ -34,10 +34,10 @@ type streamEvent struct {
 // 100), each flushed immediately, with pad (default 0) filler bytes per event.
 // It counts every request so a test can assert the shim shielded the origin to
 // exactly one. It does NOT depend on testbed/main.go.
-func newStreamOrigin(t *testing.T) (*httptest.Server, *atomic.Int64) {
+func newStreamOrigin(t *testing.T, useTLS bool) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 	var hits atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		fl, ok := w.(http.Flusher)
 		if !ok {
@@ -68,8 +68,18 @@ func newStreamOrigin(t *testing.T) (*httptest.Server, *atomic.Int64) {
 			case <-time.After(time.Duration(ms) * time.Millisecond):
 			}
 		}
-	}))
-	return srv, &hits
+	})
+	if useTLS {
+		return httptest.NewTLSServer(handler), &hits
+	}
+	return httptest.NewServer(handler), &hits
+}
+
+// originHostPort strips the scheme from an httptest server URL, yielding the
+// host:port the shim dials.
+func originHostPort(u string) string {
+	u = strings.TrimPrefix(u, "https://")
+	return strings.TrimPrefix(u, "http://")
 }
 
 func qint(r *http.Request, key string, def int) int {
@@ -86,8 +96,16 @@ func qint(r *http.Request, key string, def int) int {
 // table reattaches it to the one live origin stream. It asserts every event is
 // delivered exactly once and in order across >=3 short downstream responses,
 // the origin saw exactly ONE request, and per-event latency is bounded by ~chop.
-func TestChopOffline(t *testing.T) {
-	srv, hits := newStreamOrigin(t)
+func TestChopOffline(t *testing.T) { runChopOffline(t, false) }
+
+// TestChopOffline_TLS is the TLS analog of TestChopOffline: the chunked NDJSON
+// watch origin terminates TLS with a self-signed cert. It proves the shim dials
+// the origin over TLS (InsecureSkipVerify) and then de-chunks + chops exactly as
+// on plaintext — same exactly-once ordering across reconnects, one origin conn.
+func TestChopOffline_TLS(t *testing.T) { runChopOffline(t, true) }
+
+func runChopOffline(t *testing.T, useTLS bool) {
+	srv, hits := newStreamOrigin(t, useTLS)
 	defer srv.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -95,7 +113,7 @@ func TestChopOffline(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	const chop = 300 * time.Millisecond
-	wl, err := newWrappedListener(ctx, logger, strings.TrimPrefix(srv.URL, "http://"), chop)
+	wl, err := newWrappedListener(ctx, logger, originHostPort(srv.URL), useTLS, chop)
 	if err != nil {
 		t.Fatalf("newWrappedListener: %v", err)
 	}
@@ -203,4 +221,88 @@ func readResponse(t *testing.T, ctx context.Context, client *http.Client, url st
 		t.Logf("readResponse: body read ended with %v (after %d events)", err, len(events))
 	}
 	return events
+}
+
+// TestPassthroughContentLength proves a FIXED (Content-Length) origin response
+// is relayed VERBATIM through the flush-interval shim: the shim must NOT try to
+// de-chunk it. The client sees a normal, complete response — right status and a
+// byte-identical body — not a chunk-mangled one.
+func TestPassthroughContentLength(t *testing.T) { runPassthrough(t, false) }
+
+// TestPassthroughContentLength_TLS is the direct regression for #106: an
+// apiserver /healthz-shaped response (TLS origin, fixed Content-Length body
+// "ok"). Before the fix the shim TLS-mismatched the origin and mis-parsed the
+// non-chunked body, 502-ing every request; now it dials the origin over TLS
+// (InsecureSkipVerify) and relays the response verbatim.
+func TestPassthroughContentLength_TLS(t *testing.T) { runPassthrough(t, true) }
+
+func runPassthrough(t *testing.T, useTLS bool) {
+	var hits atomic.Int64
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		// A small, single write with no Flush lets net/http set a fixed
+		// Content-Length (the non-chunked, /healthz shape).
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.WriteString(w, "ok")
+	})
+	var srv *httptest.Server
+	if useTLS {
+		srv = httptest.NewTLSServer(handler)
+	} else {
+		srv = httptest.NewServer(handler)
+	}
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// A non-zero chop must NOT affect a fixed response — it is relayed whole.
+	wl, err := newWrappedListener(ctx, logger, originHostPort(srv.URL), useTLS, 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("newWrappedListener: %v", err)
+	}
+
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	get := func() (*http.Response, string) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+wl.Addr().String()+"/healthz", nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request through shim failed (502 shape): %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return resp, string(body)
+	}
+
+	resp, body := get()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200 (verbatim relay of the fixed origin response)", resp.StatusCode)
+	}
+	if body != "ok" {
+		t.Fatalf("body %q, want %q (relay must be byte-identical, not chunk-mangled)", body, "ok")
+	}
+	if resp.ContentLength != 2 {
+		t.Errorf("Content-Length %d, want 2 (fixed framing preserved verbatim)", resp.ContentLength)
+	}
+	if te := resp.TransferEncoding; len(te) != 0 {
+		t.Errorf("Transfer-Encoding %v, want none (fixed response must not be re-chunked)", te)
+	}
+
+	// A second identical request must start a FRESH session (the fixed session
+	// finished on relay) and get the same complete response — not reattach to a
+	// completed session and hang or 502.
+	resp2, body2 := get()
+	if resp2.StatusCode != http.StatusOK || body2 != "ok" {
+		t.Fatalf("second request: status %d body %q, want 200 %q", resp2.StatusCode, body2, "ok")
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("origin saw %d requests, want 2 (each fixed response is its own one-shot session)", got)
+	}
 }

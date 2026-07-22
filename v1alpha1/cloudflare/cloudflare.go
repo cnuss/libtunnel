@@ -379,10 +379,19 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 		if err != nil {
 			return fmt.Errorf("wrapped listener: %w", err)
 		}
-		wl, err := newWrappedListener(t.Context(), t.Logger(), u.Host, *b.chopInterval)
+		// The origin scheme decides how the shim dials the origin; it is dropped
+		// from the ingress URL below because the shim itself owns the origin hop.
+		originTLS := u.Scheme == "https"
+		wl, err := newWrappedListener(t.Context(), t.Logger(), u.Host, originTLS, *b.chopInterval)
 		if err != nil {
 			return fmt.Errorf("wrapped listener: %w", err)
 		}
+		// cloudflared -> shim is ALWAYS plaintext: the shim listens on a plain
+		// TCP socket, so the ingress service must be http regardless of the
+		// origin's scheme (a leftover https here would make cloudflared TLS-dial
+		// the plaintext shim → 502). The shim re-dials the origin itself, adding
+		// TLS back on that hop when originTLS is set.
+		u.Scheme = "http"
 		u.Host = wl.Addr().String()
 		service = u.String()
 	}
