@@ -260,7 +260,7 @@ func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server, flushInt
 		t.Fatalf("listen: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ps := &http.Server{Handler: newOriginProxy(origin, flushInterval, logger)}
+	ps := &http.Server{Handler: newOriginProxy(origin, flushInterval, logger, originTransport(origin))}
 	context.AfterFunc(ctx, func() { ps.Close() })
 	go ps.Serve(l)
 	return "http://" + l.Addr().String()

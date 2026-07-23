@@ -37,6 +37,7 @@ func (e *fakeEngine) Provider() v1.Provider[*cloudflare.Spec]     { return v1alp
 func (e *fakeEngine) CACerts() []*x509.Certificate                { return []*x509.Certificate{} }
 func (e *fakeEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e *fakeEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
+func (*fakeEngine) Reconnect(context.Context) error               { return nil }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
 	return nil
@@ -55,6 +56,7 @@ func (foreignBackend) Provider() v1.Provider[*cloudflare.Spec] {
 }
 func (f foreignBackend) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return f }
 func (f foreignBackend) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return f }
+func (foreignBackend) Reconnect(context.Context) error               { return nil }
 
 var (
 	_ v1alpha1.Engine[*cloudflare.Spec] = (*fakeEngine)(nil)
@@ -774,6 +776,7 @@ func (failingEngine) Provider() v1.Provider[*cloudflare.Spec] {
 func (failingEngine) CACerts() []*x509.Certificate                  { return nil }
 func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
+func (failingEngine) Reconnect(context.Context) error               { return nil }
 func (failingEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }

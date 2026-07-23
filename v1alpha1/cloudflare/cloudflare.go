@@ -65,6 +65,38 @@ var promMu sync.Mutex
 // LIBTUNNEL_SPEC envelope) — one source of truth so the tag never drifts.
 const backendName = "cloudflare"
 
+// haConnections is the number of edge (HA) connections the supervisor keeps.
+// The reconnect lever fires one ReconnectSignal per conn to cycle them all.
+const haConnections = 1
+
+// edgeUpWatcher counts edge Connected events so a caller can wait for N of them
+// past a barrier. The Observer sink calls up on every Connected; generation
+// returns the running count plus a channel that closes on the next one. Because
+// each delivered ReconnectSignal breaks exactly one edge conn and thus yields
+// exactly one Connected, waiting for the count to advance by haConnections is a
+// correct "all cycled conns are back up" barrier for any HA count.
+type edgeUpWatcher struct {
+	mu  sync.Mutex
+	gen uint64
+	ch  chan struct{}
+}
+
+func newEdgeUpWatcher() *edgeUpWatcher { return &edgeUpWatcher{ch: make(chan struct{})} }
+
+func (e *edgeUpWatcher) generation() (uint64, <-chan struct{}) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.gen, e.ch
+}
+
+func (e *edgeUpWatcher) up() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.gen++
+	close(e.ch)
+	e.ch = make(chan struct{})
+}
+
 // Backend is the cloudflared quick-tunnel engine. It carries the origin-scheme
 // settings declared via WithTLS / WithHTTP2; obtain a fresh one per tunnel from
 // libtunnel.Cloudflare(). Both settings default false, and both can be fixed
@@ -95,6 +127,13 @@ type Backend struct {
 	// no-op (env beats code).
 	flushInterval *time.Duration
 	flushFixed    bool
+	// The reconnect lever's runtime state, wired at connect: reconnected feeds
+	// the supervisor's external-control channel, edgeUp counts Connected events,
+	// and reconnectCtx is the tunnel context Reconnect waits on. All nil until
+	// connect runs — Reconnect errors before then.
+	reconnected  chan supervisor.ReconnectSignal
+	edgeUp       *edgeUpWatcher
+	reconnectCtx context.Context
 }
 
 // New returns the Cloudflare backend. The origin-scheme knobs are fixed from
@@ -145,6 +184,45 @@ func (b *Backend) WithHTTP2(http2 bool) v1.Backend[*Spec] {
 		b.http2 = http2
 	}
 	return b
+}
+
+// Reconnect forcefully cycles the cloudflared<->edge tunnel(s) and blocks until
+// they are re-established, ctx is done, or the tunnel shuts down (see
+// v1.Backend.Reconnect). It fires one ReconnectSignal per HA connection, then
+// waits for haConnections Connected events past the pre-send count — each
+// delivered signal breaks exactly one edge conn and thus yields exactly one
+// Connected, so the barrier is correct for any HA count. Errors if called before
+// the tunnel has connected.
+func (b *Backend) Reconnect(ctx context.Context) error {
+	if b.reconnected == nil || b.edgeUp == nil || b.reconnectCtx == nil {
+		return fmt.Errorf("cloudflare: Reconnect before tunnel connected")
+	}
+	// Wait on the caller's ctx (its deadline/cancellation) and on the tunnel
+	// context, so a tunnel teardown mid-reconnect unblocks even if ctx does not.
+	done := b.reconnectCtx.Done()
+	base, _ := b.edgeUp.generation()
+	for range haConnections {
+		select {
+		case b.reconnected <- supervisor.ReconnectSignal{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+			return b.reconnectCtx.Err()
+		}
+	}
+	for {
+		gen, ch := b.edgeUp.generation()
+		if gen-base >= haConnections {
+			return nil
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+			return b.reconnectCtx.Err()
+		}
+	}
 }
 
 // The spec-field setters override individual fields of whatever spec the
@@ -387,43 +465,25 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	if b.flushInterval != nil {
 		flushInterval = *b.flushInterval
 	}
-	proxy := newOriginProxy(origin, flushInterval, t.Logger())
-	// HACK (experimental): a ?watch=true request gets its cloudflared conn cut
-	// 5s after it lands. Cutting the live conn ends the request; cloudflared
-	// re-dials the (unchanged) listen port and re-issues the watch, which lands
-	// here and arms another 5s cut — a ~5s disconnect/reconnect loop for the
-	// life of the origin watch. Conns tracked via srv.ConnState. Everything
-	// hardcoded on purpose.
-	var mu sync.Mutex
-	conns := map[net.Conn]struct{}{}
-	srv := &http.Server{}
-	srv.ConnState = func(c net.Conn, s http.ConnState) {
-		mu.Lock()
-		defer mu.Unlock()
-		switch s {
-		case http.StateNew:
-			conns[c] = struct{}{}
-		case http.StateClosed, http.StateHijacked:
-			delete(conns, c)
-		}
-	}
-	killConns := func() {
-		mu.Lock()
-		defer mu.Unlock()
-		for c := range conns {
-			c.Close()
-		}
-		t.Logger().Info("cycle: cut cloudflared conns", "n", len(conns))
-	}
+	transport := originTransport(origin)
+	proxy := newOriginProxy(origin, flushInterval, t.Logger(), transport)
+	// Wire the reconnect lever's runtime state onto the backend: reconnected
+	// feeds the supervisor's external-control channel (see NewSupervisor below),
+	// edgeUp counts Connected events via the Observer sink, and reconnectCtx is
+	// the tunnel context. Once set, b.Reconnect is live — for direct callers and
+	// as the InterceptCtl.Reconnect lever handed to interceptors.
+	b.reconnected = make(chan supervisor.ReconnectSignal)
+	b.edgeUp = newEdgeUpWatcher()
+	b.reconnectCtx = t.Context()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("watch") == "true" {
-			t.Logger().Info("watch request: arming 5s conn cut", "url", r.URL.String())
-			timer := time.AfterFunc(5*time.Second, killConns)
-			defer timer.Stop() // origin response ended on its own → disarm
-		}
-		proxy.ServeHTTP(w, r)
+		handler := t.Intercept(proxy, w, r, v1.InterceptCtl{
+			Reconnect: b.Reconnect,
+			Listener:  l,
+		})
+
+		handler(w, r)
 	})
-	srv.Handler = handler
+	srv := &http.Server{Handler: handler}
 	context.AfterFunc(t.Context(), func() { srv.Close() })
 	go srv.Serve(l)
 	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origin", origin.Redacted(), "flushInterval", flushInterval)
@@ -478,6 +538,16 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 
 		originDialer := ingress.NewOriginDialer(ingress.OriginConfig{}, log)
 
+		// The observer fans connection lifecycle events out to sinks; wire one
+		// that pokes edgeUp on every Connected so the Reconnect lever can block
+		// until the edge is back up.
+		observer := connection.NewObserver(log, log)
+		observer.RegisterSink(connection.EventSinkFunc(func(e connection.Event) {
+			if e.EventType == connection.Connected {
+				b.edgeUp.up()
+			}
+		}))
+
 		tunnelConfig := &supervisor.TunnelConfig{
 			ClientConfig: clientConfig,
 			// cloudflared's own default (its --grace-period flag): how long the
@@ -487,7 +557,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 			GracePeriod:   30 * time.Second,
 			Region:        "",
 			EdgeIPVersion: allregions.Auto,
-			HAConnections: 1,
+			HAConnections: haConnections,
 			// No tags, matching cloudflared's quick-tunnel default. (Tags never
 			// were the connector ID — client.NewConfig mints a fresh random UUID
 			// for that; tags only become Cf-Warp-Tag-* headers injected into
@@ -495,7 +565,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 			Tags:            nil,
 			Log:             log,
 			LogTransport:    log,
-			Observer:        connection.NewObserver(log, log),
+			Observer:        observer,
 			ReportedVersion: cloudflaredVersion,
 			Retries:         5,
 			RunFromTerminal: false,
@@ -557,10 +627,10 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 			return nil, fmt.Errorf("failed to create orchestrator: %w", err)
 		}
 
-		// Nothing here produces manual reconnect signals; the channel only
-		// exists to satisfy NewSupervisor, which selects on it.
-		reconnected := make(chan supervisor.ReconnectSignal)
-		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, reconnected, ctx.Done())
+		// b.reconnected is the backend's external-control channel, wired above;
+		// here it is handed to the supervisor, which selects on it. b.Reconnect
+		// sends on it to cycle the edge.
+		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, b.reconnected, ctx.Done())
 		if err != nil {
 			return nil, fmt.Errorf("failed to create supervisor: %w", err)
 		}
@@ -593,11 +663,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 // TLS with InsecureSkipVerify, matching the engine's always-off origin
 // verification. Every response is relayed verbatim — status, headers, body
 // untouched.
-func newOriginProxy(origin *url.URL, flushInterval time.Duration, log *slog.Logger) *httputil.ReverseProxy {
-	transport := http.DefaultTransport
-	if origin.Scheme == "https" {
-		transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	}
+func newOriginProxy(origin *url.URL, flushInterval time.Duration, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Transport:     transport,
 		FlushInterval: flushInterval,
@@ -609,6 +675,15 @@ func newOriginProxy(origin *url.URL, flushInterval time.Duration, log *slog.Logg
 		},
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelDebug),
 	}
+}
+
+// originTransport dials the origin, adding TLS (InsecureSkipVerify, matching the
+// engine's always-off origin verification) when the origin scheme is https.
+func originTransport(origin *url.URL) http.RoundTripper {
+	if origin.Scheme == "https" {
+		return &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	}
+	return http.DefaultTransport
 }
 
 // noopImpl satisfies the metrics interfaces cloudflared insists on with
