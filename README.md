@@ -121,6 +121,9 @@ type Tunnel interface {
     WithLocalURL(u *url.URL) Tunnel          // attach to a running local origin
                                              // (http://localhost:1234); mutually
                                              // exclusive with WithListener
+
+    // hook requests in front of the origin proxy; layerable, not write-once
+    WithInterceptor(match MatchFn, handler InterceptFn) Tunnel
 }
 
 type Provider[T Spec] interface { Spec(ctx context.Context) (T, error) }
@@ -147,6 +150,51 @@ func Version() string                            // the libtunnel release this b
 
 // parent→child handoff — no API: minting exports the LIBTUNNEL_SPEC env var,
 // construction adopts it
+```
+
+## Interceptors
+
+An in-process reverse proxy always fronts the origin. `WithInterceptor` hooks
+that path: for every request the tunnel walks its interceptors in registration
+order and runs the first whose `MatchFn` returns true; anything unmatched is
+proxied to the origin unchanged. Interceptors layer (call it more than once)
+and, unlike the write-once `With*` mutators, may be added after the tunnel is
+live.
+
+```go
+type MatchFn     = func(r *http.Request) bool
+type InterceptFn = func(w http.ResponseWriter, r *http.Request, ctl InterceptCtl) http.HandlerFunc
+
+type InterceptCtl struct {
+    // cycle the edge connection(s); blocks until re-established, ctx is done,
+    // or the tunnel shuts down. Also on the backend as Backend.Reconnect.
+    Reconnect func(ctx context.Context) error
+    // the loopback listener the engine dials (the proxy's socket, not the origin)
+    Listener  net.Listener
+}
+```
+
+`InterceptFn` is a **selector**: given the request and an `InterceptCtl` of
+tunnel-level levers, it returns the `http.HandlerFunc` that serves the request
+(the tunnel then invokes it with the same `w, r`).
+
+```go
+tun := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
+
+// force an edge reconnect on watch requests, then fall through to the origin.
+tun.WithInterceptor(
+    func(r *http.Request) bool { return r.URL.Query().Get("watch") == "true" },
+    func(w http.ResponseWriter, r *http.Request, ctl libtunnel.InterceptCtl) http.HandlerFunc {
+        return func(w http.ResponseWriter, r *http.Request) {
+            ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+            defer cancel()
+            if err := ctl.Reconnect(ctx); err != nil {
+                return // request can't proceed — stop, no further writes
+            }
+            // ... serve the request (e.g. proxy to the origin) ...
+        }
+    },
+)
 ```
 
 ## Parent→child handoff
