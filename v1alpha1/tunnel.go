@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
@@ -80,6 +82,39 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
 		t.cancel(fmt.Errorf("WithListener: origin already provided"))
 	}
 	return t
+}
+
+// WithInterceptor appends an interceptor to the ordered registry. Safe to call
+// concurrently and after the tunnel is live (see v1.Tunnel.WithInterceptor).
+func (t *TunnelImpl[T]) WithInterceptor(match v1.MatchFn, handler v1.InterceptFn) v1.Tunnel {
+	t.interceptorsMu.Lock()
+	defer t.interceptorsMu.Unlock()
+	t.interceptors = append(t.interceptors, v1.Interceptor{Match: match, Handler: handler})
+	return t
+}
+
+// Intercept selects the handler for a request: the first registered interceptor
+// whose Match returns true builds it (given w, r and ctl), otherwise the request
+// falls through to proxy. The engine calls the returned handler with the same w
+// and r. The registry lock is held only across the match scan, not the handler.
+func (t *TunnelImpl[T]) Intercept(proxy *httputil.ReverseProxy, w http.ResponseWriter, r *http.Request, ctl v1.InterceptCtl) http.HandlerFunc {
+	t.interceptorsMu.Lock()
+	var interceptor v1.InterceptFn
+	for _, ic := range t.interceptors {
+		if ic.Match(r) {
+			interceptor = ic.Handler
+			break
+		}
+	}
+	t.interceptorsMu.Unlock()
+
+	if interceptor == nil {
+		return func(w http.ResponseWriter, r *http.Request) {
+			proxy.ServeHTTP(w, r)
+		}
+	}
+
+	return interceptor(w, r, ctl)
 }
 
 // WithLocalURL provides the local origin as the URL of an already-running

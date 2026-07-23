@@ -25,6 +25,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/cloudflared/supervisor"
+
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 )
@@ -260,7 +262,7 @@ func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server, flushInt
 		t.Fatalf("listen: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ps := &http.Server{Handler: newOriginProxy(origin, flushInterval, logger)}
+	ps := &http.Server{Handler: newOriginProxy(origin, flushInterval, logger, originTransport(origin))}
 	context.AfterFunc(ctx, func() { ps.Close() })
 	go ps.Serve(l)
 	return "http://" + l.Addr().String()
@@ -543,5 +545,97 @@ func TestQuickTunnelSurfacesRateLimit(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "quick tunnel rate limited") {
 		t.Errorf("no rate-limit warning logged; log output:\n%s", buf.String())
+	}
+}
+
+// --- reconnect lever ---
+
+func TestEdgeUpWatcher(t *testing.T) {
+	w := newEdgeUpWatcher()
+
+	gen, ch := w.generation()
+	if gen != 0 {
+		t.Fatalf("initial generation = %d, want 0", gen)
+	}
+	select {
+	case <-ch:
+		t.Fatal("generation channel closed before any up()")
+	default:
+	}
+
+	w.up()
+	select {
+	case <-ch:
+	default:
+		t.Fatal("generation channel not closed after up()")
+	}
+
+	gen2, ch2 := w.generation()
+	if gen2 != 1 {
+		t.Fatalf("generation after up() = %d, want 1", gen2)
+	}
+	if ch2 == ch {
+		t.Fatal("generation channel not swapped after up()")
+	}
+}
+
+func TestReconnectBeforeConnect(t *testing.T) {
+	if err := New().Reconnect(context.Background()); err == nil {
+		t.Fatal("Reconnect before connect: want error, got nil")
+	}
+}
+
+// wireReconnect gives a Backend the runtime state connect() would set, without
+// a real supervisor.
+func wireReconnect(tunnelCtx context.Context) *Backend {
+	b := New()
+	b.reconnected = make(chan supervisor.ReconnectSignal)
+	b.edgeUp = newEdgeUpWatcher()
+	b.reconnectCtx = tunnelCtx
+	return b
+}
+
+func TestReconnectCyclesAndWaits(t *testing.T) {
+	b := wireReconnect(context.Background())
+
+	// Stand in for the supervisor: receive each ReconnectSignal, then report a
+	// Connected — exactly what one cycled edge conn does.
+	served := make(chan struct{})
+	go func() {
+		for range haConnections {
+			<-b.reconnected
+			b.edgeUp.up()
+		}
+		close(served)
+	}()
+
+	if err := b.Reconnect(context.Background()); err != nil {
+		t.Fatalf("Reconnect: %v", err)
+	}
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fake supervisor did not receive haConnections signals")
+	}
+}
+
+func TestReconnectContextCanceled(t *testing.T) {
+	b := wireReconnect(context.Background()) // no receiver on b.reconnected
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := b.Reconnect(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Reconnect with canceled ctx: err = %v, want context.Canceled", err)
+	}
+}
+
+func TestReconnectTunnelShutdown(t *testing.T) {
+	tctx, tcancel := context.WithCancel(context.Background())
+	b := wireReconnect(tctx) // no receiver on b.reconnected
+	tcancel()                // tunnel torn down while a caller waits
+
+	// Caller passes a live ctx; the tunnel-context guard must still unblock.
+	if err := b.Reconnect(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Reconnect after tunnel shutdown: err = %v, want context.Canceled", err)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 )
 
@@ -156,6 +157,13 @@ type Backend[T Spec] interface {
 	// negotiates HTTP/2 over TLS. Default false. Chainable. LIBTUNNEL_HTTP2
 	// fixes it from the environment under the same rules as WithTLS.
 	WithHTTP2(bool) Backend[T]
+	// Reconnect forcefully cycles the engine's connection(s) to the tunnel edge
+	// and blocks until the edge is re-established or ctx is done (returning
+	// ctx.Err()); pass a ctx with a deadline to bound the wait. It also returns
+	// if the tunnel itself shuts down while waiting. It is an error to call
+	// before the tunnel has connected. This is the same lever surfaced to
+	// interceptors as InterceptCtl.Reconnect.
+	Reconnect(ctx context.Context) error
 }
 
 // Tunnel is the lazy tunnel handle returned by libtunnel.New. All getters
@@ -295,4 +303,53 @@ type Tunnel interface {
 	// and cancel it; otherwise it runs until the process exits or the tunnel
 	// fails.
 	WithLocalURL(u *url.URL) Tunnel
+
+	// WithInterceptor registers a hook in front of the in-process reverse proxy
+	// that fronts the origin. For every inbound request the tunnel walks its
+	// interceptors in registration order and runs the first whose match returns
+	// true; the handler it returns serves the request. Requests that match no
+	// interceptor are proxied to the origin unchanged. May be called more than
+	// once to layer interceptors, and may be called after the tunnel is live.
+	// Returns the tunnel for chaining.
+	WithInterceptor(match MatchFn, handler InterceptFn) Tunnel
+}
+
+// MatchFn reports whether an interceptor applies to a request. It runs on the
+// proxy goroutine for every inbound request, so it must be fast and must not
+// mutate r.
+type MatchFn = func(r *http.Request) bool
+
+// InterceptFn builds the handler that serves a matched request. It is called
+// with the request's own w and r (so it can inspect or close over them) plus a
+// InterceptCtl for tunnel-level levers, and returns the http.HandlerFunc that
+// actually serves the request — which the tunnel then invokes with the same w
+// and r. To fall through to the origin, return ctl-independent behavior such as
+// a proxy pass-through; there is no implicit default once an interceptor
+// matches.
+type InterceptFn = func(w http.ResponseWriter, r *http.Request, ctl InterceptCtl) http.HandlerFunc
+
+// Interceptor pairs a match predicate with the handler it selects.
+type Interceptor struct {
+	Match   MatchFn
+	Handler InterceptFn
+}
+
+// Interceptors is the ordered registry consulted per request; the first
+// Interceptor whose Match returns true wins (registration order).
+type Interceptors = []Interceptor
+
+// InterceptCtl exposes tunnel-level levers to an interceptor, letting a handler
+// reach past the single request into the engine that carries it.
+type InterceptCtl struct {
+	// Reconnect forcefully cycles the engine's connection(s) to the tunnel edge
+	// and blocks until the edge is re-established or ctx is done (returning
+	// ctx.Err()); pass a ctx with a deadline to bound the wait. A non-nil error
+	// means the request cannot proceed — the handler should stop and return
+	// without further writes. This is Backend.Reconnect bound to the tunnel.
+	Reconnect func(ctx context.Context) error
+
+	// Listener is the loopback listener the engine dials to reach the reverse
+	// proxy — the proxy's own accept socket, not the origin. Exposed so an
+	// interceptor can cycle it (close to force the engine to re-dial).
+	Listener net.Listener
 }

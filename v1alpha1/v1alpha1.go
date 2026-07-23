@@ -148,6 +148,9 @@ type TunnelImpl[T v1.Spec] struct {
 	caCertsOnce sync.Once
 	caCerts     []*x509.Certificate
 
+	interceptorsMu sync.Mutex
+	interceptors   v1.Interceptors
+
 	hostnameReady chan struct{}
 
 	tunnelReady chan struct{}

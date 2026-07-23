@@ -135,6 +135,16 @@ type TunnelV1 = v1.Tunnel
 // backend-specific setters (WithID and friends) stay reachable.
 type CloudflareV1 = v1.Backend[*cloudflare.Spec]
 
+// The interceptor types (see TunnelV1.WithInterceptor) are re-exported from v1
+// so callers can name them without importing v1.
+type (
+	MatchFn      = v1.MatchFn      // request predicate: does this interceptor apply
+	InterceptFn  = v1.InterceptFn  // selects the handler that serves a matched request
+	Interceptor  = v1.Interceptor  // a {Match, Handler} pair
+	Interceptors = v1.Interceptors // ordered registry; first match wins
+	InterceptCtl = v1.InterceptCtl // tunnel-level levers handed to a handler
+)
+
 // New returns an unstarted tunnel on the given backend, which also supplies
 // the credential chain. T is the backend's spec type, inferred from the
 // backend and used only to wire the credential chain — it does not appear in
