@@ -128,6 +128,9 @@ func (t *TunnelImpl[T]) WithInterceptor(interceptor v1.Interceptor) v1.Tunnel {
 
 // Interceptors returns a snapshot of the registry in precedence order (ascending
 // Priority, ties in registration order) — the order Intercept consults them.
+// It's a defensive copy: mutating the returned slice does not affect the live
+// registry (Interceptor is a value type; its func fields are immutable
+// references). If Interceptor ever gains a reference-type field, deep-copy it here.
 func (t *TunnelImpl[T]) Interceptors() v1.Interceptors {
 	t.interceptorsMu.Lock()
 	defer t.interceptorsMu.Unlock()
