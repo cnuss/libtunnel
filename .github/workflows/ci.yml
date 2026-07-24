@@ -135,6 +135,11 @@ jobs:
     needs: [ci, race]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
+    # Exposed so the downstream warm-proxy job knows the released tag and whether
+    # the release was skipped.
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      skip: ${{ steps.tag.outputs.skip }}
     permissions:
       contents: write   # push tag + create release
       id-token: write   # cosign keyless signing via OIDC
@@ -311,20 +316,24 @@ jobs:
           cosign sign --yes \
             "ghcr.io/${GITHUB_REPOSITORY}@${{ steps.image.outputs.digest }}"
 
+  # Best-effort cache primer for pkg.go.dev, in its own job (needs: release) so a
+  # transient proxy.golang.org 5xx can be re-run in isolation without touching the
+  # already-published release. The release deliverables (tag, binaries, image) are
+  # complete regardless; proxy.golang.org also fetches the tag on its own within
+  # minutes. Unlike the old inline step this is allowed to fail — a red here is a
+  # one-click rerun, not a false-failed release. See v0.0.34/v0.0.35.
+  warm-proxy:
+    needs: release
+    if: needs.release.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
       - name: warm proxy.golang.org
-        # Best-effort cache primer for pkg.go.dev: every release deliverable
-        # (tag, binaries, image) is already published above, and proxy.golang.org
-        # fetches the tag on its own within minutes regardless. A transient
-        # upstream 500 here must not fail the release, so retry and never exit
-        # non-zero. See v0.0.34/v0.0.35, which both false-failed on this step.
-        if: steps.tag.outputs.skip != 'true'
-        continue-on-error: true
         run: |
-          tag="${{ steps.tag.outputs.tag }}"
+          tag="${{ needs.release.outputs.tag }}"
           mod="github.com/${GITHUB_REPOSITORY}"
           for url in \
             "https://proxy.golang.org/${mod}/@v/${tag}.info" \
             "https://proxy.golang.org/${mod}/@v/${tag}.mod" \
             "https://sum.golang.org/lookup/${mod}@${tag}"; do
-            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$url" >/dev/null || true
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$url" >/dev/null
           done

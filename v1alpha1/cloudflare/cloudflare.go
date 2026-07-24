@@ -19,6 +19,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -117,16 +118,11 @@ type Backend struct {
 	// fields carries the spec-field overrides set via WithID and friends,
 	// applied by the overlay provider when the spec resolves.
 	fields Spec
-	// apiURL overrides the quick-tunnel mint endpoint (WithApiURL). Empty
-	// means the default; v1.CloudflareAPIURLEnv supersedes either.
-	apiURL string
-	// flushInterval sets httputil.ReverseProxy.FlushInterval on the reverse
-	// proxy that always fronts the origin (see connect). Nil means unset, i.e.
-	// 0 — the stdlib default. flushFixed records that
-	// LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL fixed it, so WithFlushInterval is a
-	// no-op (env beats code).
-	flushInterval *time.Duration
-	flushFixed    bool
+	// providerHost overrides the quick-tunnel mint provider host (WithProvider);
+	// the endpoint https://<host>/tunnel is synthesized from it (a value carrying
+	// a scheme is used verbatim). Empty means the default (api.trycloudflare.com);
+	// v1.CloudflareProviderEnv supersedes either.
+	providerHost string
 	// Runtime state wired at connect. reconnected feeds the supervisor's
 	// external-control channel, edgeUp counts Connected events, and reconnectCtx
 	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
@@ -148,21 +144,13 @@ func (b *Backend) Proxy() *httputil.ReverseProxy { return b.proxy }
 func (b *Backend) Listener() net.Listener { return b.listener }
 
 // New returns the Cloudflare backend. The origin-scheme knobs are fixed from
-// the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set, and the
-// streaming-buffer lever when LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL is set. The
-// first unparsable value wins and is surfaced at connect.
+// the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set. The first
+// unparsable value wins and is surfaced at connect.
 func New() *Backend {
 	b := &Backend{}
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
 	if b.envErr == nil {
 		b.http2, b.http2Fixed, b.envErr = v1alpha1.EnvBool(v1.HTTP2Env)
-	}
-	if b.envErr == nil {
-		var d time.Duration
-		d, b.flushFixed, b.envErr = v1alpha1.EnvDuration(v1.CloudflareFlushIntervalEnv)
-		if b.flushFixed && b.envErr == nil {
-			b.flushInterval = &d
-		}
 	}
 	return b
 }
@@ -277,33 +265,15 @@ func (b *Backend) WithSecret(secret []byte) *Backend {
 	return b
 }
 
-// WithApiURL overrides the quick-tunnel mint endpoint (default
-// https://api.trycloudflare.com/tunnel). Env mirror:
-// LIBTUNNEL__CLOUDFLARE_API_URL (env beats code). Only the mint path uses
-// it — adopted, replayed, and pinned specs never hit the API.
-func (b *Backend) WithApiURL(apiURL string) *Backend {
-	b.apiURL = apiURL
-	return b
-}
-
-// WithFlushInterval sets the FlushInterval of the httputil.ReverseProxy that
-// always fronts the origin (see connect), carrying the stdlib semantics
-// exactly: the client-facing response body is flushed every d while it is
-// being copied from the origin, so a slow streaming response is pushed
-// downstream on that cadence instead of pooling in a buffer. Default (unset)
-// is 0 — the stdlib default (no periodic flush; recognized streaming
-// responses still flush immediately). The proxy owns the origin dial, adding
-// TLS (InsecureSkipVerify) when the origin scheme is https, and relays every
-// response — streaming or fixed Content-Length — verbatim: status, headers,
-// and body are the origin's, untouched.
-//
-// Env mirror: LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL (time.ParseDuration syntax)
-// fixes the knob and makes this call a no-op — env beats code. Returns the
-// backend for chaining.
-func (b *Backend) WithFlushInterval(d time.Duration) *Backend {
-	if !b.flushFixed {
-		b.flushInterval = &d
-	}
+// WithProvider overrides the quick-tunnel mint provider host (default
+// api.trycloudflare.com); the endpoint https://<host>/tunnel is synthesized
+// from it — pass just the host, the scheme and path are assumed. A value that
+// carries a scheme (e.g. http://127.0.0.1:8080/tunnel) is used verbatim, for
+// pointing the mint at a mock or alternate endpoint. Env mirror:
+// LIBTUNNEL__CLOUDFLARE_PROVIDER (env beats code). Only the mint path uses it —
+// adopted, replayed, and pinned specs never hit the API.
+func (b *Backend) WithProvider(host string) *Backend {
+	b.providerHost = host
 	return b
 }
 
@@ -327,12 +297,25 @@ func (b *Backend) Name() string {
 func (b *Backend) Provider() v1.Provider[*Spec] {
 	next := b.provider
 	if next == nil {
+		host := b.providerHost
+		stringEnv(v1.CloudflareProviderEnv, &host) // env beats code
 		qt := QuickTunnel()
-		qt.URL = b.apiURL
-		stringEnv(v1.CloudflareAPIURLEnv, &qt.URL)
+		if host != "" {
+			qt.URL = providerEndpoint(host)
+		}
 		next = qt
 	}
 	return v1alpha1.Env(b.Name(), overlay{fields: b.fields, next: v1alpha1.Replay(b.Name(), next)})
+}
+
+// providerEndpoint turns a quick-tunnel provider host into a mint endpoint URL:
+// https://<host>/tunnel. A value that already carries a scheme is returned
+// verbatim, so a full URL (a mock or alternate endpoint) still works.
+func providerEndpoint(host string) string {
+	if strings.Contains(host, "://") {
+		return host
+	}
+	return "https://" + host + "/tunnel"
 }
 
 // overlay applies the spec-field overrides: fields (the WithID-family
@@ -459,11 +442,11 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 		return b.envErr
 	}
 	// An in-process reverse proxy always fronts the origin. It re-dials the
-	// origin (adding TLS when the origin scheme is https) and applies
-	// FlushInterval to the response stream. cloudflared -> proxy is always
-	// plaintext (the proxy listens on a plain TCP socket), so the ingress
-	// service is rewritten to http regardless of the origin's scheme — a
-	// leftover https would make cloudflared TLS-dial the plaintext proxy → 502.
+	// origin (adding TLS when the origin scheme is https) and relays the
+	// response verbatim. cloudflared -> proxy is always plaintext (the proxy
+	// listens on a plain TCP socket), so the ingress service is rewritten to
+	// http regardless of the origin's scheme — a leftover https would make
+	// cloudflared TLS-dial the plaintext proxy → 502.
 	origin, err := url.Parse(service)
 	if err != nil {
 		return fmt.Errorf("reverse proxy: %w", err)
@@ -471,10 +454,6 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("reverse proxy: %w", err)
-	}
-	var flushInterval time.Duration
-	if b.flushInterval != nil {
-		flushInterval = *b.flushInterval
 	}
 	transport := originTransport(origin)
 	// Wire runtime state onto the backend: reconnected feeds the supervisor's
@@ -486,7 +465,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edgeUp = newEdgeUpWatcher()
 	b.reconnectCtx = t.Context()
-	b.proxy = newOriginProxy(origin, flushInterval, t.Logger(), transport)
+	b.proxy = newOriginProxy(origin, t.Logger(), transport)
 	b.listener = l
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Intercept(v1alpha1.NewInterceptCtx(b, w, r))(w, r)
@@ -494,7 +473,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	srv := &http.Server{Handler: handler}
 	context.AfterFunc(t.Context(), func() { srv.Close() })
 	go srv.Serve(l)
-	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origin", origin.Redacted(), "flushInterval", flushInterval)
+	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origin", origin.Redacted())
 	service = (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
 	ctx := t.Context()
 	log := zerologger(t.Logger())
@@ -664,17 +643,13 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 }
 
 // newOriginProxy builds the reverse proxy that always fronts the origin (see
-// connect, which serves it on a plaintext listener cloudflared dials). Its
-// FlushInterval is flushInterval (stdlib semantics — flush the client response
-// body every flushInterval; streaming responses flush immediately; 0 is the
-// stdlib default). When the origin scheme is https the Transport dials it over
-// TLS with InsecureSkipVerify, matching the engine's always-off origin
-// verification. Every response is relayed verbatim — status, headers, body
-// untouched.
-func newOriginProxy(origin *url.URL, flushInterval time.Duration, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
+// connect, which serves it on a plaintext listener cloudflared dials). When the
+// origin scheme is https the Transport dials it over TLS with InsecureSkipVerify,
+// matching the engine's always-off origin verification. Every response is
+// relayed verbatim — status, headers, body untouched.
+func newOriginProxy(origin *url.URL, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Transport:     transport,
-		FlushInterval: flushInterval,
+		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(origin)
 			// Preserve the inbound Host: the origin (e.g. an apiserver) may key

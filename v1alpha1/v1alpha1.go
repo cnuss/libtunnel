@@ -11,12 +11,14 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -78,6 +80,8 @@ func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		tunnelReady:      make(chan struct{}),
 		hostnameReady:    make(chan struct{}),
 	}
+	// Auto-assigned interceptor Priorities count down from the top of the range.
+	t.autoPriority.Store(math.MaxUint16)
 	return t
 }
 
@@ -159,6 +163,14 @@ type TunnelImpl[T v1.Spec] struct {
 
 	interceptorsMu sync.Mutex
 	interceptors   v1.Interceptors
+	// autoPriority hands out Priorities to interceptors registered with Priority
+	// 0 (unset). It starts at math.MaxUint16 and steps down, so an unprioritized
+	// interceptor sits at the low-precedence end (highest number) and a
+	// later-registered one steps toward higher precedence — later wins — while
+	// any explicit small Priority outranks them all. Lower Priority = higher
+	// precedence (evaluated first), AWS-ALB style. uint32 holds the uint16 range
+	// with headroom for the step-down arithmetic; it saturates at 0.
+	autoPriority atomic.Uint32
 
 	hostnameReady chan struct{}
 

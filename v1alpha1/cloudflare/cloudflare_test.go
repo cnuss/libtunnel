@@ -90,52 +90,12 @@ func TestEnvKnobsUnsetLeaveCodeInCharge(t *testing.T) {
 	}
 }
 
-// TestEnvFixesStreamingLevers pins env-beats-code for the Cloudflare streaming
-// lever: LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL fixes the knob at construction and
-// WithFlushInterval becomes a no-op.
-func TestEnvFixesStreamingLevers(t *testing.T) {
-	t.Setenv(v1.CloudflareFlushIntervalEnv, "500ms")
-
-	b := New()
-	b.WithFlushInterval(5 * time.Second) // loses: env fixed 500ms
-
-	if got := b.flushInterval; got == nil || *got != 500*time.Millisecond {
-		t.Errorf("FlushInterval = %v, want the LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL=500ms value to stick over WithFlushInterval(5s)", got)
-	}
-	if err := b.envErr; err != nil {
-		t.Errorf("EnvErr = %v, want nil", err)
-	}
-}
-
-// TestStreamingLeversUnsetLeaveCodeInCharge pins the fallthrough: without the
-// env var the mutator works exactly as written.
-func TestStreamingLeversUnsetLeaveCodeInCharge(t *testing.T) {
-	t.Setenv(v1.CloudflareFlushIntervalEnv, "")
-
-	b := New().WithFlushInterval(2 * time.Second)
-
-	if got := b.flushInterval; got == nil || *got != 2*time.Second {
-		t.Errorf("FlushInterval = %v, want 2s from code", got)
-	}
-}
-
-// TestFlushIntervalEnvUnparsableSetsEnvErr pins loud failure for a bad duration
-// override: New records the parse error, which connect later surfaces (as
-// TestEnvKnobUnparsableFailsConnect proves for the bool knobs).
-func TestFlushIntervalEnvUnparsableSetsEnvErr(t *testing.T) {
-	t.Setenv(v1.CloudflareFlushIntervalEnv, "banana")
-
-	if err := New().envErr; err == nil || !strings.Contains(err.Error(), v1.CloudflareFlushIntervalEnv) {
-		t.Errorf("EnvErr = %v, want a %s parse cause", err, v1.CloudflareFlushIntervalEnv)
-	}
-}
-
 // clearSpecEnv scrubs the credential-chain env vars so a test resolves
 // exactly the channel it stages.
 func clearSpecEnv(t *testing.T) {
 	t.Helper()
 	for _, v := range []string{v1.SpecEnv, v1.FromEnv, v1.CloudflareIDEnv, v1.CloudflareNameEnv,
-		v1.CloudflareHostnameEnv, v1.CloudflareAccountTagEnv, v1.CloudflareSecretEnv, v1.CloudflareAPIURLEnv} {
+		v1.CloudflareHostnameEnv, v1.CloudflareAccountTagEnv, v1.CloudflareSecretEnv, v1.CloudflareProviderEnv} {
 		t.Setenv(v, "")
 	}
 }
@@ -180,7 +140,7 @@ func TestCompleteFieldSetShortCircuitsMint(t *testing.T) {
 	t.Setenv(v1.CloudflareHostnameEnv, "fields.trycloudflare.com")
 	t.Setenv(v1.CloudflareAccountTagEnv, "tag")
 	t.Setenv(v1.CloudflareSecretEnv, "c2VjcmV0")
-	t.Setenv(v1.CloudflareAPIURLEnv, "http://127.0.0.1:1/nope")
+	t.Setenv(v1.CloudflareProviderEnv, "http://127.0.0.1:1/nope")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -204,25 +164,38 @@ func TestSecretEnvUndecodableErrors(t *testing.T) {
 	}
 }
 
-// TestApiURLEnvBeatsCode pins WithApiURL and its env mirror: the mint hits
-// the env endpoint, not the code one (which would hang the test in retries).
-func TestApiURLEnvBeatsCode(t *testing.T) {
+// TestProviderEnvBeatsCode pins WithProvider and its env mirror: the mint hits
+// the env endpoint, not the code one (which would hang the test in retries). A
+// full URL (with scheme) is honored verbatim — the escape hatch that lets the
+// mint point at this mock server.
+func TestProviderEnvBeatsCode(t *testing.T) {
 	clearSpecEnv(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
-	t.Setenv(v1.CloudflareAPIURLEnv, srv.URL)
+	t.Setenv(v1.CloudflareProviderEnv, srv.URL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	spec, err := New().WithApiURL("http://127.0.0.1:1/nope").Provider().Spec(ctx)
+	spec, err := New().WithProvider("http://127.0.0.1:1/nope").Provider().Spec(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if spec.Hostname != "minted.trycloudflare.com" {
 		t.Errorf("Hostname = %q, want the spec minted from the env endpoint", spec.Hostname)
+	}
+}
+
+// TestProviderHostSynthesizesEndpoint pins the bare-host → https://host/tunnel
+// synthesis and the verbatim passthrough for a scheme-carrying value.
+func TestProviderHostSynthesizesEndpoint(t *testing.T) {
+	if got := providerEndpoint("api.trycloudflare.com"); got != "https://api.trycloudflare.com/tunnel" {
+		t.Errorf("providerEndpoint(host) = %q, want the synthesized https/…/tunnel URL", got)
+	}
+	if got := providerEndpoint("http://127.0.0.1:8080/tunnel"); got != "http://127.0.0.1:8080/tunnel" {
+		t.Errorf("providerEndpoint(url) = %q, want it verbatim", got)
 	}
 }
 
@@ -251,7 +224,7 @@ func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
 
 // mustProxy interposes the reverse-proxy shim in front of srv and returns the
 // http:// base URL a client dials.
-func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server, flushInterval time.Duration) string {
+func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server) string {
 	t.Helper()
 	origin, err := url.Parse(srv.URL)
 	if err != nil {
@@ -262,7 +235,7 @@ func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server, flushInt
 		t.Fatalf("listen: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ps := &http.Server{Handler: newOriginProxy(origin, flushInterval, logger, originTransport(origin))}
+	ps := &http.Server{Handler: newOriginProxy(origin, logger, originTransport(origin))}
 	context.AfterFunc(ctx, func() { ps.Close() })
 	go ps.Serve(l)
 	return "http://" + l.Addr().String()
@@ -305,8 +278,7 @@ func runPassthrough(t *testing.T, useTLS bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// A non-zero flush interval must NOT affect a fixed response — it is one-shot.
-	base := mustProxy(t, ctx, srv, 200*time.Millisecond)
+	base := mustProxy(t, ctx, srv)
 
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/healthz", nil)
@@ -344,9 +316,8 @@ type streamEvent struct {
 }
 
 // TestStreamingPassthrough proves a chunked, unbuffered streaming origin
-// response (the kube-watch shape) is proxied straight through with FlushInterval
-// set: every event arrives, in order. There is no reconnect/session model
-// anymore — this is a single straight stream through the reverse proxy.
+// response (the kube-watch shape) is proxied straight through: every event
+// arrives, in order. This is a single straight stream through the reverse proxy.
 func TestStreamingPassthrough(t *testing.T) {
 	const total = 12
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -378,7 +349,7 @@ func TestStreamingPassthrough(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	base := mustProxy(t, ctx, srv, 100*time.Millisecond)
+	base := mustProxy(t, ctx, srv)
 
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/watch?n="+strconv.Itoa(total), nil)

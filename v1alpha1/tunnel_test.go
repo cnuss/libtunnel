@@ -868,33 +868,120 @@ func TestInterceptFallsThroughToProxy(t *testing.T) {
 	}
 }
 
-func TestInterceptFirstMatchWins(t *testing.T) {
+func intercMark(s string) v1.InterceptFn {
+	return func(ctx v1.InterceptCtx) v1.InterceptCtx {
+		return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) })
+	}
+}
+
+// TestInterceptLaterDefaultWins: two Priority-0 interceptors are auto-assigned
+// from the top of the range downward, so the later-registered one has the lower
+// (higher-precedence) Priority and wins.
+func TestInterceptLaterDefaultWins(t *testing.T) {
 	engine := proxyEngine(t, "origin")
 	tun := v1alpha1.New(engine)
 	always := func(*http.Request) bool { return true }
-	mark := func(s string) v1.InterceptFn {
-		return func(ctx v1.InterceptCtx) v1.InterceptCtx {
-			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) })
-		}
-	}
-	tun.WithInterceptor(always, mark("first"))
-	tun.WithInterceptor(always, mark("second"))
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("first")})
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("second")})
 
 	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
-	if rr.Body.String() != "first" {
-		t.Fatalf("body = %q, want %q (registration order wins)", rr.Body.String(), "first")
+	if rr.Body.String() != "second" {
+		t.Fatalf("body = %q, want %q (later default wins via auto Priority)", rr.Body.String(), "second")
+	}
+}
+
+// TestInterceptLowerPriorityWins: with ALB ordering the lowest Priority wins,
+// regardless of registration order.
+func TestInterceptLowerPriorityWins(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	always := func(*http.Request) bool { return true }
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("low-prec"), Priority: 50})
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("high-prec"), Priority: 5})
+
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "high-prec" {
+		t.Fatalf("body = %q, want %q (lower Priority = higher precedence wins)", rr.Body.String(), "high-prec")
+	}
+}
+
+// TestInterceptExplicitBeatsDefault: any explicit Priority outranks an
+// auto-assigned default (which sits at the top of the range).
+func TestInterceptExplicitBeatsDefault(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	always := func(*http.Request) bool { return true }
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("default")})                    // auto ~MaxUint16
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("explicit"), Priority: 40_000}) // still far below auto
+
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "explicit" {
+		t.Fatalf("body = %q, want %q (explicit Priority outranks an auto default)", rr.Body.String(), "explicit")
+	}
+}
+
+// TestInterceptorsAccessor: Interceptors() exposes the registry in precedence
+// order (ascending Priority), with auto-assigned Priorities resolved.
+func TestInterceptorsAccessor(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	always := func(*http.Request) bool { return true }
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("d1")})                 // auto, top-down
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("mid"), Priority: 100}) // explicit mid
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("top"), Priority: 1})   // explicit top
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("d2")})                 // auto, below d1
+
+	got := tun.Interceptors()
+	if len(got) != 4 {
+		t.Fatalf("Interceptors() len = %d, want 4", len(got))
+	}
+	// Ascending Priority: top(1) < mid(100) < d2(auto) < d1(auto).
+	for i := 1; i < len(got); i++ {
+		if got[i-1].Priority > got[i].Priority {
+			t.Fatalf("Interceptors() not in ascending Priority order: %d then %d", got[i-1].Priority, got[i].Priority)
+		}
+	}
+	if got[0].Priority != 1 {
+		t.Errorf("first Priority = %d, want the explicit 1 (highest precedence)", got[0].Priority)
+	}
+	if got[0].Priority == 0 || got[len(got)-1].Priority == 0 {
+		t.Error("auto-assigned Priority should be resolved (non-zero) in the snapshot")
+	}
+}
+
+// TestInterceptWrapsDefaultHandler pins the README's middleware pattern: wrap
+// ctx.Handler() (the origin proxy) to add a response header, then serve it —
+// the header lands AND the origin body is relayed.
+func TestInterceptWrapsDefaultHandler(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	tun.WithInterceptor(v1.Interceptor{
+		Match: func(*http.Request) bool { return true },
+		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
+			next := ctx.Handler()
+			return ctx.WithHandler(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Served-By", "libtunnel")
+				next(w, r)
+			})
+		},
+	})
+
+	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
+	if got := rr.Header().Get("X-Served-By"); got != "libtunnel" {
+		t.Errorf("X-Served-By = %q, want the injected header", got)
+	}
+	if rr.Body.String() != "origin" {
+		t.Errorf("body = %q, want the origin body relayed through the wrapper", rr.Body.String())
 	}
 }
 
 func TestInterceptMatchPredicate(t *testing.T) {
 	engine := proxyEngine(t, "origin")
 	tun := v1alpha1.New(engine)
-	tun.WithInterceptor(
-		func(r *http.Request) bool { return r.URL.Path == "/hooked" },
-		func(ctx v1.InterceptCtx) v1.InterceptCtx {
+	tun.WithInterceptor(v1.Interceptor{
+		Match: func(r *http.Request) bool { return r.URL.Path == "/hooked" },
+		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
 			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "hooked") })
 		},
-	)
+	})
 
 	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/hooked", nil)); rr.Body.String() != "hooked" {
 		t.Errorf("matching path body = %q, want %q", rr.Body.String(), "hooked")
@@ -911,13 +998,13 @@ func TestInterceptDeclineFallsThrough(t *testing.T) {
 	tun := v1alpha1.New(engine)
 
 	inspected := false
-	tun.WithInterceptor(
-		func(*http.Request) bool { return true },
-		func(ctx v1.InterceptCtx) v1.InterceptCtx {
+	tun.WithInterceptor(v1.Interceptor{
+		Match: func(*http.Request) bool { return true },
+		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
 			inspected = true
 			return ctx // no WithHandler → default stands
 		},
-	)
+	})
 
 	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
 	if !inspected {
@@ -932,10 +1019,10 @@ func TestInterceptDeclineFallsThrough(t *testing.T) {
 func TestInterceptNilReturnFallsThrough(t *testing.T) {
 	engine := proxyEngine(t, "origin")
 	tun := v1alpha1.New(engine)
-	tun.WithInterceptor(
-		func(*http.Request) bool { return true },
-		func(v1.InterceptCtx) v1.InterceptCtx { return nil },
-	)
+	tun.WithInterceptor(v1.Interceptor{
+		Match:   func(*http.Request) bool { return true },
+		Handler: func(v1.InterceptCtx) v1.InterceptCtx { return nil },
+	})
 
 	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "origin" {
 		t.Fatalf("body = %q, want %q (nil return → fall through)", rr.Body.String(), "origin")
@@ -952,15 +1039,15 @@ func TestInterceptCtxExposesLevers(t *testing.T) {
 
 	var gotTarget net.Listener
 	var gotReq *http.Request
-	tun.WithInterceptor(
-		func(*http.Request) bool { return true },
-		func(ctx v1.InterceptCtx) v1.InterceptCtx {
+	tun.WithInterceptor(v1.Interceptor{
+		Match: func(*http.Request) bool { return true },
+		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
 			gotTarget = ctx.Target()
 			gotReq = ctx.Request()
 			_ = ctx.Reconnect(ctx)
 			return ctx.WithHandler(func(http.ResponseWriter, *http.Request) {})
 		},
-	)
+	})
 
 	req := httptest.NewRequest("GET", "/x", nil)
 	serveIntercept(tun, engine, req)

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -83,23 +84,70 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
 	return t
 }
 
-// WithInterceptor appends an interceptor to the ordered registry. Safe to call
-// concurrently and after the tunnel is live (see v1.Tunnel.WithInterceptor).
-func (t *TunnelImpl[T]) WithInterceptor(match v1.MatchFn, handler v1.InterceptFn) v1.Tunnel {
+// autoPriorityStep is how far the auto lane steps down per interceptor
+// registered with Priority 0 (unset). The counter starts at math.MaxUint16, so
+// unprioritized interceptors sit at the low-precedence end and a later-registered
+// one steps toward higher precedence — later wins.
+const autoPriorityStep = 10
+
+// nextAutoPriority returns the next auto-assigned Priority, stepping the counter
+// down by autoPriorityStep and saturating at 0 (its minimum) rather than
+// underflowing the unsigned counter.
+func (t *TunnelImpl[T]) nextAutoPriority() uint16 {
+	for {
+		cur := t.autoPriority.Load()
+		var next uint32
+		if cur > autoPriorityStep {
+			next = cur - autoPriorityStep
+		}
+		if t.autoPriority.CompareAndSwap(cur, next) {
+			return uint16(next)
+		}
+	}
+}
+
+// WithInterceptor registers an interceptor, keeping the registry ordered by
+// ascending Priority (ties in registration order) so Intercept's first-match
+// scan yields the lowest-Priority — highest-precedence — match. A Priority of 0
+// (unset) is auto-assigned from the top of the range downward, so later-
+// registered unprioritized interceptors win and any explicit Priority outranks
+// them. The stable sort preserves insertion order for equal Priorities. Safe to
+// call concurrently and after the tunnel is live (see v1.Tunnel.WithInterceptor).
+func (t *TunnelImpl[T]) WithInterceptor(interceptor v1.Interceptor) v1.Tunnel {
+	if interceptor.Priority == 0 {
+		interceptor.Priority = t.nextAutoPriority()
+	}
 	t.interceptorsMu.Lock()
 	defer t.interceptorsMu.Unlock()
-	t.interceptors = append(t.interceptors, v1.Interceptor{Match: match, Handler: handler})
+	t.interceptors = append(t.interceptors, interceptor)
+	sort.SliceStable(t.interceptors, func(i, j int) bool {
+		return t.interceptors[i].Priority < t.interceptors[j].Priority
+	})
 	return t
 }
 
+// Interceptors returns a snapshot of the registry in precedence order (ascending
+// Priority, ties in registration order) — the order Intercept consults them.
+// It's a defensive copy: mutating the returned slice does not affect the live
+// registry (Interceptor is a value type; its func fields are immutable
+// references). If Interceptor ever gains a reference-type field, deep-copy it here.
+func (t *TunnelImpl[T]) Interceptors() v1.Interceptors {
+	t.interceptorsMu.Lock()
+	defer t.interceptorsMu.Unlock()
+	out := make(v1.Interceptors, len(t.interceptors))
+	copy(out, t.interceptors)
+	return out
+}
+
 // Intercept resolves the handler for a request through the interceptor
-// registry. The first registered interceptor whose Match returns true runs,
-// given the InterceptCtx (which carries the request and the default
-// origin-proxy handler); it shapes the response by calling ctx.WithHandler and
-// returns the ctx. When nothing matches — or an interceptor returns nil — the
-// ctx's default handler (proxy to the origin) stands. The registry lock is held
-// only across the match scan, not the interceptor. The returned handler is the
-// one the engine serves.
+// registry. The lowest-Priority (highest-precedence) interceptor whose Match
+// returns true runs (ties by registration order — the registry is kept sorted),
+// given the InterceptCtx (which carries the request and the default origin-proxy
+// handler); it shapes the response by calling ctx.WithHandler and returns the
+// ctx. When nothing matches — or an interceptor returns nil — the ctx's default
+// handler (proxy to the origin) stands. The registry lock is held only across
+// the match scan, not the interceptor. The returned handler is the one the
+// engine serves.
 func (t *TunnelImpl[T]) Intercept(ctx v1.InterceptCtx) http.HandlerFunc {
 	t.interceptorsMu.Lock()
 	var interceptor v1.InterceptFn

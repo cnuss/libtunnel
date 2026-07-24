@@ -306,19 +306,16 @@ func TestLiveBinary(t *testing.T) {
 	eventuallyBody(t, pub, "hello via the binary", 60*time.Second)
 }
 
-// TestLiveWatchFlushInterval is the LIVE end-to-end proof of the Cloudflare
-// backend's flush-interval lever (WithFlushInterval) on a kubernetes-shaped
-// watch: a long-lived (~30s) chunked HTTP 200 stream of 30 small events, 1s
-// apart. The events are tiny, so over 30s they never accumulate the edge's 128
-// KiB flush threshold — a PLAIN 200 would sit buffered and dump all 30 at the
-// 30s close. The shim ends the current downstream response CLEANLY every 1s (the
-// edge's other flush trigger), so each event reaches the client within ~interval
-// instead of bunching at close, while the origin sees exactly ONE watch request
-// across every reconnect.
+// TestLiveWatchStream is the LIVE end-to-end proof that the reverse proxy
+// fronting the origin relays a real streaming (kubernetes-watch-shaped) chunked
+// HTTP 200 faithfully — every event, in order — through the live cloudflared +
+// edge path. It does NOT assert defeat of any edge buffering (the proxy doesn't,
+// and shouldn't be expected to); edge buffering may bunch arrival, but every
+// event still lands exactly once and in order.
 //
-// The client re-issues the IDENTICAL request after each short response (the
-// kubectl re-watch shape); the session table reattaches it to the live stream.
-func TestLiveWatchFlushInterval(t *testing.T) {
+// The client re-issues the IDENTICAL request as needed (the kubectl re-watch
+// shape) to collect the whole stream.
+func TestLiveWatchStream(t *testing.T) {
 	gateLive(t) // adopts the shared preflight spec
 
 	srv, originHits := startWatchOrigin(t)
@@ -329,12 +326,7 @@ func TestLiveWatchFlushInterval(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 
-	// The reverse proxy always fronts the origin; WithFlushInterval sets its
-	// stdlib FlushInterval. This asserts the proxy relays a real streaming
-	// (kube-watch-shaped) 200 faithfully — every event, in order — through the
-	// live cloudflared + edge path. It does NOT assert defeat of any edge
-	// buffering (the proxy doesn't, and shouldn't be expected to).
-	conn := libtunnel.New(cloudflare.New().WithFlushInterval(500 * time.Millisecond)).
+	conn := libtunnel.New(cloudflare.New()).
 		WithLogger(slog.Default()).
 		WithContext(ctx).
 		WithLocalURL(origin)

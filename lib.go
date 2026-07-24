@@ -173,9 +173,9 @@ func New[T v1.Spec](backend v1.Backend[T]) TunnelV1 {
 // Individual spec fields can be overridden with the backend's setters —
 // WithID, WithName, WithHostname, WithAccountTag, WithSecret — or their
 // LIBTUNNEL__CLOUDFLARE_* environment mirrors (env beats code, field by
-// field); a complete credential set skips resolution entirely. WithApiURL
-// (LIBTUNNEL__CLOUDFLARE_API_URL) points the mint at a different quick-tunnel
-// endpoint. Chain the backend-specific setters before WithTLS / WithHTTP2,
+// field); a complete credential set skips resolution entirely. WithProvider
+// (LIBTUNNEL__CLOUDFLARE_PROVIDER) points the mint at a different quick-tunnel
+// provider host. Chain the backend-specific setters before WithTLS / WithHTTP2,
 // which return the CloudflareV1 interface.
 func Cloudflare() *cloudflare.Backend {
 	return cloudflare.New()

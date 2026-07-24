@@ -32,8 +32,9 @@ var ErrMintRejected = errors.New("quick tunnel mint rejected")
 // QuickTunnelProvider mints an anonymous *.trycloudflare.com tunnel from the
 // quick-tunnel API, retrying with linear backoff until the context is done.
 type QuickTunnelProvider struct {
-	// URL overrides the quick-tunnel API endpoint (WithApiURL, its
-	// LIBTUNNEL__CLOUDFLARE_API_URL mirror, tests). Empty means the default.
+	// URL overrides the quick-tunnel API endpoint (synthesized from WithProvider
+	// / its LIBTUNNEL__CLOUDFLARE_PROVIDER mirror, or set directly in tests).
+	// Empty means the default.
 	URL string
 	// Log receives retry warnings. Nil is silent.
 	Log *slog.Logger
