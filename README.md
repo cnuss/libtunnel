@@ -163,38 +163,46 @@ live.
 
 ```go
 type MatchFn     = func(r *http.Request) bool
-type InterceptFn = func(w http.ResponseWriter, r *http.Request, ctl InterceptCtl) http.HandlerFunc
+type InterceptFn = func(ctx InterceptCtx) InterceptCtx
 
-type InterceptCtl struct {
-    // cycle the edge connection(s); blocks until re-established, ctx is done,
-    // or the tunnel shuts down. Also on the backend as Backend.Reconnect.
-    Reconnect func(ctx context.Context) error
-    // the loopback listener the engine dials (the proxy's socket, not the origin)
-    Listener  net.Listener
+// InterceptCtx is the per-request handle. It embeds the request's
+// context.Context and carries the request, the response writer, and the
+// handler that will serve it — seeded to proxy the origin.
+type InterceptCtx interface {
+    context.Context
+
+    Reconnect(ctx context.Context) error // cycle the edge conn(s), block until back up
+    Target() net.Listener                // the proxy's loopback socket (not the origin)
+
+    WithHandler(h http.HandlerFunc) InterceptCtx // replace the serving handler
+    Handler() http.HandlerFunc                   // the handler currently set
+
+    Writer() http.ResponseWriter
+    Request() *http.Request
 }
 ```
 
-`InterceptFn` is a **selector**: given the request and an `InterceptCtl` of
-tunnel-level levers, it returns the `http.HandlerFunc` that serves the request
-(the tunnel then invokes it with the same `w, r`). Returning `nil` declines the
-request — it falls through to the origin, exactly as if nothing had matched — so
-an interceptor can match broadly, inspect, and opt out per request.
+An `InterceptFn` receives the `InterceptCtx` and shapes how the request is
+served: call `WithHandler` to take it over, or return the ctx unchanged (or
+`nil`) to leave the default in place — the request is proxied to the origin,
+exactly as if nothing had matched. So an interceptor can match broadly, inspect,
+and opt out per request.
 
 ```go
 tun := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 
-// force an edge reconnect on watch requests, then fall through to the origin.
+// on watch requests, force an edge reconnect, then serve normally.
 tun.WithInterceptor(
     func(r *http.Request) bool { return r.URL.Query().Get("watch") == "true" },
-    func(w http.ResponseWriter, r *http.Request, ctl libtunnel.InterceptCtl) http.HandlerFunc {
-        return func(w http.ResponseWriter, r *http.Request) {
-            ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+    func(ic libtunnel.InterceptCtx) libtunnel.InterceptCtx {
+        return ic.WithHandler(func(w http.ResponseWriter, r *http.Request) {
+            ctx, cancel := context.WithTimeout(ic, 30*time.Second)
             defer cancel()
-            if err := ctl.Reconnect(ctx); err != nil {
+            if err := ic.Reconnect(ctx); err != nil {
                 return // request can't proceed — stop, no further writes
             }
-            // ... serve the request (e.g. proxy to the origin) ...
-        }
+            // ... serve the request ...
+        })
     },
 )
 ```

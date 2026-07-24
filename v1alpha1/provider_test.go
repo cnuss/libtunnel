@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"log/slog"
 	"net"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -372,6 +373,8 @@ func (e loggerEngine) CACerts() []*x509.Certificate                { return nil 
 func (e loggerEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e loggerEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
 func (loggerEngine) Reconnect(context.Context) error               { return nil }
+func (loggerEngine) Proxy() *httputil.ReverseProxy                 { return nil }
+func (loggerEngine) Listener() net.Listener                        { return nil }
 func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }

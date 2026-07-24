@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
@@ -35,6 +36,14 @@ type Engine[T v1.Spec] interface {
 
 	// CACerts returns the trust roots for this backend's edge connections.
 	CACerts() []*x509.Certificate
+	// Proxy is the in-process reverse proxy that fronts the origin, live once
+	// the tunnel has connected. NewInterceptCtx seeds an interception's default
+	// handler from it (proxy the request to the origin). Nil before connect.
+	Proxy() *httputil.ReverseProxy
+	// Listener is the loopback listener the engine dials to reach Proxy — the
+	// proxy's own accept socket, not the origin. Surfaced to interceptors as
+	// InterceptCtx.Target. Nil before connect.
+	Listener() net.Listener
 	// WithListener mirrors the top-level mutator: the core hands the provided
 	// listener down when the tunnel's WithListener fires. It is invoked once,
 	// in its own goroutine, and blocks until the edge connection is up

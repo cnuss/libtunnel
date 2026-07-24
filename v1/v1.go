@@ -162,7 +162,7 @@ type Backend[T Spec] interface {
 	// ctx.Err()); pass a ctx with a deadline to bound the wait. It also returns
 	// if the tunnel itself shuts down while waiting. It is an error to call
 	// before the tunnel has connected. This is the same lever surfaced to
-	// interceptors as InterceptCtl.Reconnect.
+	// interceptors as InterceptCtx.Reconnect.
 	Reconnect(ctx context.Context) error
 }
 
@@ -319,14 +319,42 @@ type Tunnel interface {
 // mutate r.
 type MatchFn = func(r *http.Request) bool
 
-// InterceptFn builds the handler that serves a matched request. It is called
-// with the request's own w and r (so it can inspect or close over them) plus an
-// InterceptCtl for tunnel-level levers, and returns the http.HandlerFunc that
-// actually serves the request — which the tunnel then invokes with the same w
-// and r. Returning nil declines the request: it falls through to the default
-// (proxied to the origin), just as if nothing had matched — so an interceptor
-// can match broadly, inspect, and opt out per request.
-type InterceptFn = func(w http.ResponseWriter, r *http.Request, ctl InterceptCtl) http.HandlerFunc
+// InterceptCtx is the per-request handle passed to an interceptor. It embeds the
+// request's context.Context (so it carries deadlines and cancellation and can be
+// passed anywhere a context is wanted), exposes the request and response writer,
+// and carries the handler that will serve the request — seeded to proxy the
+// origin. An interceptor shapes the response by calling WithHandler, and reaches
+// past the single request through the tunnel-level levers (Reconnect, Target).
+type InterceptCtx interface {
+	context.Context
+
+	// Reconnect forcefully cycles the engine's edge connection(s) and blocks
+	// until re-established or ctx is done (see Backend.Reconnect).
+	Reconnect(ctx context.Context) error
+	// Target is the loopback listener the engine dials to reach the origin
+	// proxy — the proxy's own accept socket, not the origin. An interceptor can
+	// cycle it (close to force the engine to re-dial).
+	Target() net.Listener
+
+	// WithHandler replaces the handler that will serve this request and returns
+	// the ctx for chaining. Unset, the handler proxies the request to the origin.
+	WithHandler(h http.HandlerFunc) InterceptCtx
+	// Handler is the handler currently set to serve the request.
+	Handler() http.HandlerFunc
+
+	// Writer is the response writer for the request.
+	Writer() http.ResponseWriter
+	// Request is the inbound request.
+	Request() *http.Request
+}
+
+// InterceptFn shapes how a matched request is served. It receives the request's
+// InterceptCtx — request, response writer, embedded context, and tunnel levers —
+// and returns a ctx whose Handler serves the request, typically the same ctx
+// after a WithHandler call. Returning the ctx unchanged (or nil) keeps the
+// default: the request is proxied to the origin, just as if nothing had matched.
+// So an interceptor can match broadly, inspect, and opt out per request.
+type InterceptFn = func(ctx InterceptCtx) InterceptCtx
 
 // Interceptor pairs a match predicate with the handler it selects.
 type Interceptor struct {
@@ -337,19 +365,3 @@ type Interceptor struct {
 // Interceptors is the ordered registry consulted per request; the first
 // Interceptor whose Match returns true wins (registration order).
 type Interceptors = []Interceptor
-
-// InterceptCtl exposes tunnel-level levers to an interceptor, letting a handler
-// reach past the single request into the engine that carries it.
-type InterceptCtl struct {
-	// Reconnect forcefully cycles the engine's connection(s) to the tunnel edge
-	// and blocks until the edge is re-established or ctx is done (returning
-	// ctx.Err()); pass a ctx with a deadline to bound the wait. A non-nil error
-	// means the request cannot proceed — the handler should stop and return
-	// without further writes. This is Backend.Reconnect bound to the tunnel.
-	Reconnect func(ctx context.Context) error
-
-	// Listener is the loopback listener the engine dials to reach the reverse
-	// proxy — the proxy's own accept socket, not the origin. Exposed so an
-	// interceptor can cycle it (close to force the engine to re-dial).
-	Listener net.Listener
-}

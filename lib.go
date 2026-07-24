@@ -139,10 +139,10 @@ type CloudflareV1 = v1.Backend[*cloudflare.Spec]
 // so callers can name them without importing v1.
 type (
 	MatchFn      = v1.MatchFn      // request predicate: does this interceptor apply
-	InterceptFn  = v1.InterceptFn  // selects the handler that serves a matched request
+	InterceptFn  = v1.InterceptFn  // shapes how a matched request is served
 	Interceptor  = v1.Interceptor  // a {Match, Handler} pair
 	Interceptors = v1.Interceptors // ordered registry; first match wins
-	InterceptCtl = v1.InterceptCtl // tunnel-level levers handed to a handler
+	InterceptCtx = v1.InterceptCtx // per-request handle: request, levers, handler
 )
 
 // New returns an unstarted tunnel on the given backend, which also supplies
