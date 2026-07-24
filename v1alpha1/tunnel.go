@@ -84,12 +84,31 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
 	return t
 }
 
+// autoPriorityStep is the increment handed out for interceptors registered with
+// Priority 0: the first auto value is autoPriorityStep (10), the next 20, and so
+// on — a later-registered default outranks an earlier one, and the gap leaves
+// room to slot an explicit Priority between defaults.
+const autoPriorityStep = 10
+
 // WithInterceptor registers an interceptor, keeping the registry ordered by
 // descending Priority (ties in registration order) so Intercept's first-match
-// scan yields the highest-Priority match. The stable sort preserves the
-// insertion order of equal-Priority interceptors. Safe to call concurrently and
+// scan yields the highest-Priority match. A Priority of 0 is auto-assigned an
+// increasing value (10, 20, …) so later-registered defaults win. The stable sort
+// preserves insertion order for equal Priorities. Safe to call concurrently and
 // after the tunnel is live (see v1.Tunnel.WithInterceptor).
 func (t *TunnelImpl[T]) WithInterceptor(interceptor v1.Interceptor) v1.Tunnel {
+	if interceptor.Priority == 0 {
+		interceptor.Priority = int(t.autoPriority.Add(autoPriorityStep))
+	} else {
+		// Raise the auto lane to this explicit Priority, but never lower it (a low
+		// fallback Priority must not drag it down). The next unprioritized
+		// interceptor then lands one step above this one.
+		for cur := t.autoPriority.Load(); int64(interceptor.Priority) > cur; cur = t.autoPriority.Load() {
+			if t.autoPriority.CompareAndSwap(cur, int64(interceptor.Priority)) {
+				break
+			}
+		}
+	}
 	t.interceptorsMu.Lock()
 	defer t.interceptorsMu.Unlock()
 	t.interceptors = append(t.interceptors, interceptor)

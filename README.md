@@ -156,11 +156,14 @@ func Version() string                            // the libtunnel release this b
 
 An in-process reverse proxy always fronts the origin. `WithInterceptor` hooks
 that path: for every request the tunnel runs the highest-`Priority` interceptor
-whose `MatchFn` returns true (ties break by registration order); anything
-unmatched is proxied to the origin unchanged. So a specific interceptor overrides
-a broad one by carrying a higher `Priority`, without depending on the order it
-was added. Interceptors layer (call it more than once) and, unlike the
-write-once `With*` mutators, may be added after the tunnel is live.
+whose `MatchFn` returns true; anything unmatched is proxied to the origin
+unchanged. A `Priority` of 0 (the default) is auto-assigned an increasing value
+at registration (10, 20, …), so a later-added interceptor wins over an earlier
+one. An explicit `Priority` places one deliberately and raises that lane to its
+value (so later defaults still layer on top) — use a low `Priority` as a
+fallback the defaults outrank, a high one to sit above the defaults so far.
+Interceptors layer (call it more than once) and, unlike the write-once `With*`
+mutators, may be added after the tunnel is live.
 
 ```go
 type MatchFn     = func(r *http.Request) bool
@@ -171,7 +174,7 @@ type InterceptFn = func(ctx InterceptCtx) InterceptCtx
 type Interceptor struct {
     Match    MatchFn
     Handler  InterceptFn
-    Priority int // highest wins; ties keep registration order; 0 = registration order
+    Priority int // highest wins; 0 auto-assigns 10, 20, … so later-added wins
 }
 
 // InterceptCtx is the per-request handle. It embeds the request's

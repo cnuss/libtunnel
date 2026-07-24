@@ -358,13 +358,18 @@ type Interceptor struct {
 	Handler InterceptFn
 	// Priority orders interceptors when more than one could match: the highest
 	// Priority is consulted first, so it wins. Interceptors of equal Priority
-	// keep registration order (first registered wins). The zero value leaves
-	// everything at the same Priority, i.e. plain registration order — so a
-	// specific interceptor overrides a broad one by carrying a higher Priority,
-	// without depending on the order it was added.
+	// keep registration order. A Priority of 0 (the default) is auto-assigned an
+	// increasing value at registration (10, 20, …), so among unprioritized
+	// interceptors the later-registered one wins. An explicit non-zero Priority
+	// places the interceptor deliberately and raises that auto lane to its value,
+	// so later unprioritized interceptors layer back on top of it — set a low
+	// Priority for a fallback the defaults outrank, a high one to sit above the
+	// defaults registered so far.
 	Priority int
 }
 
 // Interceptors is the registry consulted per request: the highest-Priority
 // Interceptor whose Match returns true wins, ties broken by registration order.
+// Zero-Priority interceptors are auto-assigned increasing priorities, so among
+// them the later-registered wins.
 type Interceptors = []Interceptor

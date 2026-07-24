@@ -868,41 +868,59 @@ func TestInterceptFallsThroughToProxy(t *testing.T) {
 	}
 }
 
-func TestInterceptFirstMatchWins(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-	always := func(*http.Request) bool { return true }
-	mark := func(s string) v1.InterceptFn {
-		return func(ctx v1.InterceptCtx) v1.InterceptCtx {
-			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) })
-		}
-	}
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: mark("first")})
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: mark("second")})
-
-	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
-	if rr.Body.String() != "first" {
-		t.Fatalf("body = %q, want %q (equal Priority → registration order wins)", rr.Body.String(), "first")
+func intercMark(s string) v1.InterceptFn {
+	return func(ctx v1.InterceptCtx) v1.InterceptCtx {
+		return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) })
 	}
 }
 
-// TestInterceptPriorityWins: a higher-Priority interceptor beats an
-// earlier-registered lower-Priority one, regardless of add order.
+// TestInterceptLaterDefaultWins: two Priority-0 interceptors are auto-assigned
+// increasing priorities (10, 20), so the later-registered one wins.
+func TestInterceptLaterDefaultWins(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	always := func(*http.Request) bool { return true }
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("first")})
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("second")})
+
+	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
+	if rr.Body.String() != "second" {
+		t.Fatalf("body = %q, want %q (later default wins via auto Priority)", rr.Body.String(), "second")
+	}
+}
+
+// TestInterceptPriorityWins: an explicit Priority above the auto lane beats an
+// earlier-registered default, regardless of add order.
 func TestInterceptPriorityWins(t *testing.T) {
 	engine := proxyEngine(t, "origin")
 	tun := v1alpha1.New(engine)
 	always := func(*http.Request) bool { return true }
-	mark := func(s string) v1.InterceptFn {
-		return func(ctx v1.InterceptCtx) v1.InterceptCtx {
-			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) })
-		}
-	}
-	// Registered first, but lower Priority — must lose to the later high one.
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: mark("broad"), Priority: 0})
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: mark("specific"), Priority: 10})
+	// Registered first as a default (auto 10); a later explicit 100 outranks it.
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("broad")})
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("specific"), Priority: 100})
 
 	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "specific" {
-		t.Fatalf("body = %q, want %q (higher Priority wins over earlier registration)", rr.Body.String(), "specific")
+		t.Fatalf("body = %q, want %q (explicit high Priority wins)", rr.Body.String(), "specific")
+	}
+}
+
+// TestInterceptExplicitLowIsFallback: an explicit Priority below the auto lane
+// only wins when the defaults don't match — it's a fallback.
+func TestInterceptExplicitLowIsFallback(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	tun.WithInterceptor(v1.Interceptor{ // fallback: matches all, but low priority
+		Match: func(*http.Request) bool { return true }, Handler: intercMark("fallback"), Priority: 1,
+	})
+	tun.WithInterceptor(v1.Interceptor{ // default: only /hooked, auto priority 10
+		Match: func(r *http.Request) bool { return r.URL.Path == "/hooked" }, Handler: intercMark("hooked"),
+	})
+
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/hooked", nil)); rr.Body.String() != "hooked" {
+		t.Errorf("matched path body = %q, want %q (auto default outranks the explicit fallback)", rr.Body.String(), "hooked")
+	}
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/other", nil)); rr.Body.String() != "fallback" {
+		t.Errorf("unmatched path body = %q, want %q (fallback catches it)", rr.Body.String(), "fallback")
 	}
 }
 

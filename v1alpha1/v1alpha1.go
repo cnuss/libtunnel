@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -159,6 +160,12 @@ type TunnelImpl[T v1.Spec] struct {
 
 	interceptorsMu sync.Mutex
 	interceptors   v1.Interceptors
+	// autoPriority hands out Priorities to interceptors registered with Priority
+	// 0: each Add(autoPriorityStep) returns the next value, so successive
+	// zero-Priority interceptors get increasing priorities and the later one
+	// wins. An explicit Priority raises it (never lowers) to that value, so a
+	// subsequently registered default lands one step above the explicit one.
+	autoPriority atomic.Int64
 
 	hostnameReady chan struct{}
 
