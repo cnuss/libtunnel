@@ -176,7 +176,9 @@ type InterceptCtl struct {
 
 `InterceptFn` is a **selector**: given the request and an `InterceptCtl` of
 tunnel-level levers, it returns the `http.HandlerFunc` that serves the request
-(the tunnel then invokes it with the same `w, r`).
+(the tunnel then invokes it with the same `w, r`). Returning `nil` declines the
+request — it falls through to the origin, exactly as if nothing had matched — so
+an interceptor can match broadly, inspect, and opt out per request.
 
 ```go
 tun := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)

@@ -94,9 +94,11 @@ func (t *TunnelImpl[T]) WithInterceptor(match v1.MatchFn, handler v1.InterceptFn
 }
 
 // Intercept selects the handler for a request: the first registered interceptor
-// whose Match returns true builds it (given w, r and ctl), otherwise the request
-// falls through to proxy. The engine calls the returned handler with the same w
-// and r. The registry lock is held only across the match scan, not the handler.
+// whose Match returns true builds it (given w, r and ctl). The request falls
+// through to proxy (the default) when nothing matches, or when the matched
+// interceptor returns a nil handler — letting an interceptor inspect a request
+// and decline it. The engine calls the returned handler with the same w and r.
+// The registry lock is held only across the match scan, not the handler.
 func (t *TunnelImpl[T]) Intercept(proxy *httputil.ReverseProxy, w http.ResponseWriter, r *http.Request, ctl v1.InterceptCtl) http.HandlerFunc {
 	t.interceptorsMu.Lock()
 	var interceptor v1.InterceptFn
@@ -108,13 +110,16 @@ func (t *TunnelImpl[T]) Intercept(proxy *httputil.ReverseProxy, w http.ResponseW
 	}
 	t.interceptorsMu.Unlock()
 
-	if interceptor == nil {
-		return func(w http.ResponseWriter, r *http.Request) {
-			proxy.ServeHTTP(w, r)
-		}
+	fallback := func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r)
 	}
-
-	return interceptor(w, r, ctl)
+	if interceptor == nil {
+		return fallback
+	}
+	if h := interceptor(w, r, ctl); h != nil {
+		return h
+	}
+	return fallback
 }
 
 // WithLocalURL provides the local origin as the URL of an already-running

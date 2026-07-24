@@ -892,6 +892,28 @@ func TestInterceptMatchPredicate(t *testing.T) {
 	}
 }
 
+func TestInterceptNilHandlerFallsThrough(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
+	proxy := originProxy(t, "origin")
+
+	inspected := false
+	tun.WithInterceptor(
+		func(*http.Request) bool { return true }, // matches everything
+		func(http.ResponseWriter, *http.Request, v1.InterceptCtl) http.HandlerFunc {
+			inspected = true
+			return nil // ...but declines: fall through to the origin
+		},
+	)
+
+	rr := serveIntercept(tun, proxy, v1.InterceptCtl{}, httptest.NewRequest("GET", "/", nil))
+	if !inspected {
+		t.Fatal("interceptor never ran")
+	}
+	if rr.Body.String() != "origin" {
+		t.Fatalf("body = %q, want %q (nil handler → fall through)", rr.Body.String(), "origin")
+	}
+}
+
 func TestInterceptCtlReachesHandler(t *testing.T) {
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
 	l := listen(t)

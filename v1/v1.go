@@ -320,12 +320,12 @@ type Tunnel interface {
 type MatchFn = func(r *http.Request) bool
 
 // InterceptFn builds the handler that serves a matched request. It is called
-// with the request's own w and r (so it can inspect or close over them) plus a
+// with the request's own w and r (so it can inspect or close over them) plus an
 // InterceptCtl for tunnel-level levers, and returns the http.HandlerFunc that
 // actually serves the request — which the tunnel then invokes with the same w
-// and r. To fall through to the origin, return ctl-independent behavior such as
-// a proxy pass-through; there is no implicit default once an interceptor
-// matches.
+// and r. Returning nil declines the request: it falls through to the default
+// (proxied to the origin), just as if nothing had matched — so an interceptor
+// can match broadly, inspect, and opt out per request.
 type InterceptFn = func(w http.ResponseWriter, r *http.Request, ctl InterceptCtl) http.HandlerFunc
 
 // Interceptor pairs a match predicate with the handler it selects.
