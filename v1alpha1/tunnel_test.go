@@ -882,7 +882,27 @@ func TestInterceptFirstMatchWins(t *testing.T) {
 
 	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
 	if rr.Body.String() != "first" {
-		t.Fatalf("body = %q, want %q (registration order wins)", rr.Body.String(), "first")
+		t.Fatalf("body = %q, want %q (equal Priority → registration order wins)", rr.Body.String(), "first")
+	}
+}
+
+// TestInterceptPriorityWins: a higher-Priority interceptor beats an
+// earlier-registered lower-Priority one, regardless of add order.
+func TestInterceptPriorityWins(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	always := func(*http.Request) bool { return true }
+	mark := func(s string) v1.InterceptFn {
+		return func(ctx v1.InterceptCtx) v1.InterceptCtx {
+			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) })
+		}
+	}
+	// Registered first, but lower Priority — must lose to the later high one.
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: mark("broad"), Priority: 0})
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: mark("specific"), Priority: 10})
+
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "specific" {
+		t.Fatalf("body = %q, want %q (higher Priority wins over earlier registration)", rr.Body.String(), "specific")
 	}
 }
 

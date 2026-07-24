@@ -356,8 +356,15 @@ type InterceptFn = func(ctx InterceptCtx) InterceptCtx
 type Interceptor struct {
 	Match   MatchFn
 	Handler InterceptFn
+	// Priority orders interceptors when more than one could match: the highest
+	// Priority is consulted first, so it wins. Interceptors of equal Priority
+	// keep registration order (first registered wins). The zero value leaves
+	// everything at the same Priority, i.e. plain registration order — so a
+	// specific interceptor overrides a broad one by carrying a higher Priority,
+	// without depending on the order it was added.
+	Priority int
 }
 
-// Interceptors is the ordered registry consulted per request; the first
-// Interceptor whose Match returns true wins (registration order).
+// Interceptors is the registry consulted per request: the highest-Priority
+// Interceptor whose Match returns true wins, ties broken by registration order.
 type Interceptors = []Interceptor

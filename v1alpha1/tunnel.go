@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -83,23 +84,29 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
 	return t
 }
 
-// WithInterceptor appends an interceptor to the ordered registry. Safe to call
-// concurrently and after the tunnel is live (see v1.Tunnel.WithInterceptor).
+// WithInterceptor registers an interceptor, keeping the registry ordered by
+// descending Priority (ties in registration order) so Intercept's first-match
+// scan yields the highest-Priority match. The stable sort preserves the
+// insertion order of equal-Priority interceptors. Safe to call concurrently and
+// after the tunnel is live (see v1.Tunnel.WithInterceptor).
 func (t *TunnelImpl[T]) WithInterceptor(interceptor v1.Interceptor) v1.Tunnel {
 	t.interceptorsMu.Lock()
 	defer t.interceptorsMu.Unlock()
 	t.interceptors = append(t.interceptors, interceptor)
+	sort.SliceStable(t.interceptors, func(i, j int) bool {
+		return t.interceptors[i].Priority > t.interceptors[j].Priority
+	})
 	return t
 }
 
 // Intercept resolves the handler for a request through the interceptor
-// registry. The first registered interceptor whose Match returns true runs,
-// given the InterceptCtx (which carries the request and the default
-// origin-proxy handler); it shapes the response by calling ctx.WithHandler and
-// returns the ctx. When nothing matches — or an interceptor returns nil — the
-// ctx's default handler (proxy to the origin) stands. The registry lock is held
-// only across the match scan, not the interceptor. The returned handler is the
-// one the engine serves.
+// registry. The highest-Priority interceptor whose Match returns true runs
+// (ties by registration order — the registry is kept sorted), given the
+// InterceptCtx (which carries the request and the default origin-proxy handler);
+// it shapes the response by calling ctx.WithHandler and returns the ctx. When
+// nothing matches — or an interceptor returns nil — the ctx's default handler
+// (proxy to the origin) stands. The registry lock is held only across the match
+// scan, not the interceptor. The returned handler is the one the engine serves.
 func (t *TunnelImpl[T]) Intercept(ctx v1.InterceptCtx) http.HandlerFunc {
 	t.interceptorsMu.Lock()
 	var interceptor v1.InterceptFn
