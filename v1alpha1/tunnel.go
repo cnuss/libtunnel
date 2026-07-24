@@ -85,10 +85,10 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
 
 // WithInterceptor appends an interceptor to the ordered registry. Safe to call
 // concurrently and after the tunnel is live (see v1.Tunnel.WithInterceptor).
-func (t *TunnelImpl[T]) WithInterceptor(match v1.MatchFn, handler v1.InterceptFn) v1.Tunnel {
+func (t *TunnelImpl[T]) WithInterceptor(interceptor v1.Interceptor) v1.Tunnel {
 	t.interceptorsMu.Lock()
 	defer t.interceptorsMu.Unlock()
-	t.interceptors = append(t.interceptors, v1.Interceptor{Match: match, Handler: handler})
+	t.interceptors = append(t.interceptors, interceptor)
 	return t
 }
 

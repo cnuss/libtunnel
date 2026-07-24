@@ -877,8 +877,8 @@ func TestInterceptFirstMatchWins(t *testing.T) {
 			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) })
 		}
 	}
-	tun.WithInterceptor(always, mark("first"))
-	tun.WithInterceptor(always, mark("second"))
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: mark("first")})
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: mark("second")})
 
 	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
 	if rr.Body.String() != "first" {
@@ -886,15 +886,41 @@ func TestInterceptFirstMatchWins(t *testing.T) {
 	}
 }
 
+// TestInterceptWrapsDefaultHandler pins the README's middleware pattern: wrap
+// ctx.Handler() (the origin proxy) to add a response header, then serve it —
+// the header lands AND the origin body is relayed.
+func TestInterceptWrapsDefaultHandler(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	tun.WithInterceptor(v1.Interceptor{
+		Match: func(*http.Request) bool { return true },
+		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
+			next := ctx.Handler()
+			return ctx.WithHandler(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Served-By", "libtunnel")
+				next(w, r)
+			})
+		},
+	})
+
+	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
+	if got := rr.Header().Get("X-Served-By"); got != "libtunnel" {
+		t.Errorf("X-Served-By = %q, want the injected header", got)
+	}
+	if rr.Body.String() != "origin" {
+		t.Errorf("body = %q, want the origin body relayed through the wrapper", rr.Body.String())
+	}
+}
+
 func TestInterceptMatchPredicate(t *testing.T) {
 	engine := proxyEngine(t, "origin")
 	tun := v1alpha1.New(engine)
-	tun.WithInterceptor(
-		func(r *http.Request) bool { return r.URL.Path == "/hooked" },
-		func(ctx v1.InterceptCtx) v1.InterceptCtx {
+	tun.WithInterceptor(v1.Interceptor{
+		Match: func(r *http.Request) bool { return r.URL.Path == "/hooked" },
+		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
 			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "hooked") })
 		},
-	)
+	})
 
 	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/hooked", nil)); rr.Body.String() != "hooked" {
 		t.Errorf("matching path body = %q, want %q", rr.Body.String(), "hooked")
@@ -911,13 +937,13 @@ func TestInterceptDeclineFallsThrough(t *testing.T) {
 	tun := v1alpha1.New(engine)
 
 	inspected := false
-	tun.WithInterceptor(
-		func(*http.Request) bool { return true },
-		func(ctx v1.InterceptCtx) v1.InterceptCtx {
+	tun.WithInterceptor(v1.Interceptor{
+		Match: func(*http.Request) bool { return true },
+		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
 			inspected = true
 			return ctx // no WithHandler → default stands
 		},
-	)
+	})
 
 	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
 	if !inspected {
@@ -932,10 +958,10 @@ func TestInterceptDeclineFallsThrough(t *testing.T) {
 func TestInterceptNilReturnFallsThrough(t *testing.T) {
 	engine := proxyEngine(t, "origin")
 	tun := v1alpha1.New(engine)
-	tun.WithInterceptor(
-		func(*http.Request) bool { return true },
-		func(v1.InterceptCtx) v1.InterceptCtx { return nil },
-	)
+	tun.WithInterceptor(v1.Interceptor{
+		Match:   func(*http.Request) bool { return true },
+		Handler: func(v1.InterceptCtx) v1.InterceptCtx { return nil },
+	})
 
 	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "origin" {
 		t.Fatalf("body = %q, want %q (nil return → fall through)", rr.Body.String(), "origin")
@@ -952,15 +978,15 @@ func TestInterceptCtxExposesLevers(t *testing.T) {
 
 	var gotTarget net.Listener
 	var gotReq *http.Request
-	tun.WithInterceptor(
-		func(*http.Request) bool { return true },
-		func(ctx v1.InterceptCtx) v1.InterceptCtx {
+	tun.WithInterceptor(v1.Interceptor{
+		Match: func(*http.Request) bool { return true },
+		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
 			gotTarget = ctx.Target()
 			gotReq = ctx.Request()
 			_ = ctx.Reconnect(ctx)
 			return ctx.WithHandler(func(http.ResponseWriter, *http.Request) {})
 		},
-	)
+	})
 
 	req := httptest.NewRequest("GET", "/x", nil)
 	serveIntercept(tun, engine, req)

@@ -123,7 +123,7 @@ type Tunnel interface {
                                              // exclusive with WithListener
 
     // hook requests in front of the origin proxy; layerable, not write-once
-    WithInterceptor(match MatchFn, handler InterceptFn) Tunnel
+    WithInterceptor(interceptor Interceptor) Tunnel
 }
 
 type Provider[T Spec] interface { Spec(ctx context.Context) (T, error) }
@@ -165,6 +165,13 @@ live.
 type MatchFn     = func(r *http.Request) bool
 type InterceptFn = func(ctx InterceptCtx) InterceptCtx
 
+// WithInterceptor takes an Interceptor — the {Match, Handler} pair — so reusable
+// interceptors ship as constructors: tun.WithInterceptor(addHeaders()).
+type Interceptor struct {
+    Match   MatchFn
+    Handler InterceptFn
+}
+
 // InterceptCtx is the per-request handle. It embeds the request's
 // context.Context and carries the request, the response writer, and the
 // handler that will serve it — seeded to proxy the origin.
@@ -188,23 +195,49 @@ served: call `WithHandler` to take it over, or return the ctx unchanged (or
 exactly as if nothing had matched. So an interceptor can match broadly, inspect,
 and opt out per request.
 
-```go
-tun := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
+Ship an interceptor as a constructor that returns an `Interceptor`. The common
+shape wraps the default handler (`ic.Handler()`, which proxies to the origin) —
+plain net/http middleware:
 
-// on watch requests, force an edge reconnect, then serve normally.
-tun.WithInterceptor(
-    func(r *http.Request) bool { return r.URL.Query().Get("watch") == "true" },
-    func(ic libtunnel.InterceptCtx) libtunnel.InterceptCtx {
-        return ic.WithHandler(func(w http.ResponseWriter, r *http.Request) {
-            ctx, cancel := context.WithTimeout(ic, 30*time.Second)
-            defer cancel()
-            if err := ic.Reconnect(ctx); err != nil {
-                return // request can't proceed — stop, no further writes
-            }
-            // ... serve the request ...
-        })
-    },
-)
+```go
+// addHeader sets a response header on every request, then serves the origin.
+func addHeader(key, val string) libtunnel.Interceptor {
+    return libtunnel.Interceptor{
+        Match: func(*http.Request) bool { return true },
+        Handler: func(ic libtunnel.InterceptCtx) libtunnel.InterceptCtx {
+            next := ic.Handler() // the default: proxy to the origin
+            return ic.WithHandler(func(w http.ResponseWriter, r *http.Request) {
+                w.Header().Set(key, val)
+                next(w, r)
+            })
+        },
+    }
+}
+
+tun := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
+tun.WithInterceptor(addHeader("X-Served-By", "libtunnel"))
+```
+
+Reach past the request through the ctx levers — e.g. force an edge reconnect on
+`?watch=true`, then serve normally:
+
+```go
+func reconnectOnWatch() libtunnel.Interceptor {
+    return libtunnel.Interceptor{
+        Match: func(r *http.Request) bool { return r.URL.Query().Get("watch") == "true" },
+        Handler: func(ic libtunnel.InterceptCtx) libtunnel.InterceptCtx {
+            next := ic.Handler()
+            return ic.WithHandler(func(w http.ResponseWriter, r *http.Request) {
+                ctx, cancel := context.WithTimeout(ic, 30*time.Second)
+                defer cancel()
+                if err := ic.Reconnect(ctx); err != nil {
+                    return // request can't proceed — stop, no further writes
+                }
+                next(w, r)
+            })
+        },
+    }
+}
 ```
 
 ## Parent→child handoff
@@ -281,8 +314,7 @@ credential set (id, hostname, account tag, secret) skips resolution entirely:
 | `LIBTUNNEL__CLOUDFLARE_HOSTNAME` | `WithHostname()` |
 | `LIBTUNNEL__CLOUDFLARE_ACCOUNT_TAG` | `WithAccountTag()` |
 | `LIBTUNNEL__CLOUDFLARE_SECRET` | `WithSecret()` (base64) |
-| `LIBTUNNEL__CLOUDFLARE_API_URL` | `WithApiURL()` — quick-tunnel mint endpoint, default `https://api.trycloudflare.com/tunnel` |
-| `LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL` | `WithFlushInterval()` — streaming-buffer lever; duration (`time.ParseDuration`, e.g. `1s`). Fixed at construction, later calls are no-ops; unparsable value fails at connect. |
+| `LIBTUNNEL__CLOUDFLARE_PROVIDER` | `WithProvider()` — quick-tunnel provider host, default `api.trycloudflare.com` (endpoint `https://<host>/tunnel` synthesized; a value with a scheme is used verbatim) |
 
 The Cloudflare backend also has a bare activation switch, `LIBTUNNEL__CLOUDFLARE=1`,
 used by the binary below to select it without a spec handoff.

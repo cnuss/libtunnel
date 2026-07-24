@@ -96,17 +96,11 @@ const (
 	// CloudflareSecretEnv carries the tunnel secret, base64-encoded (the
 	// JSON []byte encoding); an undecodable value fails spec resolution.
 	CloudflareSecretEnv = "LIBTUNNEL__CLOUDFLARE_SECRET"
-	// CloudflareAPIURLEnv mirrors WithApiURL: the quick-tunnel mint endpoint
-	// (default https://api.trycloudflare.com/tunnel). Only the mint path
-	// uses it.
-	CloudflareAPIURLEnv = "LIBTUNNEL__CLOUDFLARE_API_URL"
-
-	// CloudflareFlushIntervalEnv fixes WithFlushInterval from the environment
-	// (time.ParseDuration syntax, e.g. "1s", "500ms"): set, the mutator is a
-	// no-op and the session shim's flush cadence is the env value. A positive
-	// value engages the streaming-buffer shim (see the Cloudflare backend's
-	// WithFlushInterval); an unparsable value fails the tunnel at connect.
-	CloudflareFlushIntervalEnv = "LIBTUNNEL__CLOUDFLARE_FLUSH_INTERVAL"
+	// CloudflareProviderEnv mirrors WithProvider: the quick-tunnel mint
+	// provider host (default api.trycloudflare.com), from which the endpoint
+	// https://<host>/tunnel is synthesized — though a value carrying a scheme
+	// (://) is used verbatim. Only the mint path uses it.
+	CloudflareProviderEnv = "LIBTUNNEL__CLOUDFLARE_PROVIDER"
 )
 
 // Spec is the credential/identity set a Provider yields. Each backend defines
@@ -304,14 +298,16 @@ type Tunnel interface {
 	// fails.
 	WithLocalURL(u *url.URL) Tunnel
 
-	// WithInterceptor registers a hook in front of the in-process reverse proxy
-	// that fronts the origin. For every inbound request the tunnel walks its
-	// interceptors in registration order and runs the first whose match returns
-	// true; the handler it returns serves the request. Requests that match no
-	// interceptor are proxied to the origin unchanged. May be called more than
-	// once to layer interceptors, and may be called after the tunnel is live.
-	// Returns the tunnel for chaining.
-	WithInterceptor(match MatchFn, handler InterceptFn) Tunnel
+	// WithInterceptor registers an Interceptor (a Match predicate paired with an
+	// InterceptFn) in front of the in-process reverse proxy that fronts the
+	// origin. For every inbound request the tunnel walks its interceptors in
+	// registration order and runs the first whose Match returns true; requests
+	// that match none are proxied to the origin unchanged. May be called more
+	// than once to layer interceptors, and may be called after the tunnel is
+	// live. Bundling the pair in one value lets callers ship reusable
+	// interceptors as constructors — tun.WithInterceptor(addHeaders()). Returns
+	// the tunnel for chaining.
+	WithInterceptor(interceptor Interceptor) Tunnel
 }
 
 // MatchFn reports whether an interceptor applies to a request. It runs on the
