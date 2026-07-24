@@ -312,10 +312,19 @@ jobs:
             "ghcr.io/${GITHUB_REPOSITORY}@${{ steps.image.outputs.digest }}"
 
       - name: warm proxy.golang.org
+        # Best-effort cache primer for pkg.go.dev: every release deliverable
+        # (tag, binaries, image) is already published above, and proxy.golang.org
+        # fetches the tag on its own within minutes regardless. A transient
+        # upstream 500 here must not fail the release, so retry and never exit
+        # non-zero. See v0.0.34/v0.0.35, which both false-failed on this step.
         if: steps.tag.outputs.skip != 'true'
+        continue-on-error: true
         run: |
           tag="${{ steps.tag.outputs.tag }}"
           mod="github.com/${GITHUB_REPOSITORY}"
-          curl -fsSL "https://proxy.golang.org/${mod}/@v/${tag}.info" >/dev/null
-          curl -fsSL "https://proxy.golang.org/${mod}/@v/${tag}.mod"  >/dev/null
-          curl -fsSL "https://sum.golang.org/lookup/${mod}@${tag}"    >/dev/null
+          for url in \
+            "https://proxy.golang.org/${mod}/@v/${tag}.info" \
+            "https://proxy.golang.org/${mod}/@v/${tag}.mod" \
+            "https://sum.golang.org/lookup/${mod}@${tag}"; do
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$url" >/dev/null || true
+          done
