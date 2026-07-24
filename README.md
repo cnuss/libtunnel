@@ -158,12 +158,13 @@ func Version() string                            // the libtunnel release this b
 An in-process reverse proxy always fronts the origin. `WithInterceptor` hooks
 that path: for every request the tunnel runs the highest-`Priority` interceptor
 whose `MatchFn` returns true; anything unmatched is proxied to the origin
-unchanged. Ordering is AWS-ALB style: the **lowest** `Priority` wins (`0` is
-highest precedence). A `Priority` of 0 (unset) is auto-assigned from the top of
-the `uint16` range downward, so unprioritized interceptors sit at the
-low-precedence end — a later-added one wins over an earlier one, and any explicit
-`Priority` outranks them all. Interceptors layer (call it more than once) and,
-unlike the write-once `With*` mutators, may be added after the tunnel is live.
+unchanged. Ordering is AWS-ALB style: the **lowest** `Priority` wins — `1` is the
+highest precedence, `65535` the lowest. `Priority` 0 is not a precedence; it's
+the zero value meaning **unset**, and those are auto-assigned from the top of the
+`uint16` range downward, so unprioritized interceptors sit at the low-precedence
+end — a later-added one wins over an earlier one, and any explicit `Priority`
+outranks them all. Interceptors layer (call it more than once) and, unlike the
+write-once `With*` mutators, may be added after the tunnel is live.
 `tun.Interceptors()` returns the registry in precedence order for visibility.
 
 ```go
@@ -175,7 +176,7 @@ type InterceptFn = func(ctx InterceptCtx) InterceptCtx
 type Interceptor struct {
     Match    MatchFn
     Handler  InterceptFn
-    Priority uint16 // ALB-style: lowest wins (0 = highest); unset auto-assigns from the top down
+    Priority uint16 // ALB-style: lowest wins (1 highest); 0 = unset, auto-assigned from the top down
 }
 
 // InterceptCtx is the per-request handle. It embeds the request's

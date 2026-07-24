@@ -364,19 +364,24 @@ type Interceptor struct {
 	Match   MatchFn
 	Handler InterceptFn
 	// Priority orders interceptors when more than one could match, AWS-ALB style:
-	// the LOWEST Priority is consulted first, so it wins (0 is the highest
-	// precedence). Interceptors of equal Priority keep registration order. A
-	// Priority of 0 (the zero value, i.e. left unset) is auto-assigned from the
-	// top of the uint16 range downward, so unprioritized interceptors sit at the
-	// low-precedence end — a later-registered one wins over an earlier one, and
-	// any interceptor given an explicit Priority outranks them all. Set an
-	// explicit Priority (1 highest, larger = lower precedence) to place one
-	// deliberately.
+	// the LOWEST Priority is consulted first, so it wins. Interceptors of equal
+	// Priority keep registration order.
+	//
+	// 0 is not a precedence — it is the zero value that means "unset". An unset
+	// Priority is auto-assigned from the top of the uint16 range downward, so
+	// unprioritized interceptors sit at the low-precedence end: a later-registered
+	// one wins over an earlier one, and any interceptor given an explicit Priority
+	// outranks them all.
+	//
+	// So 1 is the highest settable precedence and 65535 the lowest; larger =
+	// lower precedence. To pin an interceptor above every default, give it a
+	// small Priority (1); to make it a fallback, a large one.
 	Priority uint16
 }
 
 // Interceptors is the registry consulted per request, in precedence order: the
-// lowest-Priority Interceptor whose Match returns true wins, ties broken by
-// registration order. Zero-Priority (unset) interceptors are auto-assigned from
-// the top of the range down, so among them the later-registered wins.
+// lowest-Priority Interceptor whose Match returns true wins (1 is highest, larger
+// is lower), ties broken by registration order. Priority 0 means unset — those
+// interceptors are auto-assigned from the top of the range down, so among them
+// the later-registered wins.
 type Interceptors = []Interceptor
