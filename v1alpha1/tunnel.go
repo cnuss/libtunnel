@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
@@ -93,28 +92,32 @@ func (t *TunnelImpl[T]) WithInterceptor(match v1.MatchFn, handler v1.InterceptFn
 	return t
 }
 
-// Intercept selects the handler for a request: the first registered interceptor
-// whose Match returns true builds it (given w, r and ctl), otherwise the request
-// falls through to proxy. The engine calls the returned handler with the same w
-// and r. The registry lock is held only across the match scan, not the handler.
-func (t *TunnelImpl[T]) Intercept(proxy *httputil.ReverseProxy, w http.ResponseWriter, r *http.Request, ctl v1.InterceptCtl) http.HandlerFunc {
+// Intercept resolves the handler for a request through the interceptor
+// registry. The first registered interceptor whose Match returns true runs,
+// given the InterceptCtx (which carries the request and the default
+// origin-proxy handler); it shapes the response by calling ctx.WithHandler and
+// returns the ctx. When nothing matches — or an interceptor returns nil — the
+// ctx's default handler (proxy to the origin) stands. The registry lock is held
+// only across the match scan, not the interceptor. The returned handler is the
+// one the engine serves.
+func (t *TunnelImpl[T]) Intercept(ctx v1.InterceptCtx) http.HandlerFunc {
 	t.interceptorsMu.Lock()
 	var interceptor v1.InterceptFn
-	for _, ic := range t.interceptors {
-		if ic.Match(r) {
-			interceptor = ic.Handler
+	for _, item := range t.interceptors {
+		if item.Match(ctx.Request()) {
+			interceptor = item.Handler
 			break
 		}
 	}
 	t.interceptorsMu.Unlock()
 
 	if interceptor == nil {
-		return func(w http.ResponseWriter, r *http.Request) {
-			proxy.ServeHTTP(w, r)
-		}
+		return ctx.Handler()
 	}
-
-	return interceptor(w, r, ctl)
+	if out := interceptor(ctx); out != nil {
+		return out.Handler()
+	}
+	return ctx.Handler()
 }
 
 // WithLocalURL provides the local origin as the URL of an already-running

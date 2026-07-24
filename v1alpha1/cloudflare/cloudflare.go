@@ -127,14 +127,25 @@ type Backend struct {
 	// no-op (env beats code).
 	flushInterval *time.Duration
 	flushFixed    bool
-	// The reconnect lever's runtime state, wired at connect: reconnected feeds
-	// the supervisor's external-control channel, edgeUp counts Connected events,
-	// and reconnectCtx is the tunnel context Reconnect waits on. All nil until
-	// connect runs — Reconnect errors before then.
+	// Runtime state wired at connect. reconnected feeds the supervisor's
+	// external-control channel, edgeUp counts Connected events, and reconnectCtx
+	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
+	// and listener is the loopback socket cloudflared dials to reach it. All nil
+	// until connect runs.
 	reconnected  chan supervisor.ReconnectSignal
 	edgeUp       *edgeUpWatcher
 	reconnectCtx context.Context
+	proxy        *httputil.ReverseProxy
+	listener     net.Listener
 }
+
+// Proxy returns the origin reverse proxy (nil before connect). Implements the
+// v1alpha1 Engine contract.
+func (b *Backend) Proxy() *httputil.ReverseProxy { return b.proxy }
+
+// Listener returns the loopback listener cloudflared dials to reach the proxy
+// (nil before connect). Implements the v1alpha1 Engine contract.
+func (b *Backend) Listener() net.Listener { return b.listener }
 
 // New returns the Cloudflare backend. The origin-scheme knobs are fixed from
 // the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set, and the
@@ -466,22 +477,19 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 		flushInterval = *b.flushInterval
 	}
 	transport := originTransport(origin)
-	proxy := newOriginProxy(origin, flushInterval, t.Logger(), transport)
-	// Wire the reconnect lever's runtime state onto the backend: reconnected
-	// feeds the supervisor's external-control channel (see NewSupervisor below),
-	// edgeUp counts Connected events via the Observer sink, and reconnectCtx is
-	// the tunnel context. Once set, b.Reconnect is live — for direct callers and
-	// as the InterceptCtl.Reconnect lever handed to interceptors.
+	// Wire runtime state onto the backend: reconnected feeds the supervisor's
+	// external-control channel (see NewSupervisor below), edgeUp counts Connected
+	// events via the Observer sink, reconnectCtx is the tunnel context, and
+	// proxy/listener back the Engine's Proxy/Listener (seeding each interception's
+	// default handler and Target). Once set, b.Reconnect and the interceptor
+	// pipeline are live.
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edgeUp = newEdgeUpWatcher()
 	b.reconnectCtx = t.Context()
+	b.proxy = newOriginProxy(origin, flushInterval, t.Logger(), transport)
+	b.listener = l
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handler := t.Intercept(proxy, w, r, v1.InterceptCtl{
-			Reconnect: b.Reconnect,
-			Listener:  l,
-		})
-
-		handler(w, r)
+		t.Intercept(v1alpha1.NewInterceptCtx(b, w, r))(w, r)
 	})
 	srv := &http.Server{Handler: handler}
 	context.AfterFunc(t.Context(), func() { srv.Close() })

@@ -27,9 +27,12 @@ import (
 // records the origin it was handed (listener or URL) and reports success
 // immediately.
 type fakeEngine struct {
-	got    chan net.Listener
-	gotURL chan *url.URL
-	spec   *cloudflare.Spec
+	got         chan net.Listener
+	gotURL      chan *url.URL
+	spec        *cloudflare.Spec
+	proxy       *httputil.ReverseProxy
+	listener    net.Listener
+	reconnected bool
 }
 
 func newFakeEngine(spec *cloudflare.Spec) *fakeEngine {
@@ -41,7 +44,9 @@ func (e *fakeEngine) Provider() v1.Provider[*cloudflare.Spec]     { return v1alp
 func (e *fakeEngine) CACerts() []*x509.Certificate                { return []*x509.Certificate{} }
 func (e *fakeEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e *fakeEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
-func (*fakeEngine) Reconnect(context.Context) error               { return nil }
+func (e *fakeEngine) Reconnect(context.Context) error             { e.reconnected = true; return nil }
+func (e *fakeEngine) Proxy() *httputil.ReverseProxy               { return e.proxy }
+func (e *fakeEngine) Listener() net.Listener                      { return e.listener }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
 	return nil
@@ -778,6 +783,8 @@ func (failingEngine) Provider() v1.Provider[*cloudflare.Spec] {
 	return failingProvider{}
 }
 func (failingEngine) CACerts() []*x509.Certificate                  { return nil }
+func (failingEngine) Proxy() *httputil.ReverseProxy                 { return nil }
+func (failingEngine) Listener() net.Listener                        { return nil }
 func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
 func (failingEngine) Reconnect(context.Context) error               { return nil }
@@ -826,9 +833,9 @@ func FuzzHostnameParsing(f *testing.F) {
 
 // --- interceptors ---
 
-// originProxy is a reverse proxy to a throwaway origin that echoes a fixed
-// body, so Intercept's fall-through path has something real to serve.
-func originProxy(t *testing.T, body string) *httputil.ReverseProxy {
+// proxyEngine returns a fake engine whose Proxy serves a fixed body, so the
+// default (fall-through) handler NewInterceptCtx seeds has a real origin to hit.
+func proxyEngine(t *testing.T, body string) *fakeEngine {
 	t.Helper()
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, body)
@@ -838,84 +845,132 @@ func originProxy(t *testing.T, body string) *httputil.ReverseProxy {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return httputil.NewSingleHostReverseProxy(u)
+	e := newFakeEngine(&cloudflare.Spec{})
+	e.proxy = httputil.NewSingleHostReverseProxy(u)
+	return e
 }
 
-func serveIntercept(tun *v1alpha1.TunnelImpl[*cloudflare.Spec], proxy *httputil.ReverseProxy, ctl v1.InterceptCtl, req *http.Request) *httptest.ResponseRecorder {
+// serveIntercept resolves req through tun's interceptor pipeline (built over
+// engine's InterceptCtx) and serves it, returning the recorded response.
+func serveIntercept(tun *v1alpha1.TunnelImpl[*cloudflare.Spec], engine *fakeEngine, req *http.Request) *httptest.ResponseRecorder {
 	rr := httptest.NewRecorder()
-	tun.Intercept(proxy, rr, req, ctl)(rr, req)
+	tun.Intercept(v1alpha1.NewInterceptCtx[*cloudflare.Spec](engine, rr, req))(rr, req)
 	return rr
 }
 
 func TestInterceptFallsThroughToProxy(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
-	proxy := originProxy(t, "origin")
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
 
-	rr := serveIntercept(tun, proxy, v1.InterceptCtl{}, httptest.NewRequest("GET", "/", nil))
+	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
 	if rr.Body.String() != "origin" {
 		t.Fatalf("body = %q, want %q (no interceptor → proxy)", rr.Body.String(), "origin")
 	}
 }
 
 func TestInterceptFirstMatchWins(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
 	always := func(*http.Request) bool { return true }
 	mark := func(s string) v1.InterceptFn {
-		return func(http.ResponseWriter, *http.Request, v1.InterceptCtl) http.HandlerFunc {
-			return func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) }
+		return func(ctx v1.InterceptCtx) v1.InterceptCtx {
+			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) })
 		}
 	}
 	tun.WithInterceptor(always, mark("first"))
 	tun.WithInterceptor(always, mark("second"))
 
-	rr := serveIntercept(tun, nil, v1.InterceptCtl{}, httptest.NewRequest("GET", "/", nil))
+	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
 	if rr.Body.String() != "first" {
 		t.Fatalf("body = %q, want %q (registration order wins)", rr.Body.String(), "first")
 	}
 }
 
 func TestInterceptMatchPredicate(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
-	proxy := originProxy(t, "origin")
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
 	tun.WithInterceptor(
 		func(r *http.Request) bool { return r.URL.Path == "/hooked" },
-		func(http.ResponseWriter, *http.Request, v1.InterceptCtl) http.HandlerFunc {
-			return func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "hooked") }
+		func(ctx v1.InterceptCtx) v1.InterceptCtx {
+			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "hooked") })
 		},
 	)
 
-	if rr := serveIntercept(tun, proxy, v1.InterceptCtl{}, httptest.NewRequest("GET", "/hooked", nil)); rr.Body.String() != "hooked" {
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/hooked", nil)); rr.Body.String() != "hooked" {
 		t.Errorf("matching path body = %q, want %q", rr.Body.String(), "hooked")
 	}
-	if rr := serveIntercept(tun, proxy, v1.InterceptCtl{}, httptest.NewRequest("GET", "/other", nil)); rr.Body.String() != "origin" {
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/other", nil)); rr.Body.String() != "origin" {
 		t.Errorf("non-matching path body = %q, want %q (fall-through)", rr.Body.String(), "origin")
 	}
 }
 
-func TestInterceptCtlReachesHandler(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
-	l := listen(t)
+// TestInterceptDeclineFallsThrough: a matched interceptor that inspects but
+// never calls WithHandler leaves the default (origin) handler in place.
+func TestInterceptDeclineFallsThrough(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
 
-	var gotListener net.Listener
-	reconnected := false
-	ctl := v1.InterceptCtl{
-		Reconnect: func(context.Context) error { reconnected = true; return nil },
-		Listener:  l,
-	}
+	inspected := false
 	tun.WithInterceptor(
 		func(*http.Request) bool { return true },
-		func(_ http.ResponseWriter, _ *http.Request, c v1.InterceptCtl) http.HandlerFunc {
-			gotListener = c.Listener
-			_ = c.Reconnect(context.Background())
-			return func(http.ResponseWriter, *http.Request) {}
+		func(ctx v1.InterceptCtx) v1.InterceptCtx {
+			inspected = true
+			return ctx // no WithHandler → default stands
 		},
 	)
 
-	serveIntercept(tun, nil, ctl, httptest.NewRequest("GET", "/", nil))
-	if gotListener != l {
-		t.Error("InterceptCtl.Listener not passed through to the handler")
+	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
+	if !inspected {
+		t.Fatal("interceptor never ran")
 	}
-	if !reconnected {
-		t.Error("InterceptCtl.Reconnect not reachable from the handler")
+	if rr.Body.String() != "origin" {
+		t.Fatalf("body = %q, want %q (decline → fall through)", rr.Body.String(), "origin")
+	}
+}
+
+// TestInterceptNilReturnFallsThrough: returning nil is equivalent to declining.
+func TestInterceptNilReturnFallsThrough(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	tun.WithInterceptor(
+		func(*http.Request) bool { return true },
+		func(v1.InterceptCtx) v1.InterceptCtx { return nil },
+	)
+
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "origin" {
+		t.Fatalf("body = %q, want %q (nil return → fall through)", rr.Body.String(), "origin")
+	}
+}
+
+// TestInterceptCtxExposesLevers: the ctx surfaces the request, the proxy
+// listener via Target, and reaches the engine's Reconnect.
+func TestInterceptCtxExposesLevers(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	l := listen(t)
+	engine.listener = l
+	tun := v1alpha1.New(engine)
+
+	var gotTarget net.Listener
+	var gotReq *http.Request
+	tun.WithInterceptor(
+		func(*http.Request) bool { return true },
+		func(ctx v1.InterceptCtx) v1.InterceptCtx {
+			gotTarget = ctx.Target()
+			gotReq = ctx.Request()
+			_ = ctx.Reconnect(ctx)
+			return ctx.WithHandler(func(http.ResponseWriter, *http.Request) {})
+		},
+	)
+
+	req := httptest.NewRequest("GET", "/x", nil)
+	serveIntercept(tun, engine, req)
+	if gotTarget != l {
+		t.Error("InterceptCtx.Target did not return the engine listener")
+	}
+	if gotReq != req {
+		t.Error("InterceptCtx.Request did not return the inbound request")
+	}
+	if !engine.reconnected {
+		t.Error("InterceptCtx.Reconnect did not reach the engine")
 	}
 }
