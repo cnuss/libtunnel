@@ -308,6 +308,13 @@ type Tunnel interface {
 	// interceptors as constructors — tun.WithInterceptor(addHeaders()). Returns
 	// the tunnel for chaining.
 	WithInterceptor(interceptor Interceptor) Tunnel
+
+	// Interceptors returns a snapshot of the registered interceptors in
+	// precedence order — ascending Priority, ties in registration order, the
+	// order requests are matched against. Any auto-assigned Priority (from a
+	// zero-Priority registration) is resolved in the returned values, for
+	// visibility into the effective ordering.
+	Interceptors() Interceptors
 }
 
 // MatchFn reports whether an interceptor applies to a request. It runs on the
@@ -356,20 +363,20 @@ type InterceptFn = func(ctx InterceptCtx) InterceptCtx
 type Interceptor struct {
 	Match   MatchFn
 	Handler InterceptFn
-	// Priority orders interceptors when more than one could match: the highest
-	// Priority is consulted first, so it wins. Interceptors of equal Priority
-	// keep registration order. A Priority of 0 (the default) is auto-assigned an
-	// increasing value at registration (10, 20, …), so among unprioritized
-	// interceptors the later-registered one wins. An explicit non-zero Priority
-	// places the interceptor deliberately and raises that auto lane to its value,
-	// so later unprioritized interceptors layer back on top of it — set a low
-	// Priority for a fallback the defaults outrank, a high one to sit above the
-	// defaults registered so far.
-	Priority int
+	// Priority orders interceptors when more than one could match, AWS-ALB style:
+	// the LOWEST Priority is consulted first, so it wins (0 is the highest
+	// precedence). Interceptors of equal Priority keep registration order. A
+	// Priority of 0 (the zero value, i.e. left unset) is auto-assigned from the
+	// top of the uint16 range downward, so unprioritized interceptors sit at the
+	// low-precedence end — a later-registered one wins over an earlier one, and
+	// any interceptor given an explicit Priority outranks them all. Set an
+	// explicit Priority (1 highest, larger = lower precedence) to place one
+	// deliberately.
+	Priority uint16
 }
 
-// Interceptors is the registry consulted per request: the highest-Priority
-// Interceptor whose Match returns true wins, ties broken by registration order.
-// Zero-Priority interceptors are auto-assigned increasing priorities, so among
-// them the later-registered wins.
+// Interceptors is the registry consulted per request, in precedence order: the
+// lowest-Priority Interceptor whose Match returns true wins, ties broken by
+// registration order. Zero-Priority (unset) interceptors are auto-assigned from
+// the top of the range down, so among them the later-registered wins.
 type Interceptors = []Interceptor

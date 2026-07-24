@@ -875,7 +875,8 @@ func intercMark(s string) v1.InterceptFn {
 }
 
 // TestInterceptLaterDefaultWins: two Priority-0 interceptors are auto-assigned
-// increasing priorities (10, 20), so the later-registered one wins.
+// from the top of the range downward, so the later-registered one has the lower
+// (higher-precedence) Priority and wins.
 func TestInterceptLaterDefaultWins(t *testing.T) {
 	engine := proxyEngine(t, "origin")
 	tun := v1alpha1.New(engine)
@@ -889,38 +890,60 @@ func TestInterceptLaterDefaultWins(t *testing.T) {
 	}
 }
 
-// TestInterceptPriorityWins: an explicit Priority above the auto lane beats an
-// earlier-registered default, regardless of add order.
-func TestInterceptPriorityWins(t *testing.T) {
+// TestInterceptLowerPriorityWins: with ALB ordering the lowest Priority wins,
+// regardless of registration order.
+func TestInterceptLowerPriorityWins(t *testing.T) {
 	engine := proxyEngine(t, "origin")
 	tun := v1alpha1.New(engine)
 	always := func(*http.Request) bool { return true }
-	// Registered first as a default (auto 10); a later explicit 100 outranks it.
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("broad")})
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("specific"), Priority: 100})
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("low-prec"), Priority: 50})
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("high-prec"), Priority: 5})
 
-	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "specific" {
-		t.Fatalf("body = %q, want %q (explicit high Priority wins)", rr.Body.String(), "specific")
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "high-prec" {
+		t.Fatalf("body = %q, want %q (lower Priority = higher precedence wins)", rr.Body.String(), "high-prec")
 	}
 }
 
-// TestInterceptExplicitLowIsFallback: an explicit Priority below the auto lane
-// only wins when the defaults don't match — it's a fallback.
-func TestInterceptExplicitLowIsFallback(t *testing.T) {
+// TestInterceptExplicitBeatsDefault: any explicit Priority outranks an
+// auto-assigned default (which sits at the top of the range).
+func TestInterceptExplicitBeatsDefault(t *testing.T) {
 	engine := proxyEngine(t, "origin")
 	tun := v1alpha1.New(engine)
-	tun.WithInterceptor(v1.Interceptor{ // fallback: matches all, but low priority
-		Match: func(*http.Request) bool { return true }, Handler: intercMark("fallback"), Priority: 1,
-	})
-	tun.WithInterceptor(v1.Interceptor{ // default: only /hooked, auto priority 10
-		Match: func(r *http.Request) bool { return r.URL.Path == "/hooked" }, Handler: intercMark("hooked"),
-	})
+	always := func(*http.Request) bool { return true }
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("default")})                    // auto ~MaxUint16
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("explicit"), Priority: 40_000}) // still far below auto
 
-	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/hooked", nil)); rr.Body.String() != "hooked" {
-		t.Errorf("matched path body = %q, want %q (auto default outranks the explicit fallback)", rr.Body.String(), "hooked")
+	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "explicit" {
+		t.Fatalf("body = %q, want %q (explicit Priority outranks an auto default)", rr.Body.String(), "explicit")
 	}
-	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/other", nil)); rr.Body.String() != "fallback" {
-		t.Errorf("unmatched path body = %q, want %q (fallback catches it)", rr.Body.String(), "fallback")
+}
+
+// TestInterceptorsAccessor: Interceptors() exposes the registry in precedence
+// order (ascending Priority), with auto-assigned Priorities resolved.
+func TestInterceptorsAccessor(t *testing.T) {
+	engine := proxyEngine(t, "origin")
+	tun := v1alpha1.New(engine)
+	always := func(*http.Request) bool { return true }
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("d1")})                 // auto, top-down
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("mid"), Priority: 100}) // explicit mid
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("top"), Priority: 1})   // explicit top
+	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("d2")})                 // auto, below d1
+
+	got := tun.Interceptors()
+	if len(got) != 4 {
+		t.Fatalf("Interceptors() len = %d, want 4", len(got))
+	}
+	// Ascending Priority: top(1) < mid(100) < d2(auto) < d1(auto).
+	for i := 1; i < len(got); i++ {
+		if got[i-1].Priority > got[i].Priority {
+			t.Fatalf("Interceptors() not in ascending Priority order: %d then %d", got[i-1].Priority, got[i].Priority)
+		}
+	}
+	if got[0].Priority != 1 {
+		t.Errorf("first Priority = %d, want the explicit 1 (highest precedence)", got[0].Priority)
+	}
+	if got[0].Priority == 0 || got[len(got)-1].Priority == 0 {
+		t.Error("auto-assigned Priority should be resolved (non-zero) in the snapshot")
 	}
 }
 

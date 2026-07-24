@@ -124,6 +124,7 @@ type Tunnel interface {
 
     // hook requests in front of the origin proxy; layerable, not write-once
     WithInterceptor(interceptor Interceptor) Tunnel
+    Interceptors() Interceptors // snapshot in precedence order (ascending Priority)
 }
 
 type Provider[T Spec] interface { Spec(ctx context.Context) (T, error) }
@@ -157,13 +158,13 @@ func Version() string                            // the libtunnel release this b
 An in-process reverse proxy always fronts the origin. `WithInterceptor` hooks
 that path: for every request the tunnel runs the highest-`Priority` interceptor
 whose `MatchFn` returns true; anything unmatched is proxied to the origin
-unchanged. A `Priority` of 0 (the default) is auto-assigned an increasing value
-at registration (10, 20, …), so a later-added interceptor wins over an earlier
-one. An explicit `Priority` places one deliberately and raises that lane to its
-value (so later defaults still layer on top) — use a low `Priority` as a
-fallback the defaults outrank, a high one to sit above the defaults so far.
-Interceptors layer (call it more than once) and, unlike the write-once `With*`
-mutators, may be added after the tunnel is live.
+unchanged. Ordering is AWS-ALB style: the **lowest** `Priority` wins (`0` is
+highest precedence). A `Priority` of 0 (unset) is auto-assigned from the top of
+the `uint16` range downward, so unprioritized interceptors sit at the
+low-precedence end — a later-added one wins over an earlier one, and any explicit
+`Priority` outranks them all. Interceptors layer (call it more than once) and,
+unlike the write-once `With*` mutators, may be added after the tunnel is live.
+`tun.Interceptors()` returns the registry in precedence order for visibility.
 
 ```go
 type MatchFn     = func(r *http.Request) bool
@@ -174,7 +175,7 @@ type InterceptFn = func(ctx InterceptCtx) InterceptCtx
 type Interceptor struct {
     Match    MatchFn
     Handler  InterceptFn
-    Priority int // highest wins; 0 auto-assigns 10, 20, … so later-added wins
+    Priority uint16 // ALB-style: lowest wins (0 = highest); unset auto-assigns from the top down
 }
 
 // InterceptCtx is the per-request handle. It embeds the request's

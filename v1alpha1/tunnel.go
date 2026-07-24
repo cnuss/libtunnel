@@ -84,48 +84,67 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
 	return t
 }
 
-// autoPriorityStep is the increment handed out for interceptors registered with
-// Priority 0: the first auto value is autoPriorityStep (10), the next 20, and so
-// on — a later-registered default outranks an earlier one, and the gap leaves
-// room to slot an explicit Priority between defaults.
+// autoPriorityStep is how far the auto lane steps down per interceptor
+// registered with Priority 0 (unset). The counter starts at math.MaxUint16, so
+// unprioritized interceptors sit at the low-precedence end and a later-registered
+// one steps toward higher precedence — later wins.
 const autoPriorityStep = 10
 
+// nextAutoPriority returns the next auto-assigned Priority, stepping the counter
+// down by autoPriorityStep and saturating at 0 (its minimum) rather than
+// underflowing the unsigned counter.
+func (t *TunnelImpl[T]) nextAutoPriority() uint16 {
+	for {
+		cur := t.autoPriority.Load()
+		var next uint32
+		if cur > autoPriorityStep {
+			next = cur - autoPriorityStep
+		}
+		if t.autoPriority.CompareAndSwap(cur, next) {
+			return uint16(next)
+		}
+	}
+}
+
 // WithInterceptor registers an interceptor, keeping the registry ordered by
-// descending Priority (ties in registration order) so Intercept's first-match
-// scan yields the highest-Priority match. A Priority of 0 is auto-assigned an
-// increasing value (10, 20, …) so later-registered defaults win. The stable sort
-// preserves insertion order for equal Priorities. Safe to call concurrently and
-// after the tunnel is live (see v1.Tunnel.WithInterceptor).
+// ascending Priority (ties in registration order) so Intercept's first-match
+// scan yields the lowest-Priority — highest-precedence — match. A Priority of 0
+// (unset) is auto-assigned from the top of the range downward, so later-
+// registered unprioritized interceptors win and any explicit Priority outranks
+// them. The stable sort preserves insertion order for equal Priorities. Safe to
+// call concurrently and after the tunnel is live (see v1.Tunnel.WithInterceptor).
 func (t *TunnelImpl[T]) WithInterceptor(interceptor v1.Interceptor) v1.Tunnel {
 	if interceptor.Priority == 0 {
-		interceptor.Priority = int(t.autoPriority.Add(autoPriorityStep))
-	} else {
-		// Raise the auto lane to this explicit Priority, but never lower it (a low
-		// fallback Priority must not drag it down). The next unprioritized
-		// interceptor then lands one step above this one.
-		for cur := t.autoPriority.Load(); int64(interceptor.Priority) > cur; cur = t.autoPriority.Load() {
-			if t.autoPriority.CompareAndSwap(cur, int64(interceptor.Priority)) {
-				break
-			}
-		}
+		interceptor.Priority = t.nextAutoPriority()
 	}
 	t.interceptorsMu.Lock()
 	defer t.interceptorsMu.Unlock()
 	t.interceptors = append(t.interceptors, interceptor)
 	sort.SliceStable(t.interceptors, func(i, j int) bool {
-		return t.interceptors[i].Priority > t.interceptors[j].Priority
+		return t.interceptors[i].Priority < t.interceptors[j].Priority
 	})
 	return t
 }
 
+// Interceptors returns a snapshot of the registry in precedence order (ascending
+// Priority, ties in registration order) — the order Intercept consults them.
+func (t *TunnelImpl[T]) Interceptors() v1.Interceptors {
+	t.interceptorsMu.Lock()
+	defer t.interceptorsMu.Unlock()
+	out := make(v1.Interceptors, len(t.interceptors))
+	copy(out, t.interceptors)
+	return out
+}
+
 // Intercept resolves the handler for a request through the interceptor
-// registry. The highest-Priority interceptor whose Match returns true runs
-// (ties by registration order — the registry is kept sorted), given the
-// InterceptCtx (which carries the request and the default origin-proxy handler);
-// it shapes the response by calling ctx.WithHandler and returns the ctx. When
-// nothing matches — or an interceptor returns nil — the ctx's default handler
-// (proxy to the origin) stands. The registry lock is held only across the match
-// scan, not the interceptor. The returned handler is the one the engine serves.
+// registry. The lowest-Priority (highest-precedence) interceptor whose Match
+// returns true runs (ties by registration order — the registry is kept sorted),
+// given the InterceptCtx (which carries the request and the default origin-proxy
+// handler); it shapes the response by calling ctx.WithHandler and returns the
+// ctx. When nothing matches — or an interceptor returns nil — the ctx's default
+// handler (proxy to the origin) stands. The registry lock is held only across
+// the match scan, not the interceptor. The returned handler is the one the
+// engine serves.
 func (t *TunnelImpl[T]) Intercept(ctx v1.InterceptCtx) http.HandlerFunc {
 	t.interceptorsMu.Lock()
 	var interceptor v1.InterceptFn
