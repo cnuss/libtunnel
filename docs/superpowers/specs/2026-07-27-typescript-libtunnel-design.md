@@ -305,7 +305,9 @@ request, which the Go engine also pays.
 ## Prototype gates
 
 Three unknowns are load-bearing, each answerable independently of the rest of
-the library.
+the library. **G1 and G2 were run during planning and both passed** — see the
+M0+M1 plan for the evidence and the caveats each turned up. G3 remains open and
+is answered by the CI QUIC lane.
 
 **G1 — HTTP/2 over a pre-established TLS socket.** Node's http2 server is
 normally handed a listening socket. Feeding it an already-negotiated TLS
