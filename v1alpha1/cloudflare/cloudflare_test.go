@@ -95,7 +95,8 @@ func TestEnvKnobsUnsetLeaveCodeInCharge(t *testing.T) {
 func clearSpecEnv(t *testing.T) {
 	t.Helper()
 	for _, v := range []string{v1.SpecEnv, v1.FromEnv, v1.CloudflareIDEnv, v1.CloudflareNameEnv,
-		v1.CloudflareHostnameEnv, v1.CloudflareAccountTagEnv, v1.CloudflareSecretEnv, v1.CloudflareProviderEnv} {
+		v1.CloudflareHostnameEnv, v1.CloudflareAccountTagEnv, v1.CloudflareSecretEnv,
+		v1.CloudflareProviderEnv, v1.CloudflareHeadersEnv} {
 		t.Setenv(v, "")
 	}
 }
@@ -185,6 +186,79 @@ func TestProviderEnvBeatsCode(t *testing.T) {
 	}
 	if spec.Hostname != "minted.trycloudflare.com" {
 		t.Errorf("Hostname = %q, want the spec minted from the env endpoint", spec.Hostname)
+	}
+}
+
+// mintServer returns a mock quick-tunnel endpoint that records the request
+// headers it saw and mints a canned spec.
+func mintServer(t *testing.T, seen *http.Header) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*seen = r.Header.Clone()
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestWithHeaderSentToMint pins WithHeader: the added header reaches the mint
+// request, and the deliberate defaults (Content-Type, User-Agent) still stand.
+func TestWithHeaderSentToMint(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithProvider(srv.URL).WithHeader("X-Opaque", "true").Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("X-Opaque"); got != "true" {
+		t.Errorf("X-Opaque = %q, want %q", got, "true")
+	}
+	if seen.Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type = %q, want the default to stand", seen.Get("Content-Type"))
+	}
+	if !strings.HasPrefix(seen.Get("User-Agent"), "cloudflared/") {
+		t.Errorf("User-Agent = %q, want the cloudflared default", seen.Get("User-Agent"))
+	}
+}
+
+// TestWithHeaderOverridesDefault pins that a caller header replaces the default
+// for its key (User-Agent here), rather than adding a second value.
+func TestWithHeaderOverridesDefault(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithProvider(srv.URL).WithHeader("User-Agent", "tush/1").Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Values("User-Agent"); len(got) != 1 || got[0] != "tush/1" {
+		t.Errorf("User-Agent = %v, want exactly [tush/1] (caller replaces the default)", got)
+	}
+}
+
+// TestHeadersEnvBeatsCode pins the env mirror: LIBTUNNEL__CLOUDFLARE_HEADERS
+// entries replace the code value per key and add new ones.
+func TestHeadersEnvBeatsCode(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+	t.Setenv(v1.CloudflareHeadersEnv, "X-Opaque=false, X-Extra=1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithProvider(srv.URL).WithHeader("X-Opaque", "true").Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("X-Opaque"); got != "false" {
+		t.Errorf("X-Opaque = %q, want the env value to beat code", got)
+	}
+	if got := seen.Get("X-Extra"); got != "1" {
+		t.Errorf("X-Extra = %q, want the env-only header added", got)
 	}
 }
 

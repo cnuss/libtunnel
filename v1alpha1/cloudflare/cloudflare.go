@@ -123,6 +123,11 @@ type Backend struct {
 	// a scheme is used verbatim). Empty means the default (api.trycloudflare.com);
 	// v1.CloudflareProviderEnv supersedes either.
 	providerHost string
+	// headers carries request headers added to the quick-tunnel mint call via
+	// WithHeader. Nil until the first WithHeader; overlaid by (and augmented
+	// with) v1.CloudflareHeadersEnv at mint time. Mint-only — adopted, replayed,
+	// and pinned specs never hit the API, so these never apply to them.
+	headers http.Header
 	// Runtime state wired at connect. reconnected feeds the supervisor's
 	// external-control channel, edgeUp counts Connected events, and reconnectCtx
 	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
@@ -277,6 +282,23 @@ func (b *Backend) WithProvider(host string) *Backend {
 	return b
 }
 
+// WithHeader adds a request header to the quick-tunnel mint call, so a provider
+// can vary what it returns based on the request (e.g. X-Opaque: true asking for
+// a less-guessable hostname). Repeatable — successive calls accumulate, and
+// repeating a key adds another value. Env mirror: LIBTUNNEL__CLOUDFLARE_HEADERS,
+// a comma-separated K=V list, whose entries beat code per key. Applied over the
+// headers the mint sets itself (Content-Type, User-Agent), so a caller may
+// override those — overriding User-Agent changes how the endpoint sees the
+// connector version. Mint-only, following the WithProvider boundary: adopted,
+// replayed, and pinned specs never hit the API, so headers never apply to them.
+func (b *Backend) WithHeader(key, value string) *Backend {
+	if b.headers == nil {
+		b.headers = http.Header{}
+	}
+	b.headers.Add(key, value)
+	return b
+}
+
 var (
 	_ v1.Backend[*Spec]      = (*Backend)(nil)
 	_ v1alpha1.Engine[*Spec] = (*Backend)(nil)
@@ -303,9 +325,37 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 		if host != "" {
 			qt.URL = providerEndpoint(host)
 		}
+		qt.Headers = mintHeaders(b.headers)
 		next = qt
 	}
 	return v1alpha1.Env(b.Name(), overlay{fields: b.fields, next: v1alpha1.Replay(b.Name(), next)})
+}
+
+// mintHeaders resolves the mint request headers: the code headers (WithHeader)
+// overlaid by v1.CloudflareHeadersEnv, a comma-separated K=V list whose entries
+// replace the code value for their key (env beats code). Returns nil when
+// neither is set. Values cannot contain a comma or an equals sign — the env
+// form has no escaping.
+func mintHeaders(code http.Header) http.Header {
+	var out http.Header
+	if len(code) > 0 {
+		out = code.Clone()
+	}
+	raw := os.Getenv(v1.CloudflareHeadersEnv)
+	if raw == "" {
+		return out
+	}
+	if out == nil {
+		out = http.Header{}
+	}
+	for _, pair := range strings.Split(raw, ",") {
+		k, v, ok := strings.Cut(pair, "=")
+		if k = strings.TrimSpace(k); !ok || k == "" {
+			continue
+		}
+		out.Set(k, strings.TrimSpace(v))
+	}
+	return out
 }
 
 // providerEndpoint turns a quick-tunnel provider host into a mint endpoint URL:
