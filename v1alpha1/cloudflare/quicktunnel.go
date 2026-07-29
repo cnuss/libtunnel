@@ -36,6 +36,11 @@ type QuickTunnelProvider struct {
 	// / its LIBTUNNEL__CLOUDFLARE_PROVIDER mirror, or set directly in tests).
 	// Empty means the default.
 	URL string
+	// Headers are added to the mint request (WithHeader / its
+	// LIBTUNNEL__CLOUDFLARE_HEADERS mirror). They are applied over the headers
+	// set here (Content-Type, User-Agent), so a caller-supplied key replaces the
+	// default for that key. Nil adds nothing.
+	Headers http.Header
 	// Log receives retry warnings. Nil is silent.
 	Log *slog.Logger
 }
@@ -86,6 +91,14 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		}
 		req.Header.Add("Content-Type", "application/json")
 		req.Header.Add("User-Agent", fmt.Sprintf("cloudflared/%s", cloudflaredVersion))
+		// Caller headers (WithHeader) apply over the defaults above — a supplied
+		// key replaces the default for that key.
+		for k, vs := range p.Headers {
+			req.Header.Del(k)
+			for _, v := range vs {
+				req.Header.Add(k, v)
+			}
+		}
 
 		resp, err := client.Do(req)
 		if err != nil {

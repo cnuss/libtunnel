@@ -101,6 +101,12 @@ const (
 	// https://<host>/tunnel is synthesized — though a value carrying a scheme
 	// (://) is used verbatim. Only the mint path uses it.
 	CloudflareProviderEnv = "LIBTUNNEL__CLOUDFLARE_PROVIDER"
+
+	// CloudflareHeadersEnv mirrors WithHeader: request headers added to the
+	// quick-tunnel mint call, a comma-separated K=V list (e.g. "X-Opaque=true").
+	// Its entries beat code per key. Values cannot contain a comma or equals sign
+	// — the list form has no escaping. Only the mint path uses it.
+	CloudflareHeadersEnv = "LIBTUNNEL__CLOUDFLARE_HEADERS"
 )
 
 // Spec is the credential/identity set a Provider yields. Each backend defines
