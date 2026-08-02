@@ -288,10 +288,11 @@ func (r Records) Equal(o Records) bool {
 }
 
 // Query asks server (an ip:port DNS endpoint) for hostname's A and AAAA records
-// with recursion desired, returning both families sorted. It queries over UDP
-// and retries over TCP if the answer is truncated. A name that does not (yet)
-// resolve comes back as empty Records with a nil error (the "keep polling"
-// signal); transport and DNS-level failures return an error.
+// directly (RD=0), returning both families sorted. Each family is raced over UDP
+// and TCP and only an authoritative (AA) answer is accepted, so a network
+// intercepting UDP/53 cannot stall or spoof the result (see query). A name that
+// does not (yet) resolve comes back as empty Records with a nil error (the "keep
+// polling" signal); transport and DNS-level failures return an error.
 func Query(ctx context.Context, server, hostname string) (Records, error) {
 	a, err := query(ctx, server, hostname, dnsmessage.TypeA)
 	if err != nil {
@@ -304,30 +305,69 @@ func Query(ctx context.Context, server, hostname string) (Records, error) {
 	return Records{A: a, AAAA: aaaa}, nil
 }
 
+// query races the question over UDP and TCP against server and returns the
+// addresses from the first AUTHORITATIVE (AA-bit) response. Racing both
+// transports defeats a network that intercepts UDP/53: an interceptor answers
+// over UDP as a recursive resolver standing in for the zone's nameserver — no AA
+// bit, and a REFUSED for an RD=0 query it is not authoritative for — while TCP
+// (which interceptors rarely touch) reaches the real authoritative server. A
+// non-authoritative reply is therefore set aside, not trusted. An authoritative
+// NXDOMAIN, or NOERROR with no records, is "not published yet" — empty addrs,
+// nil error, the keep-polling signal. If neither transport yields an
+// authoritative answer, the last meaningful failure is returned.
 func query(ctx context.Context, server, hostname string, qtype dnsmessage.Type) ([]netip.Addr, error) {
 	wire, err := buildQuery(hostname, qtype)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := exchangeUDP(ctx, server, wire)
-	if err != nil {
-		return nil, err
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // stop the slower transport once one answers authoritatively
+
+	type result struct {
+		transport string
+		ans       answer
+		err       error
 	}
-	truncated, addrs, err := parse(resp, qtype)
-	if err != nil {
-		return nil, err
-	}
-	if truncated {
-		if resp, err = exchangeTCP(ctx, server, wire); err != nil {
-			return nil, err
+	results := make(chan result, 2) // buffered: the loser never blocks on send
+	race := func(transport string, exchange func(context.Context, string, []byte) ([]byte, error)) {
+		resp, err := exchange(ctx, server, wire)
+		if err != nil {
+			results <- result{transport: transport, err: err}
+			return
 		}
-		if _, addrs, err = parse(resp, qtype); err != nil {
-			return nil, err
+		ans, err := parse(resp, qtype)
+		results <- result{transport: transport, ans: ans, err: err}
+	}
+	go race("udp", exchangeUDP)
+	go race("tcp", exchangeTCP)
+
+	var lastErr error
+	for range 2 {
+		r := <-results
+		switch {
+		case r.err != nil:
+			lastErr = fmt.Errorf("%s: %w", r.transport, r.err)
+		case r.ans.truncated:
+			// UDP hit the 512-byte limit; the TCP leg carries the full message.
+		case !r.ans.authoritative:
+			// Not the zone's nameserver — an intercepting recursive resolver.
+			// Set aside; the other transport may reach the real server.
+			lastErr = fmt.Errorf("%s: non-authoritative response (rcode %v; port 53 may be intercepted)", r.transport, r.ans.rcode)
+		case r.ans.rcode == dnsmessage.RCodeNameError:
+			return nil, nil // authoritative NXDOMAIN: not published yet
+		case r.ans.rcode != dnsmessage.RCodeSuccess:
+			return nil, fmt.Errorf("%s: authoritative server returned rcode %v", r.transport, r.ans.rcode)
+		default:
+			addrs := r.ans.addrs
+			slices.SortFunc(addrs, func(a, b netip.Addr) int { return a.Compare(b) })
+			return addrs, nil
 		}
 	}
-	slices.SortFunc(addrs, func(a, b netip.Addr) int { return a.Compare(b) })
-	return addrs, nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no authoritative DNS answer for %s", hostname)
+	}
+	return nil, lastErr
 }
 
 func buildQuery(hostname string, qtype dnsmessage.Type) ([]byte, error) {
@@ -338,7 +378,10 @@ func buildQuery(hostname string, qtype dnsmessage.Type) ([]byte, error) {
 	// RD=0: these queries go straight to the zone's authoritative nameservers,
 	// which answer in-zone names authoritatively regardless, so recursion is
 	// neither needed nor wanted. (Authoritative/AA is a response flag the server
-	// sets — pointless on an outbound query.)
+	// sets — pointless on an outbound query.) RD=0 is also what makes an
+	// intercepting recursive resolver REFUSE rather than answer — the signal
+	// query keys on — but only if the packet reaches the real nameserver at all,
+	// which is why query races TCP alongside UDP.
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{RecursionDesired: false})
 	b.EnableCompression()
 	if err := b.StartQuestions(); err != nil {
@@ -399,24 +442,29 @@ func exchangeTCP(ctx context.Context, server string, wire []byte) ([]byte, error
 	return resp, nil
 }
 
-func parse(resp []byte, qtype dnsmessage.Type) (truncated bool, addrs []netip.Addr, err error) {
+// answer is a parsed DNS response: the header bits query needs to judge it plus
+// any A/AAAA addresses (populated only on an RCodeSuccess, non-truncated reply).
+// A malformed response is the only error — rcode and the AA/TC flags are data
+// the caller interprets, not failures.
+type answer struct {
+	authoritative bool // AA: the responder is the zone's own nameserver
+	truncated     bool // TC: retry over TCP for the full message
+	rcode         dnsmessage.RCode
+	addrs         []netip.Addr
+}
+
+func parse(resp []byte, qtype dnsmessage.Type) (answer, error) {
 	var p dnsmessage.Parser
 	header, err := p.Start(resp)
 	if err != nil {
-		return false, nil, fmt.Errorf("malformed DNS response: %w", err)
+		return answer{}, fmt.Errorf("malformed DNS response: %w", err)
 	}
-	if header.Truncated {
-		return true, nil, nil
-	}
-	switch header.RCode {
-	case dnsmessage.RCodeSuccess:
-	case dnsmessage.RCodeNameError:
-		return false, nil, nil // NXDOMAIN: not visible yet
-	default:
-		return false, nil, fmt.Errorf("server returned rcode %v", header.RCode)
+	ans := answer{authoritative: header.Authoritative, truncated: header.Truncated, rcode: header.RCode}
+	if header.Truncated || header.RCode != dnsmessage.RCodeSuccess {
+		return ans, nil // nothing to parse; query decides on the flags/rcode
 	}
 	if err := p.SkipAllQuestions(); err != nil {
-		return false, nil, err
+		return answer{}, err
 	}
 
 	for {
@@ -425,12 +473,12 @@ func parse(resp []byte, qtype dnsmessage.Type) (truncated bool, addrs []netip.Ad
 			break
 		}
 		if err != nil {
-			return false, nil, err
+			return answer{}, err
 		}
 		if rh.Type != qtype {
 			// CNAME links and other-family records in the chain: skip.
 			if err := p.SkipAnswer(); err != nil {
-				return false, nil, err
+				return answer{}, err
 			}
 			continue
 		}
@@ -438,18 +486,18 @@ func parse(resp []byte, qtype dnsmessage.Type) (truncated bool, addrs []netip.Ad
 		case dnsmessage.TypeA:
 			r, err := p.AResource()
 			if err != nil {
-				return false, nil, err
+				return answer{}, err
 			}
-			addrs = append(addrs, netip.AddrFrom4(r.A))
+			ans.addrs = append(ans.addrs, netip.AddrFrom4(r.A))
 		case dnsmessage.TypeAAAA:
 			r, err := p.AAAAResource()
 			if err != nil {
-				return false, nil, err
+				return answer{}, err
 			}
-			addrs = append(addrs, netip.AddrFrom16(r.AAAA))
+			ans.addrs = append(ans.addrs, netip.AddrFrom16(r.AAAA))
 		}
 	}
-	return false, addrs, nil
+	return ans, nil
 }
 
 // NameserverIPs resolves the zone's NS records to IPv4 ip:53 endpoints via the
