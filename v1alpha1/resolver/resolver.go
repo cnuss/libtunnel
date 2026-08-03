@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -445,12 +446,22 @@ func exchangeDoH(ctx context.Context, endpoint, hostname string, qtype dnsmessag
 	if qtype == dnsmessage.TypeAAAA {
 		rrType = dohTypeAAAA
 	}
-	q := url.Values{"name": {hostname}, "type": {strconv.Itoa(rrType)}}
+	// ts is a cache buster: readiness polls the same name repeatedly while it is
+	// still unpublished, so a cached "no such name" is exactly the answer that
+	// must not be reused. A unique URL per attempt keeps any HTTP-layer cache —
+	// proxy, CDN, client — from serving one, and Cache-Control asks the resolver
+	// to revalidate rather than answer from its own store.
+	q := url.Values{
+		"name": {hostname},
+		"type": {strconv.Itoa(rrType)},
+		"ts":   {dohNonceValue()},
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
 	if err != nil {
 		return answer{}, err
 	}
 	req.Header.Set("Accept", "application/dns-json")
+	req.Header.Set("Cache-Control", "no-cache")
 
 	resp, err := dohClient.Do(req)
 	if err != nil {
@@ -496,6 +507,17 @@ const (
 	defaultDoHHost = "cloudflare-dns.com"
 	defaultDoHAddr = "1.1.1.1:443"
 )
+
+// dohNonce makes every DoH URL unique. A timestamp alone is not enough: the A
+// and AAAA legs of one lookup, and consecutive poll rounds, routinely land in
+// the same instant, and two identical URLs are two chances for a cache to serve
+// the stale negative this is meant to avoid. The counter guarantees uniqueness
+// within the process; the nanosecond stamp separates processes.
+var dohNonce atomic.Uint64
+
+func dohNonceValue() string {
+	return strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.FormatUint(dohNonce.Add(1), 36)
+}
 
 // dohClient dials the default DoH endpoint by IP so the DNS bypass never itself
 // depends on DNS. Without this, resolving cloudflare-dns.com goes through

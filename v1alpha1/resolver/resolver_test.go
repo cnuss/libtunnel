@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,6 +122,56 @@ func serveDoH(t *testing.T, status int, v4 []string) string {
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
+}
+
+// TestQueryDoHIsUncacheable pins the cache-busting on the DoH leg. Readiness
+// polls the same name repeatedly while it is still unpublished, so a cached "no
+// such name" is precisely the answer that must never be reused — the failure
+// mode that hung tunnels behind an intercepting resolver. Each request must
+// carry a unique URL (so no HTTP cache can serve it) and ask for revalidation.
+func TestQueryDoHIsUncacheable(t *testing.T) {
+	var mu sync.Mutex
+	var urls []string
+	var cacheControl []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		urls = append(urls, r.URL.String())
+		cacheControl = append(cacheControl, r.Header.Get("Cache-Control"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/dns-json")
+		json.NewEncoder(w).Encode(struct {
+			Status int `json:"Status"`
+		}{Status: 3}) // NXDOMAIN: keeps the caller polling
+	}))
+	defer srv.Close()
+	resolver.DoHEndpoint = srv.URL
+	t.Cleanup(func() { resolver.DoHEndpoint = "" })
+
+	// Two lookups of the same name, as a readiness poll would issue.
+	dead := "127.0.0.1:1"
+	for range 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resolver.Query(ctx, dead, "demo.trycloudflare.com")
+		cancel()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(urls) < 2 {
+		t.Fatalf("DoH requests = %d, want at least 2", len(urls))
+	}
+	seen := map[string]bool{}
+	for _, u := range urls {
+		if seen[u] {
+			t.Errorf("duplicate DoH URL %q — a cache could serve a stale negative", u)
+		}
+		seen[u] = true
+	}
+	for _, cc := range cacheControl {
+		if cc != "no-cache" {
+			t.Errorf("Cache-Control = %q, want no-cache", cc)
+		}
+	}
 }
 
 // TestQueryDoHBeatsHijackedNegative is the hotel/hotspot case: BOTH plaintext
