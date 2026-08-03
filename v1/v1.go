@@ -107,6 +107,13 @@ const (
 	// Its entries beat code per key. Values cannot contain a comma or equals sign
 	// — the list form has no escaping. Only the mint path uses it.
 	CloudflareHeadersEnv = "LIBTUNNEL__CLOUDFLARE_HEADERS"
+
+	// CloudflareEdgeEnv mirrors WithEdge: a comma-separated list of host:port
+	// addresses to dial for the tunnel edge instead of discovering it by SRV
+	// (which yields Cloudflare's edge on port 7844). Set, it also forces the
+	// http2 edge protocol. Intended for a relay on an allowed port; see
+	// WithEdge for the constraints.
+	CloudflareEdgeEnv = "LIBTUNNEL__CLOUDFLARE_EDGE"
 )
 
 // Spec is the credential/identity set a Provider yields. Each backend defines

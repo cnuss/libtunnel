@@ -323,6 +323,7 @@ credential set (id, hostname, account tag, secret) skips resolution entirely:
 | `LIBTUNNEL__CLOUDFLARE_SECRET` | `WithSecret()` (base64) |
 | `LIBTUNNEL__CLOUDFLARE_PROVIDER` | `WithProvider()` — quick-tunnel provider host, default `api.trycloudflare.com` (endpoint `https://<host>/tunnel` synthesized; a value with a scheme is used verbatim) |
 | `LIBTUNNEL__CLOUDFLARE_HEADERS` | `WithHeader()` — request headers on the mint call, comma-separated `K=V` (e.g. `X-Opaque=true`); entries beat code per key. No escaping — values can't contain `,` or `=`. Mint-only. |
+| `LIBTUNNEL__CLOUDFLARE_EDGE` | `WithEdge()` — comma-separated `host:port` list to dial for the tunnel edge instead of discovering it by SRV (which yields Cloudflare's edge on port 7844). Replaces the code value wholesale; forces the `http2` edge protocol. For reaching the edge through a relay on an allowed port. |
 
 The Cloudflare backend also has a bare activation switch, `LIBTUNNEL__CLOUDFLARE=1`,
 used by the binary below to select it without a spec handoff.
