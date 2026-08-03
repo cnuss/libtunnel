@@ -262,6 +262,34 @@ func TestHeadersEnvBeatsCode(t *testing.T) {
 	}
 }
 
+// TestWithEdgePinsAddresses pins WithEdge: the addresses are carried through to
+// the supervisor's static-edge list, which bypasses SRV discovery (and with it
+// Cloudflare's port 7844) so a relay on an allowed port can be dialed instead.
+func TestWithEdgePinsAddresses(t *testing.T) {
+	t.Setenv(v1.CloudflareEdgeEnv, "")
+
+	b := New().WithEdge("relay.example:443", "relay2.example:443")
+	got := edgeAddresses(b.edgeAddrs)
+	if len(got) != 2 || got[0] != "relay.example:443" || got[1] != "relay2.example:443" {
+		t.Errorf("edge addrs = %v, want both pinned addresses", got)
+	}
+	if edgeAddresses(nil) != nil {
+		t.Error("unset must stay empty so the edge is discovered by SRV")
+	}
+}
+
+// TestEdgeEnvBeatsCode pins the env mirror: LIBTUNNEL__CLOUDFLARE_EDGE replaces
+// the code value wholesale (it is one list, not a per-entry merge) and tolerates
+// whitespace around the commas.
+func TestEdgeEnvBeatsCode(t *testing.T) {
+	t.Setenv(v1.CloudflareEdgeEnv, " env1.example:443 , env2.example:443 ")
+
+	got := edgeAddresses([]string{"code.example:443"})
+	if len(got) != 2 || got[0] != "env1.example:443" || got[1] != "env2.example:443" {
+		t.Errorf("edge addrs = %v, want the env list to replace the code value", got)
+	}
+}
+
 // TestProviderHostSynthesizesEndpoint pins the bare-host → https://host/tunnel
 // synthesis and the verbatim passthrough for a scheme-carrying value.
 func TestProviderHostSynthesizesEndpoint(t *testing.T) {
