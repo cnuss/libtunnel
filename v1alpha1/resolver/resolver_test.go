@@ -207,9 +207,64 @@ func TestQueryRacesTCPWhenUDPIntercepted(t *testing.T) {
 	}
 }
 
-// TestQueryNonAuthoritativeIsRejected pins that a non-authoritative answer is
-// never trusted: when both transports return a hijacked (no-AA) response, Query
-// errors rather than accepting it or hanging.
+// nonAuthAnswer mimics a transparent recursive resolver that answers CORRECTLY
+// but does not set AA: RA set, NOERROR, real records. Common on home and
+// corporate networks.
+func nonAuthAnswer(t *testing.T, q dnsmessage.Question, v4 [][4]byte) []byte {
+	t.Helper()
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true, RecursionAvailable: true})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Question(q); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.StartAnswers(); err != nil {
+		t.Fatal(err)
+	}
+	if q.Type == dnsmessage.TypeA {
+		rh := dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: 60}
+		for _, ip := range v4 {
+			if err := b.AResource(rh, dnsmessage.AResource{A: ip}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	wire, err := b.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
+// TestQueryAcceptsNonAuthoritativeRecords is the regression guard for the AA
+// requirement that shipped in v0.0.39: a transparent resolver that answers
+// correctly without setting AA must still be believed. Requiring AA made every
+// probe fail on such networks, so hostname readiness never fired and the tunnel
+// hung at "waiting for DNS" forever. Records are the readiness signal — trust
+// them whether or not AA is set.
+func TestQueryAcceptsNonAuthoritativeRecords(t *testing.T) {
+	v4 := [][4]byte{{104, 16, 230, 132}}
+	server := serveDNSSplit(t,
+		func(q dnsmessage.Question) []byte { return nonAuthAnswer(t, q, v4) },
+		func(q dnsmessage.Question) []byte { return nonAuthAnswer(t, q, v4) },
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rec, err := resolver.Query(ctx, server, "demo.trycloudflare.com")
+	if err != nil {
+		t.Fatalf("a correct answer without AA must be accepted, got error: %v", err)
+	}
+	if len(rec.A) != 1 || rec.A[0] != netip.AddrFrom4(v4[0]) {
+		t.Errorf("A = %v, want %v from the non-authoritative answer", rec.A, v4[0])
+	}
+}
+
+// TestQueryNonAuthoritativeIsRejected pins that a non-authoritative NEGATIVE is
+// never trusted: when both transports return a hijacked (no-AA, no records)
+// response, Query errors rather than accepting it as "not published" or hanging.
 func TestQueryNonAuthoritativeIsRejected(t *testing.T) {
 	server := serveDNSSplit(t,
 		func(q dnsmessage.Question) []byte { return nonAuthRefused(t, q) },

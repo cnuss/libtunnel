@@ -289,8 +289,8 @@ func (r Records) Equal(o Records) bool {
 
 // Query asks server (an ip:port DNS endpoint) for hostname's A and AAAA records
 // directly (RD=0), returning both families sorted. Each family is raced over UDP
-// and TCP and only an authoritative (AA) answer is accepted, so a network
-// intercepting UDP/53 cannot stall or spoof the result (see query). A name that
+// and TCP, preferring but not requiring an authoritative (AA) answer, so a
+// network intercepting port 53 cannot stall the result (see query). A name that
 // does not (yet) resolve comes back as empty Records with a nil error (the "keep
 // polling" signal); transport and DNS-level failures return an error.
 func Query(ctx context.Context, server, hostname string) (Records, error) {
@@ -306,15 +306,27 @@ func Query(ctx context.Context, server, hostname string) (Records, error) {
 }
 
 // query races the question over UDP and TCP against server and returns the
-// addresses from the first AUTHORITATIVE (AA-bit) response. Racing both
-// transports defeats a network that intercepts UDP/53: an interceptor answers
-// over UDP as a recursive resolver standing in for the zone's nameserver — no AA
-// bit, and a REFUSED for an RD=0 query it is not authoritative for — while TCP
-// (which interceptors rarely touch) reaches the real authoritative server. A
-// non-authoritative reply is therefore set aside, not trusted. An authoritative
-// NXDOMAIN, or NOERROR with no records, is "not published yet" — empty addrs,
-// nil error, the keep-polling signal. If neither transport yields an
-// authoritative answer, the last meaningful failure is returned.
+// addresses from the first usable answer. Racing both transports defeats a
+// network that intercepts port 53: an interceptor stands in for the zone's
+// nameserver, and for an RD=0 query it is not authoritative for it typically
+// REFUSEs — while the other transport (interceptors usually target UDP) reaches
+// the real server.
+//
+// The AA bit is NOT required — only consulted to judge a refusal:
+//
+//   - Any response CARRYING RECORDS is accepted. Records are the readiness
+//     signal, and plenty of benign middleboxes answer correctly without setting
+//     AA (a transparent recursive resolver on a home or corporate network).
+//     Requiring AA here hangs the poll on those networks.
+//   - A well-formed negative — NOERROR with no records, or NXDOMAIN — is "not
+//     published yet": empty addrs, nil error, keep polling. Believed with or
+//     without AA, since an empty family (an A-only host's AAAA) is routine.
+//   - A REFUSED/SERVFAIL-class failure is judged by AA: from the zone's own
+//     nameserver it is a real error; from anything else it is likely an
+//     interceptor rejecting the RD=0 query, so it is set aside to let the other
+//     transport speak. If neither transport produces anything usable, that
+//     failure is returned — naming the likely interception — rather than
+//     silently polling on a lie.
 func query(ctx context.Context, server, hostname string, qtype dnsmessage.Type) ([]netip.Addr, error) {
 	wire, err := buildQuery(hostname, qtype)
 	if err != nil {
@@ -350,22 +362,28 @@ func query(ctx context.Context, server, hostname string, qtype dnsmessage.Type) 
 			lastErr = fmt.Errorf("%s: %w", r.transport, r.err)
 		case r.ans.truncated:
 			// UDP hit the 512-byte limit; the TCP leg carries the full message.
-		case !r.ans.authoritative:
-			// Not the zone's nameserver — an intercepting recursive resolver.
-			// Set aside; the other transport may reach the real server.
-			lastErr = fmt.Errorf("%s: non-authoritative response (rcode %v; port 53 may be intercepted)", r.transport, r.ans.rcode)
-		case r.ans.rcode == dnsmessage.RCodeNameError:
-			return nil, nil // authoritative NXDOMAIN: not published yet
-		case r.ans.rcode != dnsmessage.RCodeSuccess:
-			return nil, fmt.Errorf("%s: authoritative server returned rcode %v", r.transport, r.ans.rcode)
-		default:
+		case len(r.ans.addrs) > 0:
+			// Records answer the question, authoritative or not.
 			addrs := r.ans.addrs
 			slices.SortFunc(addrs, func(a, b netip.Addr) int { return a.Compare(b) })
 			return addrs, nil
+		case r.ans.rcode == dnsmessage.RCodeSuccess, r.ans.rcode == dnsmessage.RCodeNameError:
+			// A well-formed negative: the name has no record of this family yet
+			// (NOERROR) or does not exist yet (NXDOMAIN). Both mean keep polling,
+			// and both are believable without AA — a family with no records is the
+			// normal answer for, say, an A-only hostname's AAAA query.
+			return nil, nil
+		case !r.ans.authoritative:
+			// A refusal or failure from something that is not the zone's
+			// nameserver: likely an interceptor rejecting the RD=0 query rather
+			// than the zone answering. Set aside so the other transport can speak.
+			lastErr = fmt.Errorf("%s: non-authoritative %v (port 53 may be intercepted)", r.transport, r.ans.rcode)
+		default:
+			return nil, fmt.Errorf("%s: authoritative server returned rcode %v", r.transport, r.ans.rcode)
 		}
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("no authoritative DNS answer for %s", hostname)
+		lastErr = fmt.Errorf("no usable DNS answer for %s", hostname)
 	}
 	return nil, lastErr
 }
