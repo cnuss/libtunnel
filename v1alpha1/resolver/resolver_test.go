@@ -3,9 +3,13 @@ package resolver_test
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 
@@ -54,7 +58,7 @@ func serveDNS(t *testing.T, handler func(dnsmessage.Question) []byte) string {
 func respond(t *testing.T, q dnsmessage.Question, rcode dnsmessage.RCode, v4 [][4]byte, v6 [][16]byte) []byte {
 	t.Helper()
 	// Authoritative: these stand in for the zone's own nameservers, which set AA
-	// on RD=0 answers — what query now requires to accept a response.
+	// on RD=0 answers.
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true, Authoritative: true, RCode: rcode})
 	b.EnableCompression()
 	if err := b.StartQuestions(); err != nil {
@@ -80,6 +84,102 @@ func respond(t *testing.T, q dnsmessage.Question, rcode dnsmessage.RCode, v4 [][
 				t.Fatal(err)
 			}
 		}
+	}
+	wire, err := b.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
+// TestMain disables the DoH leg by default so the suite stays offline; the DoH
+// tests below point it at a local stub.
+func TestMain(m *testing.M) {
+	resolver.DoHEndpoint = ""
+	os.Exit(m.Run())
+}
+
+// serveDoH stands up a stub DNS-over-HTTPS endpoint answering the JSON form.
+func serveDoH(t *testing.T, status int, v4 []string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		type rr struct {
+			Type int    `json:"type"`
+			Data string `json:"data"`
+		}
+		out := struct {
+			Status int  `json:"Status"`
+			Answer []rr `json:"Answer"`
+		}{Status: status}
+		if r.URL.Query().Get("type") == "1" { // 1 = A, the numeric form query sends
+			for _, ip := range v4 {
+				out.Answer = append(out.Answer, rr{Type: 1, Data: ip})
+			}
+		}
+		w.Header().Set("Content-Type", "application/dns-json")
+		json.NewEncoder(w).Encode(out)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// TestQueryDoHBeatsHijackedNegative is the hotel/hotspot case: BOTH plaintext
+// transports are intercepted and serve a stale NXDOMAIN for a name that has
+// since been published. Believing them hangs readiness forever (observed live:
+// DoH saw the record 10s in, plain DNS said NXDOMAIN indefinitely). The DoH leg
+// must win, and the fast local negative must not short-circuit the race.
+func TestQueryDoHBeatsHijackedNegative(t *testing.T) {
+	hijacked := func(q dnsmessage.Question) []byte {
+		return respondNonAuth(t, q, dnsmessage.RCodeNameError)
+	}
+	server := serveDNSSplit(t, hijacked, hijacked)
+	resolver.DoHEndpoint = serveDoH(t, 0, []string{"104.16.230.132"})
+	t.Cleanup(func() { resolver.DoHEndpoint = "" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rec, err := resolver.Query(ctx, server, "demo.trycloudflare.com")
+	if err != nil {
+		t.Fatalf("DoH should resolve past a hijacked NXDOMAIN: %v", err)
+	}
+	if len(rec.A) != 1 || rec.A[0] != netip.AddrFrom4([4]byte{104, 16, 230, 132}) {
+		t.Errorf("A = %v, want the DoH answer", rec.A)
+	}
+}
+
+// TestQueryDoHNegativeIsBelieved pins the other side: when DoH also says the
+// name does not exist, that is a trustworthy "not published yet" — empty
+// records and a nil error, so the caller keeps polling rather than erroring.
+func TestQueryDoHNegativeIsBelieved(t *testing.T) {
+	hijacked := func(q dnsmessage.Question) []byte {
+		return respondNonAuth(t, q, dnsmessage.RCodeNameError)
+	}
+	server := serveDNSSplit(t, hijacked, hijacked)
+	resolver.DoHEndpoint = serveDoH(t, 3, nil) // 3 = NXDOMAIN
+	t.Cleanup(func() { resolver.DoHEndpoint = "" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rec, err := resolver.Query(ctx, server, "demo.trycloudflare.com")
+	if err != nil {
+		t.Fatalf("a DoH negative is definitive, not an error: %v", err)
+	}
+	if !rec.Empty() {
+		t.Errorf("records = %+v, want empty", rec)
+	}
+}
+
+// respondNonAuth builds a reply with the given rcode and no AA bit — what an
+// on-path interceptor returns while standing in for the zone's nameserver.
+func respondNonAuth(t *testing.T, q dnsmessage.Question, rcode dnsmessage.RCode) []byte {
+	t.Helper()
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true, RecursionAvailable: true, RCode: rcode})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Question(q); err != nil {
+		t.Fatal(err)
 	}
 	wire, err := b.Finish()
 	if err != nil {
@@ -207,9 +307,64 @@ func TestQueryRacesTCPWhenUDPIntercepted(t *testing.T) {
 	}
 }
 
-// TestQueryNonAuthoritativeIsRejected pins that a non-authoritative answer is
-// never trusted: when both transports return a hijacked (no-AA) response, Query
-// errors rather than accepting it or hanging.
+// nonAuthAnswer mimics a transparent recursive resolver that answers CORRECTLY
+// but does not set AA: RA set, NOERROR, real records. Common on home and
+// corporate networks.
+func nonAuthAnswer(t *testing.T, q dnsmessage.Question, v4 [][4]byte) []byte {
+	t.Helper()
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true, RecursionAvailable: true})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Question(q); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.StartAnswers(); err != nil {
+		t.Fatal(err)
+	}
+	if q.Type == dnsmessage.TypeA {
+		rh := dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: 60}
+		for _, ip := range v4 {
+			if err := b.AResource(rh, dnsmessage.AResource{A: ip}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	wire, err := b.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
+// TestQueryAcceptsNonAuthoritativeRecords is the regression guard for the AA
+// requirement that shipped in v0.0.39: a transparent resolver that answers
+// correctly without setting AA must still be believed. Requiring AA made every
+// probe fail on such networks, so hostname readiness never fired and the tunnel
+// hung at "waiting for DNS" forever. Records are the readiness signal — trust
+// them whether or not AA is set.
+func TestQueryAcceptsNonAuthoritativeRecords(t *testing.T) {
+	v4 := [][4]byte{{104, 16, 230, 132}}
+	server := serveDNSSplit(t,
+		func(q dnsmessage.Question) []byte { return nonAuthAnswer(t, q, v4) },
+		func(q dnsmessage.Question) []byte { return nonAuthAnswer(t, q, v4) },
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rec, err := resolver.Query(ctx, server, "demo.trycloudflare.com")
+	if err != nil {
+		t.Fatalf("a correct answer without AA must be accepted, got error: %v", err)
+	}
+	if len(rec.A) != 1 || rec.A[0] != netip.AddrFrom4(v4[0]) {
+		t.Errorf("A = %v, want %v from the non-authoritative answer", rec.A, v4[0])
+	}
+}
+
+// TestQueryNonAuthoritativeIsRejected pins that a non-authoritative NEGATIVE is
+// never trusted: when both transports return a hijacked (no-AA, no records)
+// response, Query errors rather than accepting it as "not published" or hanging.
 func TestQueryNonAuthoritativeIsRejected(t *testing.T) {
 	server := serveDNSSplit(t,
 		func(q dnsmessage.Question) []byte { return nonAuthRefused(t, q) },

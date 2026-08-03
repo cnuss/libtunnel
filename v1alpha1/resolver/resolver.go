@@ -14,12 +14,16 @@ package resolver
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -289,32 +293,57 @@ func (r Records) Equal(o Records) bool {
 
 // Query asks server (an ip:port DNS endpoint) for hostname's A and AAAA records
 // directly (RD=0), returning both families sorted. Each family is raced over UDP
-// and TCP and only an authoritative (AA) answer is accepted, so a network
-// intercepting UDP/53 cannot stall or spoof the result (see query). A name that
+// and TCP, preferring but not requiring an authoritative (AA) answer, so a
+// network intercepting port 53 cannot stall the result (see query). A name that
 // does not (yet) resolve comes back as empty Records with a nil error (the "keep
 // polling" signal); transport and DNS-level failures return an error.
 func Query(ctx context.Context, server, hostname string) (Records, error) {
-	a, err := query(ctx, server, hostname, dnsmessage.TypeA)
-	if err != nil {
-		return Records{}, err
+	a, aErr := query(ctx, server, hostname, dnsmessage.TypeA)
+	aaaa, aaaaErr := query(ctx, server, hostname, dnsmessage.TypeAAAA)
+	// Records from either family answer the readiness question, so one family
+	// coming back inconclusive does not discard the other's answer — an A-only
+	// hostname whose AAAA lookup is unusable is still resolvable.
+	if len(a) > 0 || len(aaaa) > 0 {
+		return Records{A: a, AAAA: aaaa}, nil
 	}
-	aaaa, err := query(ctx, server, hostname, dnsmessage.TypeAAAA)
-	if err != nil {
-		return Records{}, err
+	if aErr != nil {
+		return Records{}, aErr
 	}
-	return Records{A: a, AAAA: aaaa}, nil
+	if aaaaErr != nil {
+		return Records{}, aaaaErr
+	}
+	return Records{}, nil
 }
 
-// query races the question over UDP and TCP against server and returns the
-// addresses from the first AUTHORITATIVE (AA-bit) response. Racing both
-// transports defeats a network that intercepts UDP/53: an interceptor answers
-// over UDP as a recursive resolver standing in for the zone's nameserver — no AA
-// bit, and a REFUSED for an RD=0 query it is not authoritative for — while TCP
-// (which interceptors rarely touch) reaches the real authoritative server. A
-// non-authoritative reply is therefore set aside, not trusted. An authoritative
-// NXDOMAIN, or NOERROR with no records, is "not published yet" — empty addrs,
-// nil error, the keep-polling signal. If neither transport yields an
-// authoritative answer, the last meaningful failure is returned.
+// query races the question three ways — UDP and TCP against server, plus DoH
+// (see DoHEndpoint) — and returns the addresses from the first usable answer.
+// Racing defeats a network that intercepts port 53 by standing in for the zone's
+// nameserver: it may REFUSE an RD=0 query it is not authoritative for, or serve
+// a stale cached miss for a name that has since been published. Where an
+// interceptor takes only UDP, the TCP leg reaches the real server; where it
+// takes both — hotel and hotspot wifi routinely do — DoH rides HTTPS past it.
+//
+// Only records end the race early. A negative is weighed after every leg
+// reports, so the local liar (always fastest) cannot beat DoH to the answer.
+//
+// The AA bit is NOT required — only consulted to judge a refusal:
+//
+//   - Any response CARRYING RECORDS is accepted. Records are the readiness
+//     signal, and plenty of benign middleboxes answer correctly without setting
+//     AA (a transparent recursive resolver on a home or corporate network).
+//     Requiring AA here hangs the poll on those networks.
+//   - A well-formed negative — NOERROR with no records, or NXDOMAIN — is "not
+//     published yet": empty addrs, nil error, keep polling. Believed with or
+//     without AA, since an empty family (an A-only host's AAAA) is routine.
+//   - A REFUSED/SERVFAIL-class failure is judged by AA: from the zone's own
+//     nameserver it is a real error; from anything else it is likely an
+//     interceptor rejecting the RD=0 query, so it is set aside to let the other
+//     legs speak. If no leg produces anything usable, that failure is returned —
+//     naming the likely interception — rather than silently polling on a lie.
+//
+// A negative is only believed from the zone's nameserver (AA) or over DoH;
+// a plaintext non-authoritative "no such name" is treated as unusable, since it
+// may be an interceptor's stale miss.
 func query(ctx context.Context, server, hostname string, qtype dnsmessage.Type) ([]netip.Addr, error) {
 	wire, err := buildQuery(hostname, qtype)
 	if err != nil {
@@ -322,52 +351,170 @@ func query(ctx context.Context, server, hostname string, qtype dnsmessage.Type) 
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel() // stop the slower transport once one answers authoritatively
+	defer cancel() // stop the slower legs once one answers with records
 
 	type result struct {
 		transport string
 		ans       answer
 		err       error
 	}
-	results := make(chan result, 2) // buffered: the loser never blocks on send
-	race := func(transport string, exchange func(context.Context, string, []byte) ([]byte, error)) {
-		resp, err := exchange(ctx, server, wire)
-		if err != nil {
-			results <- result{transport: transport, err: err}
-			return
-		}
-		ans, err := parse(resp, qtype)
+	results := make(chan result, 3) // buffered: losers never block on send
+	race := func(transport string, exchange func() (answer, error)) {
+		ans, err := exchange()
 		results <- result{transport: transport, ans: ans, err: err}
 	}
-	go race("udp", exchangeUDP)
-	go race("tcp", exchangeTCP)
+	legs := 2
+	go race("udp", func() (answer, error) { return exchangeWire(ctx, server, wire, qtype, exchangeUDP) })
+	go race("tcp", func() (answer, error) { return exchangeWire(ctx, server, wire, qtype, exchangeTCP) })
+	if DoHEndpoint != "" {
+		legs++
+		go race("doh", func() (answer, error) { return exchangeDoH(ctx, DoHEndpoint, hostname, qtype) })
+	}
 
-	var lastErr error
-	for range 2 {
+	// Negatives do NOT short-circuit: on an intercepting network the local liar
+	// answers first, and believing its "no such name" would beat DoH to the
+	// punch. Only records end the race early; negatives are weighed at the end.
+	var (
+		trustedNeg bool // a negative from a source that cannot be the interceptor
+		lastErr    error
+	)
+	for range legs {
 		r := <-results
 		switch {
 		case r.err != nil:
 			lastErr = fmt.Errorf("%s: %w", r.transport, r.err)
 		case r.ans.truncated:
 			// UDP hit the 512-byte limit; the TCP leg carries the full message.
-		case !r.ans.authoritative:
-			// Not the zone's nameserver — an intercepting recursive resolver.
-			// Set aside; the other transport may reach the real server.
-			lastErr = fmt.Errorf("%s: non-authoritative response (rcode %v; port 53 may be intercepted)", r.transport, r.ans.rcode)
-		case r.ans.rcode == dnsmessage.RCodeNameError:
-			return nil, nil // authoritative NXDOMAIN: not published yet
-		case r.ans.rcode != dnsmessage.RCodeSuccess:
-			return nil, fmt.Errorf("%s: authoritative server returned rcode %v", r.transport, r.ans.rcode)
-		default:
+		case len(r.ans.addrs) > 0:
+			// Records answer the question, authoritative or not.
 			addrs := r.ans.addrs
 			slices.SortFunc(addrs, func(a, b netip.Addr) int { return a.Compare(b) })
 			return addrs, nil
+		case r.ans.rcode == dnsmessage.RCodeSuccess, r.ans.rcode == dnsmessage.RCodeNameError:
+			// A well-formed negative: no record of this family yet (NOERROR) or
+			// the name does not exist yet (NXDOMAIN). Believe it only from the
+			// zone's own nameserver or over DoH — a plaintext negative from an
+			// interceptor may be a stale cached miss for a name that now exists.
+			if r.ans.authoritative || r.transport == "doh" {
+				trustedNeg = true
+			} else {
+				lastErr = fmt.Errorf("%s: non-authoritative %v (port 53 may be intercepted)", r.transport, r.ans.rcode)
+			}
+		case !r.ans.authoritative:
+			// A refusal from something that is not the zone's nameserver: likely
+			// an interceptor rejecting the RD=0 query. Set aside for the others.
+			lastErr = fmt.Errorf("%s: non-authoritative %v (port 53 may be intercepted)", r.transport, r.ans.rcode)
+		default:
+			lastErr = fmt.Errorf("%s: authoritative server returned rcode %v", r.transport, r.ans.rcode)
 		}
 	}
+	if trustedNeg {
+		return nil, nil // not published yet: keep polling
+	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("no authoritative DNS answer for %s", hostname)
+		lastErr = fmt.Errorf("no usable DNS answer for %s", hostname)
 	}
 	return nil, lastErr
+}
+
+// exchangeWire sends the prebuilt query over one plaintext transport and parses
+// the reply.
+func exchangeWire(ctx context.Context, server string, wire []byte, qtype dnsmessage.Type,
+	exchange func(context.Context, string, []byte) ([]byte, error)) (answer, error) {
+	resp, err := exchange(ctx, server, wire)
+	if err != nil {
+		return answer{}, err
+	}
+	return parse(resp, qtype)
+}
+
+// DoHEndpoint is the DNS-over-HTTPS resolver raced alongside plaintext UDP/TCP
+// (see query). DoH rides HTTPS, so a network that hijacks port 53 — which is
+// common enough on hotel and hotspot wifi, and which no plaintext transport can
+// escape — cannot answer in its place. Empty disables the DoH leg.
+var DoHEndpoint = "https://cloudflare-dns.com/dns-query"
+
+// exchangeDoH resolves hostname over DNS-over-HTTPS (RFC 8484's JSON form) and
+// shapes the reply like a plaintext answer. The result is never marked
+// authoritative — it comes from a recursive resolver, not the zone — but it is
+// trusted for negatives because it cannot have come from an on-path interceptor.
+func exchangeDoH(ctx context.Context, endpoint, hostname string, qtype dnsmessage.Type) (answer, error) {
+	// The RR type goes over as its numeric code: dnsmessage's String() renders
+	// "TypeA", which is not what the API expects.
+	rrType := dohTypeA
+	if qtype == dnsmessage.TypeAAAA {
+		rrType = dohTypeAAAA
+	}
+	q := url.Values{"name": {hostname}, "type": {strconv.Itoa(rrType)}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
+	if err != nil {
+		return answer{}, err
+	}
+	req.Header.Set("Accept", "application/dns-json")
+
+	resp, err := dohClient.Do(req)
+	if err != nil {
+		return answer{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return answer{}, fmt.Errorf("doh: HTTP %s", resp.Status)
+	}
+	var body struct {
+		Status int `json:"Status"`
+		Answer []struct {
+			Type int    `json:"type"`
+			Data string `json:"data"`
+		} `json:"Answer"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxDoHResponse)).Decode(&body); err != nil {
+		return answer{}, fmt.Errorf("doh: %w", err)
+	}
+
+	ans := answer{rcode: dnsmessage.RCode(body.Status)}
+	for _, rr := range body.Answer {
+		// Skip the CNAME links in a chain; keep the family asked for.
+		if (qtype == dnsmessage.TypeA && rr.Type != dohTypeA) ||
+			(qtype == dnsmessage.TypeAAAA && rr.Type != dohTypeAAAA) {
+			continue
+		}
+		addr, err := netip.ParseAddr(rr.Data)
+		if err != nil {
+			continue
+		}
+		ans.addrs = append(ans.addrs, addr)
+	}
+	return ans, nil
+}
+
+const (
+	dohTypeA       = 1 // RR type codes as the JSON API reports them
+	dohTypeAAAA    = 28
+	maxDoHResponse = 1 << 16
+
+	// The default DoH endpoint's host and the anycast address it is dialed at.
+	defaultDoHHost = "cloudflare-dns.com"
+	defaultDoHAddr = "1.1.1.1:443"
+)
+
+// dohClient dials the default DoH endpoint by IP so the DNS bypass never itself
+// depends on DNS. Without this, resolving cloudflare-dns.com goes through
+// net.DefaultResolver — which this package replaces with a repairing resolver
+// that falls back to Query, whose DoH leg would resolve cloudflare-dns.com
+// again. TLS still verifies against the URL's hostname, so pinning the address
+// costs nothing. A non-default endpoint (tests, a private resolver) is dialed
+// normally.
+var dohClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if host, _, err := net.SplitHostPort(addr); err == nil && host == defaultDoHHost {
+				addr = defaultDoHAddr
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	},
 }
 
 func buildQuery(hostname string, qtype dnsmessage.Type) ([]byte, error) {
