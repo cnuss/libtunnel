@@ -10,31 +10,48 @@
 // the very resolver the calling process will use to connect. Nothing here asks
 // it, ever.
 //
-// Two sources that cannot hold a stale negative are asked instead:
+// Ready means consensus, not first sighting. The record propagates across the
+// zone's nameservers — and across each nameserver's anycast nodes — over
+// seconds, and a caller told "ready" during that spread can ask its own
+// resolver, hit a node the record has not reached, and cache the negative for
+// the zone's SOA. So every voice that can be heard votes, and readiness waits
+// for agreement:
 //
 //   - The zone's own nameservers, found by following a TLD server's referral
-//     and asked all at once. Only replies carrying the AA bit are trusted: on
-//     networks that intercept port 53 — hotel and hotspot wifi, corporate
+//     and asked all at once. Only replies carrying the AA bit have a voice:
+//     on networks that intercept port 53 — hotel and hotspot wifi, corporate
 //     proxies — whatever answers in the nameserver's place is not
-//     authoritative for the zone, cannot set that bit honestly, and is
-//     discarded. Ready means consensus, not first sighting: the record
-//     propagates across the zone's nameservers asynchronously, and a caller
-//     told "ready" while one nameserver still lacks the record can ask its
-//     own resolver, hit that nameserver, and cache the negative readiness
-//     exists to avoid. So one authoritative "not yet" holds readiness open.
+//     authoritative for the zone and cannot set that bit honestly.
 //   - DoH endpoints (RFC 8484), which ride HTTPS and so pass through networks
-//     that intercept port 53. They are recursive, so they answer only where
-//     no authoritative voice can be heard at all; an authoritative "not yet"
-//     outranks a recursive resolver's yes, which may be exactly the kind of
-//     cached answer consensus is waiting to make safe.
+//     that intercept port 53. They are recursive resolvers with anycast
+//     fleets of their own — the vantage a visitor actually resolves from,
+//     which the authoritative view alone cannot see. They join only after the
+//     authoritative fleet agrees: asked earlier, they would recurse for a
+//     name that does not exist yet and cache the negative — measured live as
+//     all three endpoints flapping stale negatives, planted by this package's
+//     own early rounds, for the rest of the wait.
+//
+// A round is ready when someone serves the record and nobody answers without
+// it; one "not yet" from either kind of voice holds readiness open. Voices
+// that cannot be heard at all — unreachable, blocked, intercepted — forfeit
+// rather than veto, so consensus needs whoever can answer, not everyone. And
+// consensus only ratchets forward: a voice that has served the record once
+// has proven the record reached it, and an anycast node behind it flapping
+// back to a stale view cannot take that vote away.
+//
+// Where no authoritative voice can be heard at all — port 53 intercepted or
+// blocked — the DoH endpoints are the only voices left, and the first of them
+// to serve the record decides. Unanimity there would measure nothing: the
+// negatives their fleets may hold are indistinguishable from the ones this
+// package's own pre-publication queries just planted.
 //
 // There are no timeouts here. Resolve keeps asking — a fresh round of queries
 // every resolveInterval, rotating through servers — until an answer arrives or
 // ctx ends. How long to wait is the caller's decision, expressed through ctx;
 // a query the network never answers is abandoned when ctx is done, not before.
-// The one clock consensus needs — how long to wait for a nameserver that may
-// never reply — is the pacing itself: a nameserver still silent when the next
-// round begins forfeits its vote, rather than holding readiness hostage.
+// The one clock consensus needs — how long to wait for a voice that may never
+// reply — is the pacing itself: a voice still silent when the next round
+// begins forfeits its vote, rather than holding readiness hostage.
 package resolver
 
 import (
@@ -43,6 +60,7 @@ import (
 	"math/rand"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -112,8 +130,8 @@ type resolver struct {
 	// Shuffled at construction so no process favors the same server; must not
 	// be empty.
 	tlds []string
-	// doh are RFC 8484 endpoints, one per round. Shuffled at construction;
-	// must not be empty.
+	// doh are RFC 8484 endpoints, all asked every round. Shuffled at
+	// construction; must not be empty.
 	doh []string
 	// port is where glue addresses are dialed. Glue carries an address and no
 	// port, so it is always 53 in practice; it is a field only so tests can
@@ -132,10 +150,10 @@ var _ Resolver = &resolver{}
 const resolveInterval = time.Second
 
 // Resolve implements [Resolver]. Each round asks one TLD server for the
-// zone's delegation, then every nameserver in it at once, with one DoH lookup
-// alongside as the fallback verdict; see round for how a round decides.
-// Rounds repeat, rotating through the configured servers, until one delivers
-// or ctx ends; every in-flight query is released when Resolve returns.
+// zone's delegation, then every nameserver in it and every DoH endpoint at
+// once; see round for how the votes decide. Rounds repeat, rotating through
+// the TLD servers, until one delivers or ctx ends; every in-flight query is
+// released when Resolve returns.
 func (r *resolver) Resolve(ctx context.Context, hostname string) Records {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -144,6 +162,7 @@ func (r *resolver) Resolve(ctx context.Context, hostname string) Records {
 	pace := time.NewTicker(resolveInterval)
 	defer pace.Stop()
 
+	tally := &tally{served: make(map[string]bool)}
 	var supersede chan struct{}
 	for round := 0; ; round++ {
 		// Starting a round supersedes the previous one: whatever has not
@@ -152,8 +171,7 @@ func (r *resolver) Resolve(ctx context.Context, hostname string) Records {
 			close(supersede)
 		}
 		supersede = make(chan struct{})
-		go r.round(ctx, r.tlds[round%len(r.tlds)], r.doh[round%len(r.doh)],
-			hostname, supersede, found)
+		go r.round(ctx, r.tlds[round%len(r.tlds)], hostname, tally, supersede, found)
 
 		select {
 		case rec := <-found:
@@ -167,58 +185,86 @@ func (r *resolver) Resolve(ctx context.Context, hostname string) Records {
 	}
 }
 
+// vote is one voice's view of the hostname. A voice that answered with the A
+// record serves it (and brings the AAAA half along for the caller); one that
+// answered without it objects — the record has not reached it, and a visitor
+// resolving through it would cache that negative. A voice that could not
+// answer at all — unreachable, blocked, or a middlebox without the AA bit it
+// cannot set honestly — casts no vote.
+type vote struct {
+	source  string
+	a, aaaa []netip.Addr
+	voiced  bool
+	// recursive marks a DoH endpoint's vote, as opposed to a nameserver's.
+	recursive bool
+}
+
+// tally is what one wait has established across its rounds. Rounds overlap,
+// so it is shared under a lock; it lives and dies with a single Resolve call,
+// so nothing here outlasts the wait — the package still caches nothing.
+type tally struct {
+	mu sync.Mutex
+	// served holds every voice that has answered with the record. The record
+	// provably reached these; a stale anycast node flapping back into view
+	// cannot un-serve them, so their later objections are spent.
+	served map[string]bool
+	// askDoH opens the recursive polls: set once the authoritative fleet has
+	// agreed — before that, a DoH query would recurse for a name that does
+	// not exist yet and plant the very negative consensus is waiting out — or
+	// once a round establishes there is no authoritative voice to hear.
+	askDoH bool
+	// authHeard records that some round got an authoritative reply. It
+	// decides what DoH votes mean: confirmation on a network that can hear
+	// the zone's nameservers, the only voice there is on one that cannot.
+	authHeard bool
+}
+
 // round is one complete attempt to call the hostname resolved.
 //
-// It walks the delegation — ask tld which nameservers hold the zone, then ask
-// all of them at once — and counts authoritative votes: an AA reply carrying
-// the A record serves it, an AA reply without one is a nameserver the record
-// has not reached yet. Anything else — unreachable, or a middlebox answering
-// without the AA bit it cannot set honestly — has no vote, and a nameserver
-// still silent when the next round supersedes this one forfeits its vote
-// rather than stalling the verdict.
+// The zone's nameservers, from the delegation tld hands back, are asked all
+// at once — joined by every DoH endpoint once tally says their votes carry
+// meaning. The round delivers on consensus: someone serves the record and
+// nobody answers without it, spent objections excepted. A live objection
+// means the record is still propagating somewhere a visitor might resolve
+// from, so the round delivers nothing and lets a later round find agreement.
+// Voices still silent when the next round supersedes this one forfeit their
+// vote rather than stalling the verdict.
 //
-// The round delivers on consensus: someone serves the record and no
-// authoritative voice says "not yet". A single dissent means the record is
-// still propagating, and a caller released now could ask its own resolver,
-// hit the lagging nameserver, and cache the very negative this package exists
-// to avoid — so the round delivers nothing and lets a later round decide.
-//
-// doh is asked in parallel but its answer is used only when the walk heard no
-// authoritative voice at all — a network where port 53 is intercepted or
-// blocked. It is a recursive resolver: where the zone's own nameservers can
-// be heard, their word outranks its cache.
-func (r *resolver) round(ctx context.Context, tld, doh, hostname string, superseded <-chan struct{}, found chan<- Records) {
-	dohCh := make(chan Records, 1)
-	go func() { dohCh <- r.lookupDoH(ctx, doh, hostname) }()
-
-	type vote struct {
-		nameserver    string
-		a             []netip.Addr
-		authoritative bool
-	}
+// The first round with authoritative consensus does not deliver; it opens the
+// recursive polls, and delivery waits for a round where the DoH endpoints —
+// the vantage a visitor resolves from — concur. Where no authoritative voice
+// has ever been heard, the first DoH endpoint to serve the record decides
+// alone.
+func (r *resolver) round(ctx context.Context, tld, hostname string, tally *tally, superseded <-chan struct{}, found chan<- Records) {
 	glue := delegation(ctx, tld, hostname, r.port)
-	votes := make(chan vote, len(glue))
+	doh := tally.recursivePolls(r.doh)
+	votes := make(chan vote, len(glue)+len(doh))
 	for _, ns := range glue {
-		go func() {
-			a, authoritative := lookupUDP(ctx, ns, hostname, dnsmessage.TypeA)
-			votes <- vote{nameserver: ns, a: a, authoritative: authoritative}
-		}()
+		go func() { votes <- lookupNameserver(ctx, ns, hostname) }()
+	}
+	for _, endpoint := range doh {
+		go func() { votes <- lookupDoH(ctx, endpoint, hostname) }()
 	}
 
 	var served vote
-	answered, lagging := 0, 0
+	var objectors []string
+	serving, authVoiced := 0, 0
 collect:
-	for range glue {
+	for range len(glue) + len(doh) {
 		select {
 		case v := <-votes:
-			if !v.authoritative {
-				continue // unreachable, or not the zone's nameserver: no vote
+			if !v.voiced {
+				continue
 			}
-			answered++
-			if len(v.a) == 0 {
-				lagging++
-			} else {
+			if !v.recursive {
+				authVoiced++
+			}
+			if len(v.a) > 0 {
+				serving++
 				served = v
+				tally.serve(v.source)
+			} else if !tally.hasServed(v.source) {
+				objectors = append(objectors, v.source)
 			}
 		case <-superseded:
 			break collect // the still-silent forfeit their vote
@@ -227,44 +273,106 @@ collect:
 		}
 	}
 
+	authHeard := tally.hearAuth(authVoiced)
 	switch {
-	case lagging > 0:
-		// No consensus: the record exists on some nameservers and not others
-		// (or none yet). Deliver nothing — including DoH's answer, which
-		// cannot outrank an authoritative "not yet" — and let a later round
-		// find the fleet in agreement.
-		r.log.Debug("authoritative nameservers lack consensus",
-			"hostname", hostname, "answered", answered, "lagging", lagging)
-	case answered > 0:
-		aaaa, _ := lookupUDP(ctx, served.nameserver, hostname, dnsmessage.TypeAAAA)
-		if deliver(found, Records{A: served.a, AAAA: aaaa}) {
-			r.log.Debug("authoritative nameservers agree the record is served",
-				"hostname", hostname, "answered", answered)
+	case serving > 0 && !authHeard:
+		// No authoritative voice exists on this network; the recursive
+		// endpoints are the only voices, and one serving the record is the
+		// best answer there is.
+		if deliver(found, Records{A: served.a, AAAA: served.aaaa}) {
+			r.log.Debug("doh endpoint serves the record", "hostname", hostname,
+				"source", served.source)
 		}
+	case serving > 0 && len(objectors) == 0:
+		if len(doh) == 0 {
+			// Authoritative consensus. Not delivered on: it opens the
+			// recursive polls, and a later round delivers once the visitor's
+			// vantage concurs.
+			tally.openPolls()
+			r.log.Debug("authoritative nameservers agree, polling recursive endpoints",
+				"hostname", hostname, "serving", serving)
+			return
+		}
+		if deliver(found, Records{A: served.a, AAAA: served.aaaa}) {
+			r.log.Debug("resolvers agree the record is served", "hostname", hostname,
+				"serving", serving, "source", served.source)
+		}
+	case len(objectors) > 0:
+		r.log.Debug("resolvers lack consensus", "hostname", hostname,
+			"serving", serving, "objecting", objectors)
 	default:
-		// No authoritative voice at all: intercepted or blocked port 53, or
-		// a TLD referral this network would not carry. DoH decides.
-		select {
-		case rec := <-dohCh:
-			if !rec.Empty() && deliver(found, rec) {
-				r.log.Debug("doh endpoint serves the record",
-					"hostname", hostname, "endpoint", doh)
-			}
-		case <-ctx.Done():
+		// Nothing voiced anything. If there is no authoritative voice to
+		// wait for, the recursive endpoints are the only ones left to ask.
+		if !authHeard {
+			tally.openPolls()
 		}
 	}
 }
 
-// lookupDoH asks one DoH endpoint for both address families. AA is not
-// expected here — the endpoint is a recursive resolver; what protects this
-// path is the transport, which a network intercepting port 53 cannot answer
-// for.
-func (r *resolver) lookupDoH(ctx context.Context, endpoint, hostname string) Records {
-	a := queryDoH(ctx, endpoint, hostname, dnsmessage.TypeA)
-	if len(a) == 0 {
-		return Records{}
+// recursivePolls returns the DoH endpoints to include in a round: none until
+// askDoH opens them.
+func (t *tally) recursivePolls(endpoints []string) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.askDoH {
+		return nil
 	}
-	return Records{A: a, AAAA: queryDoH(ctx, endpoint, hostname, dnsmessage.TypeAAAA)}
+	return endpoints
+}
+
+// serve latches source as having served the record.
+func (t *tally) serve(source string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.served[source] = true
+}
+
+// hasServed reports whether source has ever served the record this wait.
+func (t *tally) hasServed(source string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.served[source]
+}
+
+// hearAuth folds a round's count of authoritative voices into the tally and
+// reports whether any round has heard one.
+func (t *tally) hearAuth(voiced int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if voiced > 0 {
+		t.authHeard = true
+	}
+	return t.authHeard
+}
+
+// openPolls admits the DoH endpoints to later rounds.
+func (t *tally) openPolls() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.askDoH = true
+}
+
+// lookupNameserver casts one zone nameserver's vote. Only an AA reply is a
+// voice: the nameserver answering for itself, not a middlebox in its place.
+func lookupNameserver(ctx context.Context, ns, hostname string) vote {
+	a, authoritative := lookupUDP(ctx, ns, hostname, dnsmessage.TypeA)
+	v := vote{source: ns, a: a, voiced: authoritative}
+	if v.voiced && len(a) > 0 {
+		v.aaaa, _ = lookupUDP(ctx, ns, hostname, dnsmessage.TypeAAAA)
+	}
+	return v
+}
+
+// lookupDoH casts one DoH endpoint's vote. AA is not expected here — the
+// endpoint is a recursive resolver; what makes its voice trustworthy is the
+// transport, which a network intercepting port 53 cannot answer for.
+func lookupDoH(ctx context.Context, endpoint, hostname string) vote {
+	a, ok := queryDoH(ctx, endpoint, hostname, dnsmessage.TypeA)
+	v := vote{source: endpoint, a: a, voiced: ok, recursive: true}
+	if v.voiced && len(a) > 0 {
+		v.aaaa, _ = queryDoH(ctx, endpoint, hostname, dnsmessage.TypeAAAA)
+	}
+	return v
 }
 
 // deliver offers rec as the answer, reporting whether it was taken. Exactly

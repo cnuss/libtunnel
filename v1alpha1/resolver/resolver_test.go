@@ -294,6 +294,127 @@ func TestResolveWaitsForFleetConsensus(t *testing.T) {
 	}
 }
 
+// TestResolveWaitsForRecursiveVantage pins the DoH endpoints as voters, not
+// tie-breakers. The zone's own nameservers all serving the record proves the
+// authoritative fleet agrees — but a visitor resolves recursively, through
+// anycast nodes the authoritative view cannot see. Measured live on CI: full
+// authoritative consensus, and the client's resolver still answered AAAA-only
+// for A. A recursive endpoint that answers without the record is an objection
+// that holds readiness open until its view catches up.
+func TestResolveWaitsForRecursiveVantage(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+	var published atomic.Bool
+
+	zone := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	zoneAddr, zonePort := splitHostPort(t, zone)
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{zoneAddr})
+	})
+	laggard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query, err := io.ReadAll(io.LimitReader(r.Body, maxDNSMessage))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		if !published.Load() {
+			w.Write(answer(t, query, false, nil)) // answers, but has no record yet
+			return
+		}
+		w.Write(answer(t, query, false, []netip.Addr{want}))
+	}))
+	t.Cleanup(laggard.Close)
+
+	r := &resolver{tlds: []string{tld}, doh: []string{laggard.URL}, port: zonePort, log: discard()}
+
+	ctx := testCtx(t)
+	done := make(chan Records, 1)
+	go func() { done <- r.Resolve(ctx, "demo.trycloudflare.com") }()
+
+	select {
+	case rec := <-done:
+		t.Fatalf("Resolve() = %+v while a recursive endpoint still lacked the record", rec)
+	case <-time.After(600 * time.Millisecond):
+	}
+
+	published.Store(true)
+	select {
+	case rec := <-done:
+		if !slices.Equal(rec.A, []netip.Addr{want}) {
+			t.Errorf("A = %v, want %v once every voice serves it", rec.A, want)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Resolve never returned once the recursive endpoint caught up")
+	}
+}
+
+// TestResolveServedVoiceCannotUnserve pins the ratchet. A recursive fleet's
+// anycast nodes flap between fresh and stale views — measured live as all
+// three DoH endpoints alternating served and not-served for a full minute —
+// so unanimity within a single round may never happen. A voice that has
+// served the record once has proven the record reached it; when it later
+// flaps back to a stale view, that objection is spent. Two endpoints
+// objecting in opposite phase agree on no single round, and only the ratchet
+// lets their votes settle.
+func TestResolveServedVoiceCannotUnserve(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+
+	zone := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	zoneAddr, zonePort := splitHostPort(t, zone)
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{zoneAddr})
+	})
+
+	// Each endpoint alternates per A query — the AAAA follow-ups leave the
+	// phase alone — and the two start in opposite phase, so no round sees
+	// both serve at once.
+	flapper := func(startServing bool) string {
+		var calls atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			query, err := io.ReadAll(io.LimitReader(r.Body, maxDNSMessage))
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			var p dnsmessage.Parser
+			if _, err := p.Start(query); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			q, err := p.Question()
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			serving := q.Type == dnsmessage.TypeA && (calls.Add(1)%2 == 1) == startServing
+			w.Header().Set("Content-Type", "application/dns-message")
+			if serving {
+				w.Write(answer(t, query, false, []netip.Addr{want}))
+				return
+			}
+			w.Write(answer(t, query, false, nil))
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL
+	}
+
+	r := &resolver{
+		tlds: []string{tld},
+		doh:  []string{flapper(true), flapper(false)},
+		port: zonePort,
+		log:  discard(),
+	}
+
+	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
+	if !slices.Equal(rec.A, []netip.Addr{want}) {
+		t.Errorf("A = %v, want %v — flapping endpoints should settle through the ratchet", rec.A, want)
+	}
+}
+
 // TestResolveSilentNameserverForfeitsVote pins the escape from consensus: a
 // nameserver that never answers cannot hold readiness hostage. When the next
 // round starts, the still-silent forfeit their vote and the nameservers that
@@ -398,7 +519,7 @@ func TestResolveReturnsEmptyWhenCtxEnds(t *testing.T) {
 func TestDoHRequestIsUncacheable(t *testing.T) {
 	endpoint, seen := serveDoH(t, []netip.Addr{netip.MustParseAddr("1.2.3.4")})
 
-	if addrs := queryDoH(testCtx(t), endpoint, "demo.trycloudflare.com", dnsmessage.TypeA); len(addrs) == 0 {
+	if addrs, ok := queryDoH(testCtx(t), endpoint, "demo.trycloudflare.com", dnsmessage.TypeA); !ok || len(addrs) == 0 {
 		t.Fatal("queryDoH returned nothing from a live stub")
 	}
 	if len(*seen) == 0 {

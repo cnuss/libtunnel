@@ -100,15 +100,16 @@ func exchangeUDP(ctx context.Context, server string, query []byte) ([]byte, erro
 	return buf[:n], nil
 }
 
-// queryDoH asks one DoH endpoint for hostname's records of type qtype,
-// returning nil for any failure — a caller distinguishes sources by whether
-// they produced records, not by why they did not.
-func queryDoH(ctx context.Context, endpoint, hostname string, qtype dnsmessage.Type) []netip.Addr {
+// queryDoH asks one DoH endpoint for hostname's records of type qtype. The
+// bool reports whether the endpoint answered at all: a clean reply without
+// records — a name not published there yet — is an answer, while a transport
+// failure or a malformed reply is not.
+func queryDoH(ctx context.Context, endpoint, hostname string, qtype dnsmessage.Type) ([]netip.Addr, bool) {
 	// Recursion is desired: a DoH endpoint is a recursive resolver, and asking
 	// it not to recurse leaves it able to answer only from its own cache.
 	query, err := buildQuery(hostname, qtype, true)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 
 	// POST carries the query as the body, so it needs neither the base64url
@@ -117,7 +118,7 @@ func queryDoH(ctx context.Context, endpoint, hostname string, qtype dnsmessage.T
 	// itself for a fresh answer.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(query))
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
@@ -125,22 +126,22 @@ func queryDoH(ctx context.Context, endpoint, hostname string, qtype dnsmessage.T
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil
+		return nil, false
 	}
 
 	wire, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSMessage))
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	addrs, _, err := parseAnswer(wire, qtype)
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	return addrs
+	return addrs, true
 }
 
 // buildQuery encodes a single A or AAAA question in DNS wire format.

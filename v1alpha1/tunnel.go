@@ -668,13 +668,13 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 // The wait that closes it is started by WithListener and gated on
 // hostnameProvided, so this is a pure accessor — select on it (and on Done).
 //
-// Readiness never consults anything that caches: package resolver asks the
-// zone's own nameservers directly (trusting only authoritative replies) and
-// fires once they agree the A record is served — one nameserver still without
-// it holds readiness open, because a visitor's resolver could hit that one
-// and cache the negative. Independent DoH endpoints decide only on networks
-// where the nameservers cannot be reached at all. Never a stale answer from a
-// recursive resolver's cache, least of all this machine's.
+// Readiness is consensus across every resolving voice package resolver can
+// hear: the zone's own nameservers (trusting only authoritative replies) and
+// independent DoH endpoints, which see the record from the recursive vantage
+// a visitor actually resolves through. It fires once someone serves the A
+// record and nobody answers without it — one voice still missing the record
+// holds readiness open, because a visitor's resolver could hit that one and
+// cache the negative. The machine's own resolver is never asked.
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	return t.hostnameReady
 }
