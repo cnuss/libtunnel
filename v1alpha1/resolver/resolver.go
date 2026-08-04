@@ -51,58 +51,38 @@ type Resolver interface {
 	Resolve(hostname string) Records
 }
 
-// defaultResolver resolves through the system resolver. It is the last resort,
-// used only when every other path has failed to produce records — its answers
-// may come from any cache the machine is configured to use.
-type defaultResolver struct {
-}
-
-var _ Resolver = &defaultResolver{}
-
-// Resolve implements [Resolver] using the system resolver.
-func (r *defaultResolver) Resolve(hostname string) Records {
-	records := Records{
-		CNAME: hostname,
-	}
-	// The families are looked up independently: a host with only A records
-	// fails the AAAA lookup, and that must not discard the A records.
-	records.A = lookupVia(net.DefaultResolver, "ip4", hostname)
-	records.AAAA = lookupVia(net.DefaultResolver, "ip6", hostname)
-	return records
-}
-
-// lookupVia resolves one address family through r, returning nil for any
-// failure — a name that does not resolve and a lookup that broke are the same
-// answer to the caller: no records.
-func lookupVia(r *net.Resolver, network, hostname string) []netip.Addr {
-	ips, err := r.LookupIP(context.Background(), network, hostname)
-	if err != nil {
-		return nil
-	}
-	var addrs []netip.Addr
-	for _, ip := range ips {
-		// Parsed rather than asserted: a malformed address is skipped instead
-		// of panicking a caller's process.
-		if addr, ok := netip.AddrFromSlice(ip); ok {
-			addrs = append(addrs, addr.Unmap())
-		}
-	}
-	return addrs
-}
-
 // NewResolver returns the resolver best suited to the current network.
 //
 // Where DNS is trustworthy, nameservers are queried directly: their answers
 // come from the zone itself and so cannot be a stale negative. Where it is not
 // — see isHijacked — that path cannot be relied on, and lookups go out over
 // DoH instead, which a network intercepting port 53 is not in a position to
-// answer for.
+// answer for. A direct walk that comes back with nothing falls through to DoH
+// as well: the two fail for unrelated reasons, so one answering is worth more
+// than either verdict alone.
+//
+// Neither path ends at the system resolver, and that is the point. It is the
+// one participant that caches, so asking it about a name that is not published
+// yet is what fixes a negative in place for the length of the zone's SOA — on
+// the very resolver the calling process will use to reach the hostname once it
+// does resolve. The system resolver can only return an answer these two could
+// already get, or a negative that outlives its truth. Where neither of them
+// sees the name, "not published yet" is the honest answer, and empty Records
+// say exactly that.
 //
 // The choice is made per call rather than once, because a machine moves between
 // networks and a resolver chosen for the previous one would be wrong.
 func NewResolver() Resolver {
+	dohResolver := &dohResolver{
+		servers: []string{
+			"https://cloudflare-dns.com/dns-query",
+			"https://dns.google/dns-query",
+			"https://dns.quad9.net/dns-query",
+		},
+	}
+
 	netResolver := &netResolver{
-		fallback: &defaultResolver{},
+		fallback: dohResolver,
 		servers: []string{
 			"a.gtld-servers.net",
 			"b.gtld-servers.net",
@@ -118,15 +98,6 @@ func NewResolver() Resolver {
 			"l.gtld-servers.net",
 			"m.gtld-servers.net",
 		}}
-
-	dohResolver := &dohResolver{
-		fallback: netResolver,
-		servers: []string{
-			"https://cloudflare-dns.com/dns-query",
-			"https://dns.google/dns-query",
-			"https://dns.quad9.net/dns-query",
-		},
-	}
 
 	if isHijacked(netResolver.servers) {
 		return dohResolver

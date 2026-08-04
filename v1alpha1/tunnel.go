@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1/resolver"
@@ -280,6 +281,12 @@ var newResolver = func() *atomic.Pointer[resolverFactory] {
 	return &p
 }()
 
+// resolveInterval paces the wait for the hostname's record to be published.
+// The resolvers behind it neither cache nor are cached by anything on this
+// machine, so asking again costs one query and can never fix a negative in
+// place — the property that makes polling safe here at all.
+const resolveInterval = time.Second
+
 // backend (nil engine, tunnel born canceled — see New) it does nothing.
 func (t *TunnelImpl[T]) start(connect func() error) {
 	if t.engine == nil {
@@ -295,8 +302,24 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 		}
 
 		t.Logger().Info("tunnel connected, waiting for DNS")
-		rec := (*newResolver.Load())().Resolve(t.Hostname())
-		t.markHostnameReady(t.Hostname(), rec)
+		hostname := t.Hostname()
+		// Resolved repeatedly, not once: the edge publishes the record moments
+		// after the connection registers, so the first lookup ordinarily races
+		// it and empty Records mean "not yet" rather than "never". The resolver
+		// is chosen once for the wait — the choice reads the network (see
+		// isHijacked) and the network does not change over the seconds this
+		// takes.
+		resolve := (*newResolver.Load())()
+		rec := resolve.Resolve(hostname)
+		for rec.Empty() {
+			select {
+			case <-t.ctx.Done():
+				return
+			case <-time.After(resolveInterval):
+			}
+			rec = resolve.Resolve(hostname)
+		}
+		t.markHostnameReady(hostname, rec)
 
 		t.Logger().Info("tunnel is ready")
 		close(t.tunnelReady)

@@ -22,11 +22,13 @@ import (
 // alternative on these networks is an answer from something worse. servers are
 // tried in a random order and each is a different operator, so a stale negative
 // held by one does not decide the result.
+//
+// It is the end of every chain: there is nothing further worth asking that
+// would not cache the answer on the machine itself (see NewResolver). Where it
+// finds nothing, the hostname is not published yet.
 type dohResolver struct {
 	// servers are RFC 8484 endpoints, tried in random order.
 	servers []string
-	// fallback resolves the hostname when no server returns records.
-	fallback Resolver
 }
 
 var _ Resolver = &dohResolver{}
@@ -36,7 +38,7 @@ var _ Resolver = &dohResolver{}
 const dohTimeout = 5 * time.Second
 
 // Resolve implements [Resolver]. It asks each server in turn for A and AAAA
-// records and returns the first non-empty answer, falling back when none of
+// records and returns the first non-empty answer, or empty Records when none of
 // them resolves the hostname.
 func (r *dohResolver) Resolve(hostname string) Records {
 	records := Records{
@@ -47,15 +49,12 @@ func (r *dohResolver) Resolve(hostname string) Records {
 		records.A = queryDoH(server, hostname, dnsmessage.TypeA)
 		records.AAAA = queryDoH(server, hostname, dnsmessage.TypeAAAA)
 
-		if len(records.A) > 0 || len(records.AAAA) > 0 {
+		if !records.Empty() {
 			return records
 		}
-
-		// If we didn't get any records, wait a second before trying the next server
-		time.Sleep(1 * time.Second)
 	}
 
-	return r.fallback.Resolve(hostname)
+	return records
 }
 
 // queryDoH asks one DoH endpoint for hostname's records of type qtype,

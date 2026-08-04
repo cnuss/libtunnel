@@ -95,8 +95,7 @@ func TestDoHResolvesBothFamilies(t *testing.T) {
 	v6 := netip.MustParseAddr("2606:4700::6810:e684")
 	endpoint, _ := serveDoH(t, []netip.Addr{v4, v6})
 
-	fallback := &stubResolver{}
-	r := &dohResolver{servers: []string{endpoint}, fallback: fallback}
+	r := &dohResolver{servers: []string{endpoint}}
 
 	rec := r.Resolve("demo.trycloudflare.com")
 	if !slices.Equal(rec.A, []netip.Addr{v4}) {
@@ -108,9 +107,6 @@ func TestDoHResolvesBothFamilies(t *testing.T) {
 	if rec.CNAME != "demo.trycloudflare.com" {
 		t.Errorf("CNAME = %q", rec.CNAME)
 	}
-	if fallback.called {
-		t.Error("fallback used despite the server answering")
-	}
 }
 
 // TestDoHRequestIsUncacheable pins the request shape. Readiness asks the same
@@ -119,7 +115,7 @@ func TestDoHResolvesBothFamilies(t *testing.T) {
 // are not cached, and Cache-Control asks the endpoint for a fresh answer.
 func TestDoHRequestIsUncacheable(t *testing.T) {
 	endpoint, seen := serveDoH(t, []netip.Addr{netip.MustParseAddr("1.2.3.4")})
-	r := &dohResolver{servers: []string{endpoint}, fallback: &stubResolver{}}
+	r := &dohResolver{servers: []string{endpoint}}
 	r.Resolve("demo.trycloudflare.com")
 
 	if len(*seen) == 0 {
@@ -141,21 +137,18 @@ func TestDoHRequestIsUncacheable(t *testing.T) {
 	}
 }
 
-// TestDoHFallsBackWhenNothingResolves pins the chain: a server that answers
-// with no records is not an answer, and the fallback decides.
-func TestDoHFallsBackWhenNothingResolves(t *testing.T) {
+// TestDoHEndsTheChain pins DoH as terminal: when no server produces records the
+// answer is empty Records, not a lookup through the machine's own resolver. That
+// resolver is the only one that caches, and asking it about a name that is not
+// published yet is what fixes a negative in place for the zone's SOA -- on the
+// very resolver the calling process will use once the name does resolve.
+func TestDoHEndsTheChain(t *testing.T) {
 	endpoint, _ := serveDoH(t, nil) // answers, but with no records
 
-	want := netip.MustParseAddr("9.9.9.9")
-	fallback := &stubResolver{records: Records{A: []netip.Addr{want}}}
-	r := &dohResolver{servers: []string{endpoint}, fallback: fallback}
+	r := &dohResolver{servers: []string{endpoint}}
 
-	rec := r.Resolve("demo.trycloudflare.com")
-	if !fallback.called {
-		t.Fatal("fallback not used when no server produced records")
-	}
-	if !slices.Equal(rec.A, []netip.Addr{want}) {
-		t.Errorf("A = %v, want the fallback's %v", rec.A, want)
+	if rec := r.Resolve("demo.trycloudflare.com"); !rec.Empty() {
+		t.Errorf("Resolve() = %+v, want empty Records", rec)
 	}
 }
 
@@ -165,18 +158,11 @@ func TestDoHIgnoresUnreachableServer(t *testing.T) {
 	want := netip.MustParseAddr("104.16.230.132")
 	live, _ := serveDoH(t, []netip.Addr{want})
 
-	fallback := &stubResolver{}
-	r := &dohResolver{
-		servers:  []string{"http://127.0.0.1:1/dns-query", live},
-		fallback: fallback,
-	}
+	r := &dohResolver{servers: []string{"http://127.0.0.1:1/dns-query", live}}
 
 	rec := r.Resolve("demo.trycloudflare.com")
 	if !slices.Equal(rec.A, []netip.Addr{want}) {
 		t.Errorf("A = %v, want %v from the reachable server", rec.A, want)
-	}
-	if fallback.called {
-		t.Error("fallback used despite a reachable server answering")
 	}
 }
 
