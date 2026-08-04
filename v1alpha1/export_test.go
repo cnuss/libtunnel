@@ -1,7 +1,6 @@
 package v1alpha1
 
 import (
-	"log/slog"
 	"time"
 
 	"github.com/cnuss/libtunnel/v1alpha1/resolver"
@@ -14,7 +13,7 @@ import (
 // concurrent tests read the same hook.
 func SetResolver(r resolver.Resolver) (restore func()) {
 	prev := newResolver.Load()
-	next := resolverFactory(func(*slog.Logger) resolver.Resolver { return r })
+	next := resolverFactory(func() resolver.Resolver { return r })
 	newResolver.Store(&next)
 	return func() { newResolver.Store(prev) }
 }

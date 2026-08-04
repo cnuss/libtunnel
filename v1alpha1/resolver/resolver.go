@@ -14,16 +14,15 @@
 // resolvers all answer DNS on the machine's behalf. isHijacked detects that,
 // and where it holds, lookups go out over DoH instead.
 //
-// The machine's resolver is not avoided, though — a caller connects through it,
-// so readiness it cannot see is readiness a caller cannot use. It is asked
-// last, and only once one of the above has shown the record exists, which is
-// the difference between a query it can answer and one that poisons it. See
-// confirmedResolver.
+// The machine's own resolver is never asked, by any path here. It is the only
+// participant that caches, and one query about a name that does not exist yet
+// costs the calling process its ability to reach that hostname for the length of
+// the zone's SOA. Readiness reports what the zone serves; connecting is the
+// caller's, through whatever resolver it uses.
 package resolver
 
 import (
 	"context"
-	"log/slog"
 	"math/rand"
 	"net"
 	"net/netip"
@@ -58,108 +57,6 @@ type Resolver interface {
 	Resolve(hostname string) Records
 }
 
-// systemResolver resolves through the machine's own resolver — the one the
-// calling process will use to reach the hostname. It is never asked first; see
-// confirmedResolver for why the order is the whole design.
-type systemResolver struct {
-}
-
-var _ Resolver = &systemResolver{}
-
-// Resolve implements [Resolver] using the system resolver.
-func (r *systemResolver) Resolve(hostname string) Records {
-	records := Records{
-		CNAME: hostname,
-	}
-	// The families are looked up independently: a host with only A records
-	// fails the AAAA lookup, and that must not discard the A records.
-	records.A = lookupVia(net.DefaultResolver, "ip4", hostname)
-	records.AAAA = lookupVia(net.DefaultResolver, "ip6", hostname)
-	return records
-}
-
-// systemLookupTimeout bounds one system-resolver lookup. Deliberately not
-// queryTimeout: that one paces direct UDP queries to a nameserver that already
-// holds the answer, tens of milliseconds' work. This is a recursive resolve of a
-// name minted moments ago, so the resolver has nothing cached and must walk to
-// the authority itself, on a machine that may be loaded. Borrowing the tighter
-// bound made a family fail on a busy CI runner and readiness report the other
-// one alone.
-const systemLookupTimeout = 10 * time.Second
-
-// lookupVia resolves one address family through r, returning nil for any
-// failure — a name that does not resolve and a lookup that broke are the same
-// answer to the caller: no records.
-func lookupVia(r *net.Resolver, network, hostname string) []netip.Addr {
-	// Bounded: the caller polls, and an unbounded lookup here would park the
-	// readiness wait somewhere its own deadline cannot see.
-	ctx, cancel := context.WithTimeout(context.Background(), systemLookupTimeout)
-	defer cancel()
-
-	ips, err := r.LookupIP(ctx, network, hostname)
-	if err != nil {
-		return nil
-	}
-	var addrs []netip.Addr
-	for _, ip := range ips {
-		// Parsed rather than asserted: a malformed address is skipped instead
-		// of panicking a caller's process.
-		if addr, ok := netip.AddrFromSlice(ip); ok {
-			addrs = append(addrs, addr.Unmap())
-		}
-	}
-	return addrs
-}
-
-// confirmedResolver reports a hostname resolved only once the machine's own
-// resolver resolves it too, and asks that resolver only after source has said
-// the record exists.
-//
-// Both halves are load-bearing. Callers reach the hostname through the system
-// resolver, so readiness that only a direct nameserver query can see is a
-// readiness the caller cannot act on — it hands back a URL that does not
-// resolve. And the system resolver is the one participant that caches, so a
-// query made before the record exists fixes an NXDOMAIN in place for the length
-// of the zone's SOA — 30 minutes for the zones here — which no amount of
-// retrying afterwards can shorten. Asking it early is not a slow answer, it is
-// a wrong one that outlives the truth.
-//
-// Ordering resolves the tension. source cannot cache anything, so it is free to
-// ask as often as it likes; once it has records the name demonstrably exists,
-// and a query to the system resolver then is one that can be answered rather
-// than one that poisons. Until both agree the answer is empty Records, which
-// the caller polls on.
-type confirmedResolver struct {
-	// source establishes that the record exists, without caching.
-	source Resolver
-	// system is the resolver the calling process will use.
-	system Resolver
-	// log reports which of the two is holding a wait up. The two failures want
-	// opposite responses — an unpublished record resolves itself, a system
-	// resolver that will not see a published one does not — and they are
-	// indistinguishable from the empty Records both produce.
-	log *slog.Logger
-}
-
-var _ Resolver = &confirmedResolver{}
-
-// Resolve implements [Resolver], returning the addresses the machine's own
-// resolver gives — the ones a caller will actually connect to.
-func (c *confirmedResolver) Resolve(hostname string) Records {
-	if c.source.Resolve(hostname).Empty() {
-		// Not published yet. Asking the system resolver now is what would
-		// poison it, so it is not asked.
-		c.log.Debug("hostname not published yet", "hostname", hostname)
-		return Records{CNAME: hostname}
-	}
-	records := c.system.Resolve(hostname)
-	if records.Empty() {
-		c.log.Debug("hostname published, but the system resolver does not see it yet",
-			"hostname", hostname)
-	}
-	return records
-}
-
 // NewResolver returns the resolver best suited to the current network.
 //
 // Where DNS is trustworthy, nameservers are queried directly: their answers
@@ -170,19 +67,17 @@ func (c *confirmedResolver) Resolve(hostname string) Records {
 // as well: the two fail for unrelated reasons, so one answering is worth more
 // than either verdict alone.
 //
-// Whichever is chosen answers only the question "does this record exist yet",
-// which is not the question a caller has: it connects through the system
-// resolver. So the choice is wrapped in a confirmedResolver, which asks that
-// resolver too — and, decisively, only once the record has been shown to exist.
-// Where neither has the name, "not published yet" is the honest answer, and
-// empty Records say exactly that.
+// Neither path ends at the machine's own resolver, and nothing here ever asks
+// it. It is the only participant that caches, so a query about a name that is
+// not published yet fixes an NXDOMAIN in place for the length of the zone's SOA
+// — 30 minutes for the zones here — on the very resolver the calling process
+// will use to reach the hostname. Readiness is not worth burning that. Where
+// neither path has the name, "not published yet" is the honest answer, and empty
+// Records say exactly that.
 //
 // The choice is made per call rather than once, because a machine moves between
 // networks and a resolver chosen for the previous one would be wrong.
-//
-// log reports, at debug, which half of a wait is unfinished — see
-// confirmedResolver. It must not be nil.
-func NewResolver(log *slog.Logger) Resolver {
+func NewResolver() Resolver {
 	dohResolver := &dohResolver{
 		servers: []string{
 			"https://cloudflare-dns.com/dns-query",
@@ -209,12 +104,11 @@ func NewResolver(log *slog.Logger) Resolver {
 			"m.gtld-servers.net",
 		}}
 
-	source := Resolver(netResolver)
 	if isHijacked(netResolver.servers) {
-		source = dohResolver
+		return dohResolver
 	}
 
-	return &confirmedResolver{source: source, system: &systemResolver{}, log: log}
+	return netResolver
 }
 
 // shuffled returns a random permutation of servers, so no one server carries
