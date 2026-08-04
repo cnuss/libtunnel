@@ -670,9 +670,11 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 //
 // Readiness never consults anything that caches: package resolver asks the
 // zone's own nameservers directly (trusting only authoritative replies) and
-// independent DoH endpoints, and fires as soon as either serves an A record —
-// never a stale answer from a recursive resolver's cache, least of all this
-// machine's.
+// fires once they agree the A record is served — one nameserver still without
+// it holds readiness open, because a visitor's resolver could hit that one
+// and cache the negative. Independent DoH endpoints decide only on networks
+// where the nameservers cannot be reached at all. Never a stale answer from a
+// recursive resolver's cache, least of all this machine's.
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	return t.hostnameReady
 }

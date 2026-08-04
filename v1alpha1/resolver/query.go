@@ -21,18 +21,13 @@ const maxUDPResponse = 1232
 // message at 64 KiB, so nothing larger is a DNS message.
 const maxDNSMessage = 1 << 16
 
-// nameserverPort is where glue addresses are dialed. Glue carries an address
-// and no port, so it is always 53 in practice; it is a variable only so tests
-// can point the walk at a stub.
-var nameserverPort = "53"
-
 // delegation asks server which nameservers hold hostname's zone and returns
-// their addresses, taken from the glue the referral carries.
+// their addresses, taken from the glue the referral carries, joined with port.
 //
 // The glue is used rather than the nameserver names: resolving those names
 // would mean asking a recursive resolver, which is the thing this path exists
 // to avoid.
-func delegation(ctx context.Context, server, hostname string) []string {
+func delegation(ctx context.Context, server, hostname, port string) []string {
 	query, err := buildQuery(hostname, dnsmessage.TypeA, false)
 	if err != nil {
 		return nil
@@ -48,7 +43,7 @@ func delegation(ctx context.Context, server, hostname string) []string {
 
 	servers := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
-		servers = append(servers, net.JoinHostPort(addr.String(), nameserverPort))
+		servers = append(servers, net.JoinHostPort(addr.String(), port))
 	}
 	// Randomized so one nameserver does not carry every lookup.
 	return shuffled(servers)

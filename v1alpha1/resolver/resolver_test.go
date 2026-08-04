@@ -130,10 +130,17 @@ func referral(t *testing.T, query []byte, glue []netip.Addr) []byte {
 // serveUDP stands up a UDP DNS server that replies with handler's wire
 // response, and returns its host:port.
 func serveUDP(t *testing.T, handler func(query []byte) []byte) string {
+	return serveUDPOn(t, "udp", "127.0.0.1:0", handler)
+}
+
+// serveUDPOn is serveUDP bound to a specific network and address — how a test
+// stands up a second nameserver: loopback has one IPv4 address, so the second
+// listens on [::1] at the same port and the referral's glue carries both.
+func serveUDPOn(t *testing.T, network, address string, handler func(query []byte) []byte) string {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	pc, err := net.ListenPacket(network, address)
 	if err != nil {
-		t.Fatal(err)
+		t.Skipf("cannot listen on %s %s: %v", network, address, err)
 	}
 	t.Cleanup(func() { pc.Close() })
 
@@ -181,18 +188,6 @@ func splitHostPort(t *testing.T, hostport string) (netip.Addr, string) {
 	return ap.Addr(), strconv.Itoa(int(ap.Port()))
 }
 
-// glueTo repoints nameserverPort at hostport's port for the duration of the
-// test and returns its address, so a referral can carry loopback glue that the
-// walk then dials on the stub's port.
-func glueTo(t *testing.T, hostport string) netip.Addr {
-	t.Helper()
-	addr, port := splitHostPort(t, hostport)
-	restore := nameserverPort
-	nameserverPort = port
-	t.Cleanup(func() { nameserverPort = restore })
-	return addr
-}
-
 // TestResolveWalksDelegation pins the direct path: a TLD server hands back
 // glue, and the zone's own nameserver — answering authoritatively — supplies
 // the records. Neither step touches a recursive resolver, so neither can serve
@@ -204,12 +199,12 @@ func TestResolveWalksDelegation(t *testing.T) {
 	zone := serveUDP(t, func(query []byte) []byte {
 		return answer(t, query, true, []netip.Addr{v4, v6})
 	})
-	zoneAddr := glueTo(t, zone)
+	zoneAddr, zonePort := splitHostPort(t, zone)
 	tld := serveUDP(t, func(query []byte) []byte {
 		return referral(t, query, []netip.Addr{zoneAddr})
 	})
 
-	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, log: discard()}
+	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, port: zonePort, log: discard()}
 
 	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
 	if !slices.Equal(rec.A, []netip.Addr{v4}) {
@@ -233,17 +228,99 @@ func TestResolveDiscardsNonAuthoritativeAnswers(t *testing.T) {
 	middlebox := serveUDP(t, func(query []byte) []byte {
 		return answer(t, query, false, []netip.Addr{poison})
 	})
-	middleAddr := glueTo(t, middlebox)
+	middleAddr, middlePort := splitHostPort(t, middlebox)
 	tld := serveUDP(t, func(query []byte) []byte {
 		return referral(t, query, []netip.Addr{middleAddr})
 	})
 	doh, _ := serveDoH(t, []netip.Addr{honest})
 
-	r := &resolver{tlds: []string{tld}, doh: []string{doh}, log: discard()}
+	r := &resolver{tlds: []string{tld}, doh: []string{doh}, port: middlePort, log: discard()}
 
 	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
 	if !slices.Equal(rec.A, []netip.Addr{honest}) {
 		t.Errorf("A = %v, want DoH's %v — a non-authoritative answer was believed", rec.A, honest)
+	}
+}
+
+// TestResolveWaitsForFleetConsensus pins the consensus rule. The record
+// propagates across the zone's nameservers asynchronously; readiness on the
+// first sighting releases a caller whose own resolver can still hit the
+// lagging nameserver and cache the negative this package exists to avoid.
+// Measured live: a CI runner's readiness fired off one nameserver while
+// another still lacked the A record, and the example's client — asking its
+// machine's resolver like any visitor — got AAAA-only for the rest of the
+// run. So an authoritative "not yet" from any nameserver holds readiness
+// open until the whole fleet serves the record.
+func TestResolveWaitsForFleetConsensus(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+	var published atomic.Bool
+
+	prompt := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	promptAddr, port := splitHostPort(t, prompt)
+	laggard := serveUDPOn(t, "udp6", "[::1]:"+port, func(query []byte) []byte {
+		if !published.Load() {
+			return answer(t, query, true, nil) // authoritative "not yet"
+		}
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	laggardAddr, _ := splitHostPort(t, laggard)
+
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{promptAddr, laggardAddr})
+	})
+
+	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, port: port, log: discard()}
+
+	ctx := testCtx(t)
+	done := make(chan Records, 1)
+	go func() { done <- r.Resolve(ctx, "demo.trycloudflare.com") }()
+
+	select {
+	case rec := <-done:
+		t.Fatalf("Resolve() = %+v while a nameserver still lacked the record", rec)
+	case <-time.After(600 * time.Millisecond):
+	}
+
+	published.Store(true)
+	select {
+	case rec := <-done:
+		if !slices.Equal(rec.A, []netip.Addr{want}) {
+			t.Errorf("A = %v, want %v once the fleet agrees", rec.A, want)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Resolve never returned once every nameserver served the record")
+	}
+}
+
+// TestResolveSilentNameserverForfeitsVote pins the escape from consensus: a
+// nameserver that never answers cannot hold readiness hostage. When the next
+// round starts, the still-silent forfeit their vote and the nameservers that
+// did answer decide.
+func TestResolveSilentNameserverForfeitsVote(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+
+	prompt := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	promptAddr, port := splitHostPort(t, prompt)
+	silent := serveUDPOn(t, "udp6", "[::1]:"+port, func([]byte) []byte { return nil })
+	silentAddr, _ := splitHostPort(t, silent)
+
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{promptAddr, silentAddr})
+	})
+
+	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, port: port, log: discard()}
+
+	start := time.Now()
+	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
+	if !slices.Equal(rec.A, []netip.Addr{want}) {
+		t.Errorf("A = %v, want %v from the nameserver that answered", rec.A, want)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("Resolve took %s — a silent nameserver held the verdict", elapsed)
 	}
 }
 
@@ -280,12 +357,12 @@ func TestResolveKeepsAskingUntilPublished(t *testing.T) {
 		}
 		return answer(t, query, true, []netip.Addr{want})
 	})
-	zoneAddr := glueTo(t, zone)
+	zoneAddr, zonePort := splitHostPort(t, zone)
 	tld := serveUDP(t, func(query []byte) []byte {
 		return referral(t, query, []netip.Addr{zoneAddr})
 	})
 
-	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, log: discard()}
+	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, port: zonePort, log: discard()}
 
 	time.AfterFunc(300*time.Millisecond, func() { published.Store(true) })
 	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
