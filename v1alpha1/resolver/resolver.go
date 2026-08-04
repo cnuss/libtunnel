@@ -23,6 +23,7 @@ package resolver
 
 import (
 	"context"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/netip"
@@ -77,8 +78,13 @@ type Resolver interface {
 //
 // The choice is made per call rather than once, because a machine moves between
 // networks and a resolver chosen for the previous one would be wrong.
-func NewResolver() Resolver {
+//
+// log records, at debug, which path was chosen and what each attempt found. A
+// hostname that will not resolve looks identical from outside whichever way it
+// fails, and these are the only lines that say which. It must not be nil.
+func NewResolver(log *slog.Logger) Resolver {
 	dohResolver := &dohResolver{
+		log: log,
 		servers: []string{
 			"https://cloudflare-dns.com/dns-query",
 			"https://dns.google/dns-query",
@@ -87,6 +93,7 @@ func NewResolver() Resolver {
 	}
 
 	netResolver := &netResolver{
+		log:      log,
 		fallback: dohResolver,
 		servers: []string{
 			"a.gtld-servers.net",
@@ -104,10 +111,12 @@ func NewResolver() Resolver {
 			"m.gtld-servers.net",
 		}}
 
-	if isHijacked(netResolver.servers) {
+	if isHijacked(log, netResolver.servers) {
+		log.Debug("dns interception detected, resolving over DoH", "servers", len(dohResolver.servers))
 		return dohResolver
 	}
 
+	log.Debug("dns carries direct queries, walking the delegation", "servers", len(netResolver.servers))
 	return netResolver
 }
 
@@ -153,7 +162,7 @@ func dnsName(hostname string) string {
 //
 // The result is not cached: a laptop changes networks, and a stale verdict
 // would route every later lookup down the wrong path.
-func isHijacked(servers []string) bool {
+func isHijacked(log *slog.Logger, servers []string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), hijackProbeTimeout)
 	defer cancel()
 	ctx, cancel = context.WithCancel(ctx)
@@ -168,6 +177,7 @@ func isHijacked(servers []string) bool {
 			return false
 		}
 	}
+	log.Debug("no configured nameserver answered authoritatively", "probed", len(servers), "within", hijackProbeTimeout)
 	return true
 }
 

@@ -269,7 +269,7 @@ func (t *TunnelImpl[T]) provideURL(u *url.URL) {
 // it — then dial the edge via connect (which blocks until the connection is
 // up) and close tunnelReady once DNS readiness lands too. On a foreign
 // resolverFactory builds the resolver used for hostname readiness.
-type resolverFactory = func() resolver.Resolver
+type resolverFactory = func(*slog.Logger) resolver.Resolver
 
 // newResolver holds that constructor as a swappable hook. It is atomic because
 // tests replace it (SetResolver) while background start goroutines from other
@@ -325,7 +325,7 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 		// is chosen once for the wait — the choice reads the network (see
 		// isHijacked) and the network does not change over the seconds this
 		// takes.
-		resolve := (*newResolver.Load())()
+		resolve := (*newResolver.Load())(t.Logger())
 		timeout := time.Duration(resolveTimeout.Load())
 		giveUp := time.After(timeout)
 		rec := resolve.Resolve(hostname)
@@ -341,7 +341,6 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 				return
 			case <-time.After(resolveInterval):
 			}
-			t.Logger().Debug("hostname not published yet", "hostname", hostname)
 			rec = resolve.Resolve(hostname)
 		}
 		t.markHostnameReady(hostname, rec)

@@ -3,6 +3,7 @@ package resolver
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,10 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 )
+
+// discard is the logger the resolvers under test write to: their debug lines are
+// diagnostic detail for a live run, not behaviour to pin.
+func discard() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 // stubResolver stands in for a Resolver in fallback chains, recording whether
 // it was reached.
@@ -95,7 +100,7 @@ func TestDoHResolvesBothFamilies(t *testing.T) {
 	v6 := netip.MustParseAddr("2606:4700::6810:e684")
 	endpoint, _ := serveDoH(t, []netip.Addr{v4, v6})
 
-	r := &dohResolver{servers: []string{endpoint}}
+	r := &dohResolver{servers: []string{endpoint}, log: discard()}
 
 	rec := r.Resolve("demo.trycloudflare.com")
 	if !slices.Equal(rec.A, []netip.Addr{v4}) {
@@ -115,7 +120,7 @@ func TestDoHResolvesBothFamilies(t *testing.T) {
 // are not cached, and Cache-Control asks the endpoint for a fresh answer.
 func TestDoHRequestIsUncacheable(t *testing.T) {
 	endpoint, seen := serveDoH(t, []netip.Addr{netip.MustParseAddr("1.2.3.4")})
-	r := &dohResolver{servers: []string{endpoint}}
+	r := &dohResolver{servers: []string{endpoint}, log: discard()}
 	r.Resolve("demo.trycloudflare.com")
 
 	if len(*seen) == 0 {
@@ -145,7 +150,7 @@ func TestDoHRequestIsUncacheable(t *testing.T) {
 func TestDoHEndsTheChain(t *testing.T) {
 	endpoint, _ := serveDoH(t, nil) // answers, but with no records
 
-	r := &dohResolver{servers: []string{endpoint}}
+	r := &dohResolver{servers: []string{endpoint}, log: discard()}
 
 	if rec := r.Resolve("demo.trycloudflare.com"); !rec.Empty() {
 		t.Errorf("Resolve() = %+v, want empty Records", rec)
@@ -158,7 +163,7 @@ func TestDoHIgnoresUnreachableServer(t *testing.T) {
 	want := netip.MustParseAddr("104.16.230.132")
 	live, _ := serveDoH(t, []netip.Addr{want})
 
-	r := &dohResolver{servers: []string{"http://127.0.0.1:1/dns-query", live}}
+	r := &dohResolver{servers: []string{"http://127.0.0.1:1/dns-query", live}, log: discard()}
 
 	rec := r.Resolve("demo.trycloudflare.com")
 	if !slices.Equal(rec.A, []netip.Addr{want}) {
@@ -332,7 +337,7 @@ func TestNetResolverWalksDelegation(t *testing.T) {
 	})
 
 	fallback := &stubResolver{}
-	r := &netResolver{servers: []string{tld}, fallback: fallback}
+	r := &netResolver{servers: []string{tld}, fallback: fallback, log: discard()}
 
 	rec := r.Resolve("demo.trycloudflare.com")
 	if !slices.Equal(rec.A, []netip.Addr{v4}) {
@@ -352,7 +357,7 @@ func TestNetResolverFallsBackWithoutGlue(t *testing.T) {
 
 	want := netip.MustParseAddr("9.9.9.9")
 	fallback := &stubResolver{records: Records{A: []netip.Addr{want}}}
-	r := &netResolver{servers: []string{tld}, fallback: fallback}
+	r := &netResolver{servers: []string{tld}, fallback: fallback, log: discard()}
 
 	rec := r.Resolve("demo.trycloudflare.com")
 	if !fallback.called {
@@ -386,7 +391,7 @@ func TestNetResolverBudgetsTheWholeWalk(t *testing.T) {
 
 	want := netip.MustParseAddr("9.9.9.9")
 	fallback := &stubResolver{records: Records{A: []netip.Addr{want}}}
-	r := &netResolver{servers: []string{tld}, fallback: fallback}
+	r := &netResolver{servers: []string{tld}, fallback: fallback, log: discard()}
 
 	start := time.Now()
 	rec := r.Resolve("demo.trycloudflare.com")
@@ -579,7 +584,7 @@ func TestIsHijackedOneAuthoritativeServerSettlesIt(t *testing.T) {
 	deadAddr := dead.LocalAddr().String()
 	dead.Close()
 
-	if isHijacked([]string{deadAddr, live}) {
+	if isHijacked(discard(), []string{deadAddr, live}) {
 		t.Error("one authoritative server should be enough to read as clean")
 	}
 }
@@ -593,7 +598,7 @@ func TestIsHijackedAllStandIns(t *testing.T) {
 		serveNameserver(t, false, dnsmessage.RCodeSuccess),
 		serveNameserver(t, false, dnsmessage.RCodeRefused),
 	}
-	if !isHijacked(servers) {
+	if !isHijacked(discard(), servers) {
 		t.Error("no authoritative reply should read as hijacked")
 	}
 }
@@ -608,7 +613,7 @@ func TestIsHijackedSilence(t *testing.T) {
 	addr := pc.LocalAddr().String()
 	pc.Close()
 
-	if !isHijacked([]string{addr}) {
+	if !isHijacked(discard(), []string{addr}) {
 		t.Error("silence should read as hijacked")
 	}
 }

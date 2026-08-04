@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"time"
@@ -29,6 +30,8 @@ import (
 type dohResolver struct {
 	// servers are RFC 8484 endpoints, tried in random order.
 	servers []string
+	// log records which endpoint answered, at debug.
+	log *slog.Logger
 }
 
 var _ Resolver = &dohResolver{}
@@ -50,10 +53,12 @@ func (r *dohResolver) Resolve(hostname string) Records {
 		records.AAAA = queryDoH(server, hostname, dnsmessage.TypeAAAA)
 
 		if !records.Empty() {
+			r.log.Debug("doh resolved hostname", "hostname", hostname, "endpoint", server)
 			return records
 		}
 	}
 
+	r.log.Debug("hostname not published yet", "hostname", hostname, "endpoints", len(r.servers))
 	return records
 }
 

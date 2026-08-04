@@ -3,6 +3,7 @@ package resolver
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"time"
@@ -29,6 +30,8 @@ type netResolver struct {
 	servers []string
 	// fallback resolves the hostname when the walk produces nothing.
 	fallback Resolver
+	// log records what each step of the walk found, at debug.
+	log *slog.Logger
 }
 
 var _ Resolver = &netResolver{}
@@ -68,22 +71,36 @@ func (r *netResolver) Resolve(hostname string) Records {
 		CNAME: hostname,
 	}
 
+	asked := 0
 	for _, server := range shuffled(r.servers) {
-		for _, nameserver := range delegation(ctx, server, hostname) {
+		nameservers := delegation(ctx, server, hostname)
+		if len(nameservers) == 0 {
+			r.log.Debug("no delegation from tld server", "server", server, "hostname", hostname)
+			continue
+		}
+		for _, nameserver := range nameservers {
+			asked++
 			records.A = lookupAt(ctx, nameserver, hostname, dnsmessage.TypeA)
 			records.AAAA = lookupAt(ctx, nameserver, hostname, dnsmessage.TypeAAAA)
 			if !records.Empty() {
+				r.log.Debug("walk resolved hostname", "hostname", hostname,
+					"nameserver", nameserver, "asked", asked)
 				return records
 			}
 			if ctx.Err() != nil {
+				r.log.Debug("walk budget spent, falling back", "hostname", hostname,
+					"budget", walkBudget, "asked", asked)
 				return r.fallback.Resolve(hostname)
 			}
 		}
 		if ctx.Err() != nil {
+			r.log.Debug("walk budget spent, falling back", "hostname", hostname,
+				"budget", walkBudget, "asked", asked)
 			break
 		}
 	}
 
+	r.log.Debug("walk found no records, falling back", "hostname", hostname, "asked", asked)
 	return r.fallback.Resolve(hostname)
 }
 
