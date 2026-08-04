@@ -281,18 +281,13 @@ var newResolver = func() *atomic.Pointer[resolverFactory] {
 	return &p
 }()
 
-// resolveInterval paces the wait for the hostname's record to be published.
-// The resolvers behind it neither cache nor are cached by anything on this
-// machine, so asking again costs one query and can never fix a negative in
-// place — the property that makes polling safe here at all.
-const resolveInterval = time.Second
-
-// resolveTimeout bounds that wait. Publication takes seconds, so reaching this
-// does not mean the record is slow — it means something answered for the name
-// before it existed and cached the negative, which lasts the zone's SOA (30
-// minutes here) no matter how long the wait. Past that point waiting is not
-// patience, it is a hang, and a caller with no deadline of its own would never
-// come back.
+// resolveTimeout bounds the wait for the hostname's record to be published.
+// Publication takes seconds, so reaching this does not mean the record is slow
+// — it means something answered for the name before it existed and cached the
+// negative, which lasts the zone's SOA (30 minutes here) no matter how long
+// the wait. Past that point waiting is not patience, it is a hang, and a
+// caller with no deadline of its own would never come back. The resolver has
+// no clock of its own; this deadline, handed down as a ctx, is the only one.
 //
 // Atomic for the same reason as newResolver: tests shorten it (SetResolveTimeout)
 // while start goroutines from other tests may still be reading it. Nanoseconds,
@@ -319,29 +314,23 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 
 		t.Logger().Info("tunnel connected, waiting for DNS")
 		hostname := t.Hostname()
-		// Resolved repeatedly, not once: the edge publishes the record moments
-		// after the connection registers, so the first lookup ordinarily races
-		// it and empty Records mean "not yet" rather than "never". The resolver
-		// is chosen once for the wait — the choice reads the network (see
-		// isIntercepted) and the network does not change over the seconds this
-		// takes.
+		// The edge publishes the record moments after the connection
+		// registers; Resolve waits out that gap, asking sources that cannot
+		// cache a negative until one serves the record. The deadline is this
+		// tunnel's policy, not the resolver's — see resolveTimeout.
 		resolve := (*newResolver.Load())(t.Logger())
 		timeout := time.Duration(resolveTimeout.Load())
-		giveUp := time.After(timeout)
-		rec := resolve.Resolve(hostname)
-		for rec.Empty() {
-			select {
-			case <-t.ctx.Done():
-				return
-			case <-giveUp:
+		ctx, cancel := context.WithTimeout(t.ctx, timeout)
+		rec := resolve.Resolve(ctx, hostname)
+		cancel()
+		if rec.Empty() {
+			if t.ctx.Err() == nil {
 				t.cancel(fmt.Errorf("%w: %s after %s: a resolver that answered for this "+
 					"name before the record was published holds that negative for the "+
 					"zone's SOA, and waiting cannot shorten it",
 					v1.ErrHostnameUnresolved, hostname, timeout))
-				return
-			case <-time.After(resolveInterval):
 			}
-			rec = resolve.Resolve(hostname)
+			return
 		}
 		t.markHostnameReady(hostname, rec)
 
@@ -675,22 +664,22 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 	return t.tunnelReady
 }
 
-// HostnameReady returns the channel closed once the public hostname resolves on
-// the zone's authoritative nameservers. The poll that closes it is started by
-// WithListener and gated on hostnameProvided, so this is a pure accessor —
-// select on it (and on Done).
+// HostnameReady returns the channel closed once the public hostname resolves.
+// The wait that closes it is started by WithListener and gated on
+// hostnameProvided, so this is a pure accessor — select on it (and on Done).
 //
-// Readiness is authoritative-only: pollAuthoritative queries the zone's
-// nameservers directly (the dig equivalent, via package resolver) and fires as
-// soon as one of them serves an A record — a record on any
-// authoritative nameserver, never a recursive resolver's cache. Queries are
-// RD=1 (the quick-tunnel nameservers REFUSE RD=0).
+// Readiness never consults anything that caches: package resolver asks the
+// zone's own nameservers directly (trusting only authoritative replies) and
+// independent DoH endpoints, and fires as soon as either serves an A record —
+// never a stale answer from a recursive resolver's cache, least of all this
+// machine's.
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	return t.hostnameReady
 }
 
 // markHostnameReady logs the resolved record and closes the readiness channel.
-// One caller (pollAuthoritative) reaches it once, so the close needs no guard.
+// One caller (start's readiness wait) reaches it once, so the close needs no
+// guard.
 func (t *TunnelImpl[T]) markHostnameReady(host string, rec resolver.Records) {
 	t.Logger().Info("hostname resolved", "hostname", host, "A", rec.A, "AAAA", rec.AAAA)
 	close(t.hostnameReady)

@@ -1,32 +1,38 @@
-// Package resolver looks up a hostname without trusting the machine's own DNS
-// configuration.
+// Package resolver waits for a hostname to resolve, asking only sources that
+// cannot serve a cached negative.
 //
-// It backs tunnel hostname readiness, which asks the same question repeatedly
-// while the answer is still changing: has this name been published yet? A
-// recursive resolver answers that badly. Under RFC 2308 it caches the negative
-// it got the first time, for as long as the zone's SOA allows — 30 minutes for
-// the zones involved here — so a lookup made moments before publication decides
-// the answer long after it stopped being true.
+// It backs tunnel hostname readiness: the edge publishes the record moments
+// after the connection registers, and readiness wants the earliest honest yes.
+// A recursive resolver answers that badly — under RFC 2308 it caches the
+// negative it got before publication for as long as the zone's SOA allows, 30
+// minutes for the zones here. The machine's own resolver is worst of all: one
+// query about the not-yet-published name would fix that negative in place on
+// the very resolver the calling process will use to connect. Nothing here asks
+// it, ever.
 //
-// The way around it is to ask something that does not cache: the zone's own
-// nameservers. That works until the network will not carry the query, which is
-// common enough — hotel and hotspot wifi, VPN exit nodes, and corporate
-// resolvers all run transparent DNS proxies that answer on the machine's
-// behalf. That practice is DNS interception; isIntercepted detects it, and
-// where it holds, lookups go out over DoH instead.
+// Two sources that cannot hold a stale negative are asked instead, together:
 //
-// The machine's own resolver is never asked, by any path here. It is the only
-// participant that caches, and one query about a name that does not exist yet
-// costs the calling process its ability to reach that hostname for the length of
-// the zone's SOA. Readiness reports what the zone serves; connecting is the
-// caller's, through whatever resolver it uses.
+//   - The zone's own nameservers, found by following a TLD server's referral.
+//     Only replies carrying the AA bit are trusted: on networks that intercept
+//     port 53 — hotel and hotspot wifi, corporate proxies — whatever answers
+//     in the nameserver's place is not authoritative for the zone, cannot set
+//     that bit honestly, and is discarded.
+//   - DoH endpoints (RFC 8484), which ride HTTPS and so pass through networks
+//     that intercept port 53. They are recursive, but each is a different
+//     operator and none is the resolver this machine will connect through, so
+//     a stale negative on one neither decides the result nor poisons the
+//     connection that follows.
+//
+// There are no timeouts here. Resolve keeps asking — a fresh round of queries
+// every resolveInterval, rotating through servers — until an answer arrives or
+// ctx ends. How long to wait is the caller's decision, expressed through ctx;
+// a query the network never answers is abandoned when ctx is done, not before.
 package resolver
 
 import (
 	"context"
 	"log/slog"
 	"math/rand"
-	"net"
 	"net/netip"
 	"strings"
 	"time"
@@ -34,16 +40,12 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-// Records is a hostname's resolved address set. Empty means the name did not
-// resolve — for a freshly minted tunnel hostname that is the ordinary state
-// until the record is published, not a failure.
+// Records is a hostname's resolved address set.
 type Records struct {
 	// A records are IPv4 addresses.
 	A []netip.Addr
 	// AAAA records are IPv6 addresses.
 	AAAA []netip.Addr
-	// CNAME is the canonical name for the queried hostname, if any.
-	CNAME string
 }
 
 // Empty reports whether the hostname resolved to an address the caller can
@@ -51,57 +53,26 @@ type Records struct {
 // independently and the AAAA half routinely lands first, so counting it would
 // call a hostname ready on a host with no IPv6 route — a macOS runner, or
 // anything behind IPv4-only NAT — that then cannot connect to it. AAAA alone is
-// therefore still "not yet", and the caller keeps waiting for the A record.
+// therefore still "not yet".
 func (r Records) Empty() bool { return len(r.A) == 0 }
 
-// Resolver looks up a hostname's addresses. Implementations differ in who they
-// ask, which is the entire point: readiness polling needs an answer that is not
-// a cached negative, and where that answer can be had from varies by network.
+// Resolver looks up a hostname's addresses.
 type Resolver interface {
-	// Resolve returns the hostname's addresses, or empty Records if it does not
-	// resolve. It does not report errors: a name that has not been published is
-	// indistinguishable from one that never will be, and both mean "not yet".
-	Resolve(hostname string) Records
+	// Resolve blocks until hostname resolves, then returns its addresses.
+	// Empty Records mean ctx ended first: the name was not published within
+	// the time the caller was willing to wait.
+	Resolve(ctx context.Context, hostname string) Records
 }
 
-// NewResolver returns the resolver best suited to the current network.
+// NewResolver returns a Resolver that races the delegation walk against DoH.
 //
-// Where DNS is trustworthy, nameservers are queried directly: their answers
-// come from the zone itself and so cannot be a stale negative. Where it is not
-// — see isIntercepted — that path cannot be relied on, and lookups go out over
-// DoH instead, which a network intercepting port 53 is not in a position to
-// answer for. A direct walk that comes back with nothing falls through to DoH
-// as well: the two fail for unrelated reasons, so one answering is worth more
-// than either verdict alone.
-//
-// Neither path ends at the machine's own resolver, and nothing here ever asks
-// it. It is the only participant that caches, so a query about a name that is
-// not published yet fixes an NXDOMAIN in place for the length of the zone's SOA
-// — 30 minutes for the zones here — on the very resolver the calling process
-// will use to reach the hostname. Readiness is not worth burning that. Where
-// neither path has the name, "not published yet" is the honest answer, and empty
-// Records say exactly that.
-//
-// The choice is made per call rather than once, because a machine moves between
-// networks and a resolver chosen for the previous one would be wrong.
-//
-// log records, at debug, which path was chosen and what each attempt found. A
-// hostname that will not resolve looks identical from outside whichever way it
-// fails, and these are the only lines that say which. It must not be nil.
+// log records, at debug, which source answered. A hostname that will not
+// resolve looks identical from outside whichever way it fails, and these are
+// the only lines that say which. It must not be nil.
 func NewResolver(log *slog.Logger) Resolver {
-	dohResolver := &dohResolver{
+	return &resolver{
 		log: log,
-		servers: []string{
-			"https://cloudflare-dns.com/dns-query",
-			"https://dns.google/dns-query",
-			"https://dns.quad9.net/dns-query",
-		},
-	}
-
-	netResolver := &netResolver{
-		log:      log,
-		fallback: dohResolver,
-		servers: []string{
+		tlds: shuffled([]string{
 			"a.gtld-servers.net",
 			"b.gtld-servers.net",
 			"c.gtld-servers.net",
@@ -115,15 +86,112 @@ func NewResolver(log *slog.Logger) Resolver {
 			"k.gtld-servers.net",
 			"l.gtld-servers.net",
 			"m.gtld-servers.net",
-		}}
-
-	if isIntercepted(log, netResolver.servers) {
-		log.Debug("dns interception detected, resolving over DoH", "servers", len(dohResolver.servers))
-		return dohResolver
+		}),
+		doh: shuffled([]string{
+			"https://cloudflare-dns.com/dns-query",
+			"https://dns.google/dns-query",
+			"https://dns.quad9.net/dns-query",
+		}),
 	}
+}
 
-	log.Debug("dns carries direct queries, walking the delegation", "servers", len(netResolver.servers))
-	return netResolver
+// resolver asks the zone's own nameservers and DoH endpoints side by side and
+// takes whichever answers first. It holds no state between calls and caches
+// nothing — the property the whole package exists for.
+type resolver struct {
+	// tlds are TLD nameservers the delegation walk starts from, one per round.
+	// Shuffled at construction so no process favors the same server; must not
+	// be empty.
+	tlds []string
+	// doh are RFC 8484 endpoints, one per round. Shuffled at construction;
+	// must not be empty.
+	doh []string
+	// log records which source answered, at debug.
+	log *slog.Logger
+}
+
+var _ Resolver = &resolver{}
+
+// resolveInterval paces the rounds. It is not a timeout: a round's queries are
+// never cut off by the next round starting — a slow answer from round one can
+// still win during round three. Nothing asked here caches, so another round
+// costs a handful of queries and can never fix a negative in place.
+const resolveInterval = time.Second
+
+// Resolve implements [Resolver]. Each round asks one TLD server (walking its
+// referral to the zone's nameservers) and one DoH endpoint, in parallel, and
+// the first source to produce an address wins. Rounds repeat, rotating through
+// the configured servers, until ctx ends; every in-flight query is released
+// when Resolve returns.
+func (r *resolver) Resolve(ctx context.Context, hostname string) Records {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	found := make(chan Records, 1)
+	pace := time.NewTicker(resolveInterval)
+	defer pace.Stop()
+
+	for round := 0; ; round++ {
+		go r.direct(ctx, r.tlds[round%len(r.tlds)], hostname, found)
+		go r.recursive(ctx, r.doh[round%len(r.doh)], hostname, found)
+
+		select {
+		case rec := <-found:
+			return rec
+		case <-ctx.Done():
+			r.log.Debug("hostname did not resolve before ctx ended",
+				"hostname", hostname, "rounds", round+1)
+			return Records{}
+		case <-pace.C:
+		}
+	}
+}
+
+// direct walks the delegation: it asks tld which nameservers hold the zone,
+// then asks each of those, in parallel, trusting only authoritative answers.
+// Neither step passes through a recursive resolver, so neither can return a
+// cached negative, and the AA requirement means a middlebox answering in a
+// nameserver's place is ignored rather than believed.
+func (r *resolver) direct(ctx context.Context, tld, hostname string, found chan<- Records) {
+	for _, ns := range delegation(ctx, tld, hostname) {
+		go func() {
+			a, authoritative := lookupUDP(ctx, ns, hostname, dnsmessage.TypeA)
+			if !authoritative || len(a) == 0 {
+				return
+			}
+			aaaa, _ := lookupUDP(ctx, ns, hostname, dnsmessage.TypeAAAA)
+			if deliver(found, Records{A: a, AAAA: aaaa}) {
+				r.log.Debug("authoritative nameserver serves the record",
+					"hostname", hostname, "nameserver", ns)
+			}
+		}()
+	}
+}
+
+// recursive asks one DoH endpoint. AA is not expected here — the endpoint is a
+// recursive resolver; what protects this path is the transport, which a
+// network intercepting port 53 cannot answer for.
+func (r *resolver) recursive(ctx context.Context, endpoint, hostname string, found chan<- Records) {
+	a := queryDoH(ctx, endpoint, hostname, dnsmessage.TypeA)
+	if len(a) == 0 {
+		return
+	}
+	aaaa := queryDoH(ctx, endpoint, hostname, dnsmessage.TypeAAAA)
+	if deliver(found, Records{A: a, AAAA: aaaa}) {
+		r.log.Debug("doh endpoint serves the record", "hostname", hostname, "endpoint", endpoint)
+	}
+}
+
+// deliver offers rec as the answer, reporting whether it was taken. Exactly
+// one answer is; later arrivals are dropped rather than blocking their
+// goroutines.
+func deliver(found chan<- Records, rec Records) bool {
+	select {
+	case found <- rec:
+		return true
+	default:
+		return false
+	}
 }
 
 // shuffled returns a random permutation of servers, so no one server carries
@@ -144,99 +212,3 @@ func dnsName(hostname string) string {
 	}
 	return hostname + "."
 }
-
-// isIntercepted reports whether this network will not carry a query to one of
-// servers and bring back that server's own answer. It decides between querying
-// nameservers directly and going out over DoH.
-//
-// Interception is a transparent DNS proxy: the network redirects port 53 to a
-// resolver of its own and answers in the addressed nameserver's place. Hotel
-// and airport wifi do it to drive captive portals, VPNs to keep split-horizon
-// names working, corporate networks to filter.
-//
-// It asks the servers themselves — the ones netResolver would use, so the probe
-// tests the actual path — for their zone's SOA with recursion disabled, and
-// looks at one bit of the reply: AA. Those servers are authoritative for the
-// zone and say so. Anything else answering in their place cannot set that bit
-// honestly, because it is not the zone's nameserver. So an authoritative reply
-// proves the query reached the server it was addressed to.
-//
-// This measures the capability the caller depends on rather than inferring it
-// from configuration. Across nine network configurations it agreed exactly with
-// whether an RD=0 query to a tunnel zone's own nameserver came back
-// authoritative.
-//
-// Anything else counts as intercepted, including a network that simply drops
-// the query: if direct nameserver queries cannot be shown to work, DoH is the
-// path that does.
-//
-// The result is not cached: a laptop changes networks, and a stale verdict
-// would route every later lookup down the wrong path.
-func isIntercepted(log *slog.Logger, servers []string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), interceptProbeTimeout)
-	defer cancel()
-	ctx, cancel = context.WithCancel(ctx)
-	defer cancel() // stop the slower probes once one has answered
-
-	answered := make(chan bool, len(servers))
-	for _, server := range servers {
-		go func(server string) { answered <- answersAuthoritatively(ctx, server) }(server)
-	}
-	for range servers {
-		if <-answered {
-			return false
-		}
-	}
-	log.Debug("no configured nameserver answered authoritatively", "probed", len(servers), "within", interceptProbeTimeout)
-	return true
-}
-
-// interceptProbeTimeout bounds the whole check. The servers are anycast and
-// answer in tens of milliseconds, so this is a ceiling on a stalled network
-// rather than a cost normally paid.
-const interceptProbeTimeout = 2 * time.Second
-
-// probeZone is the zone the probe asks about. It must be one the configured
-// servers are authoritative for — with the gTLD servers netResolver uses, that
-// is com.
-const probeZone = "com"
-
-// answersAuthoritatively reports whether server replies to a nonrecursive query
-// for probeZone with the AA bit set — the mark of the zone's own nameserver
-// rather than something answering on its behalf.
-func answersAuthoritatively(ctx context.Context, server string) bool {
-	// Recursion is deliberately not requested: the question is whether this
-	// server is authoritative for the zone, not whether it can look it up.
-	query, err := buildQuery(probeZone, dnsmessage.TypeSOA, false)
-	if err != nil {
-		return false
-	}
-	if _, _, err := net.SplitHostPort(server); err != nil {
-		server = net.JoinHostPort(server, "53")
-	}
-
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "udp", server)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(deadline)
-	}
-
-	if _, err := conn.Write(query); err != nil {
-		return false
-	}
-	buf := make([]byte, maxUDPResponse)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return false // dropped, refused, or timed out: not shown to work
-	}
-	var p dnsmessage.Parser
-	header, err := p.Start(buf[:n])
-	return err == nil && header.Authoritative
-}
-
-// maxUDPResponse bounds a DNS reply read from a datagram socket.
-const maxUDPResponse = 1232

@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -609,49 +608,35 @@ func TestWithContextWriteOnce(t *testing.T) {
 // network.
 type fakeResolver struct{}
 
-func (fakeResolver) Resolve(hostname string) resolver.Records {
-	return resolver.Records{
-		A:     []netip.Addr{netip.MustParseAddr("104.16.230.132")},
-		CNAME: hostname,
+func (fakeResolver) Resolve(context.Context, string) resolver.Records {
+	return resolver.Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}
+}
+
+// unpublishedResolver answers once publish is closed — a hostname whose record
+// is published a moment after the tunnel connects, which is the ordinary case.
+// Like the real resolver, it comes back empty only when ctx ends first.
+type unpublishedResolver struct{ publish chan struct{} }
+
+func (u *unpublishedResolver) Resolve(ctx context.Context, _ string) resolver.Records {
+	select {
+	case <-u.publish:
+		return resolver.Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}
+	case <-ctx.Done():
+		return resolver.Records{}
 	}
 }
 
-// unpublishedResolver answers with nothing until it has been asked after times,
-// then resolves — a hostname whose record is published a moment after the
-// tunnel connects, which is the ordinary case.
-type unpublishedResolver struct {
-	after int
+// neverResolver never answers, so hostname readiness never fires. It returns
+// empty on release — closed at test cleanup, so the tunnel's goroutine is not
+// left parked — or when ctx ends, whichever comes first.
+type neverResolver struct{ release <-chan struct{} }
 
-	mu    sync.Mutex
-	calls int
-}
-
-func (u *unpublishedResolver) Resolve(hostname string) resolver.Records {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.calls++
-	if u.calls < u.after {
-		return resolver.Records{CNAME: hostname}
+func (n neverResolver) Resolve(ctx context.Context, _ string) resolver.Records {
+	select {
+	case <-n.release:
+	case <-ctx.Done():
 	}
-	return resolver.Records{
-		A:     []netip.Addr{netip.MustParseAddr("104.16.230.132")},
-		CNAME: hostname,
-	}
-}
-
-func (u *unpublishedResolver) asked() int {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.calls
-}
-
-// blockingResolver never answers, so hostname readiness never fires. It
-// releases on test cleanup so the tunnel's goroutine is not left parked.
-type blockingResolver struct{ release <-chan struct{} }
-
-func (b blockingResolver) Resolve(hostname string) resolver.Records {
-	<-b.release
-	return resolver.Records{CNAME: hostname}
+	return resolver.Records{}
 }
 
 // stubNeverReady holds hostname readiness open for the duration of a test, for
@@ -659,7 +644,7 @@ func (b blockingResolver) Resolve(hostname string) resolver.Records {
 func stubNeverReady(t *testing.T) {
 	t.Helper()
 	release := make(chan struct{})
-	t.Cleanup(v1alpha1.SetResolver(blockingResolver{release: release}))
+	t.Cleanup(v1alpha1.SetResolver(neverResolver{release: release}))
 	t.Cleanup(func() { close(release) })
 }
 
@@ -688,13 +673,12 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 	}
 }
 
-// TestHostnameReadyWaitsForRecords pins that readiness means the record exists.
-// The edge publishes it moments after the connection registers, so the first
-// lookup ordinarily finds nothing; marking ready there would hand the caller a
-// URL that does not resolve, having already asked — and, before the chain ended
-// at DoH, poisoned — a resolver about a name that was not published yet.
+// TestHostnameReadyWaitsForRecords pins that readiness means the record
+// exists. The edge publishes it moments after the connection registers, so the
+// resolver ordinarily waits out that gap; readiness firing before the record
+// is published would hand the caller a URL that does not resolve.
 func TestHostnameReadyWaitsForRecords(t *testing.T) {
-	r := &unpublishedResolver{after: 3}
+	r := &unpublishedResolver{publish: make(chan struct{})}
 	t.Cleanup(v1alpha1.SetResolver(r))
 
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
@@ -702,12 +686,15 @@ func TestHostnameReadyWaitsForRecords(t *testing.T) {
 
 	select {
 	case <-conn.HostnameReady():
-	case <-time.After(30 * time.Second):
-		t.Fatal("HostnameReady never closed once the record was published")
+		t.Fatal("HostnameReady closed before the record was published")
+	case <-time.After(200 * time.Millisecond):
 	}
 
-	if got := r.asked(); got < 3 {
-		t.Errorf("resolver asked %d times, want at least 3 — readiness fired on an empty answer", got)
+	close(r.publish)
+	select {
+	case <-conn.HostnameReady():
+	case <-time.After(30 * time.Second):
+		t.Fatal("HostnameReady never closed once the record was published")
 	}
 }
 
@@ -717,7 +704,7 @@ func TestHostnameReadyWaitsForRecords(t *testing.T) {
 // that set no deadline of its own would otherwise block forever, which is a
 // hang rather than patience.
 func TestHostnameNeverResolvesFailsTunnel(t *testing.T) {
-	t.Cleanup(v1alpha1.SetResolver(&unpublishedResolver{after: 1 << 30}))
+	stubNeverReady(t)
 	t.Cleanup(v1alpha1.SetResolveTimeout(100 * time.Millisecond))
 
 	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})).
