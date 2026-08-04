@@ -243,8 +243,8 @@ func TestRecordsEmpty(t *testing.T) {
 	if (Records{A: []netip.Addr{netip.MustParseAddr("1.2.3.4")}}).Empty() {
 		t.Error("Records with an A record should not be empty")
 	}
-	if (Records{AAAA: []netip.Addr{netip.MustParseAddr("::1")}}).Empty() {
-		t.Error("Records with an AAAA record should not be empty")
+	if !(Records{AAAA: []netip.Addr{netip.MustParseAddr("::1")}}).Empty() {
+		t.Error("Records with only an AAAA record should be empty: IPv6 alone is not reachable everywhere")
 	}
 }
 
@@ -536,7 +536,7 @@ func TestAnswersAuthoritativelyAcceptsTheRealServer(t *testing.T) {
 	}
 }
 
-// TestAnswersAuthoritativelyRejectsAStandIn is the hijacked case, and the one
+// TestAnswersAuthoritativelyRejectsAStandIn is the intercepted case, and the one
 // that matters: something answered, and answered plausibly, but it is not the
 // root and cannot honestly set AA. Measured on intercepting networks as
 // NOERROR with records in one configuration and REFUSED in another, so both
@@ -571,10 +571,10 @@ func TestAnswersAuthoritativelyRejectsSilence(t *testing.T) {
 	}
 }
 
-// TestIsHijackedOneAuthoritativeServerSettlesIt pins that a single reachable
+// TestIsInterceptedOneAuthoritativeServerSettlesIt pins that a single reachable
 // server decides the verdict, so one unreachable nameserver cannot force the
 // DoH path.
-func TestIsHijackedOneAuthoritativeServerSettlesIt(t *testing.T) {
+func TestIsInterceptedOneAuthoritativeServerSettlesIt(t *testing.T) {
 	live := serveNameserver(t, true, dnsmessage.RCodeSuccess)
 
 	dead, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -584,28 +584,28 @@ func TestIsHijackedOneAuthoritativeServerSettlesIt(t *testing.T) {
 	deadAddr := dead.LocalAddr().String()
 	dead.Close()
 
-	if isHijacked(discard(), []string{deadAddr, live}) {
+	if isIntercepted(discard(), []string{deadAddr, live}) {
 		t.Error("one authoritative server should be enough to read as clean")
 	}
 }
 
-// TestIsHijackedAllStandIns is the hijacked network: every server answers, and
-// answers plausibly, but none authoritatively — measured as NOERROR with
+// TestIsInterceptedAllStandIns is the intercepted network: every server answers,
+// and answers plausibly, but none authoritatively — measured as NOERROR with
 // records on one intercepting network and REFUSED on another, so both shapes
 // are covered.
-func TestIsHijackedAllStandIns(t *testing.T) {
+func TestIsInterceptedAllStandIns(t *testing.T) {
 	servers := []string{
 		serveNameserver(t, false, dnsmessage.RCodeSuccess),
 		serveNameserver(t, false, dnsmessage.RCodeRefused),
 	}
-	if !isHijacked(discard(), servers) {
-		t.Error("no authoritative reply should read as hijacked")
+	if !isIntercepted(discard(), servers) {
+		t.Error("no authoritative reply should read as intercepted")
 	}
 }
 
-// TestIsHijackedSilence pins that a network dropping the queries entirely reads
-// as hijacked: the direct path was not shown to work, so DoH is used.
-func TestIsHijackedSilence(t *testing.T) {
+// TestIsInterceptedSilence pins that a network dropping the queries entirely
+// reads as intercepted: the direct path was not shown to work, so DoH is used.
+func TestIsInterceptedSilence(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -613,7 +613,7 @@ func TestIsHijackedSilence(t *testing.T) {
 	addr := pc.LocalAddr().String()
 	pc.Close()
 
-	if !isHijacked(discard(), []string{addr}) {
-		t.Error("silence should read as hijacked")
+	if !isIntercepted(discard(), []string{addr}) {
+		t.Error("silence should read as intercepted")
 	}
 }

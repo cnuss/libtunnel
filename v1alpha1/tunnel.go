@@ -323,7 +323,7 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 		// after the connection registers, so the first lookup ordinarily races
 		// it and empty Records mean "not yet" rather than "never". The resolver
 		// is chosen once for the wait — the choice reads the network (see
-		// isHijacked) and the network does not change over the seconds this
+		// isIntercepted) and the network does not change over the seconds this
 		// takes.
 		resolve := (*newResolver.Load())(t.Logger())
 		timeout := time.Duration(resolveTimeout.Load())
@@ -682,7 +682,7 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 //
 // Readiness is authoritative-only: pollAuthoritative queries the zone's
 // nameservers directly (the dig equivalent, via package resolver) and fires as
-// soon as one of them serves a non-empty A+AAAA set — a record on any
+// soon as one of them serves an A record — a record on any
 // authoritative nameserver, never a recursive resolver's cache. Queries are
 // RD=1 (the quick-tunnel nameservers REFUSE RD=0).
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {

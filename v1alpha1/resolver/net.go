@@ -24,7 +24,7 @@ import (
 // deliberately not one.
 //
 // It is used only where the network carries such queries honestly; see
-// isHijacked.
+// isIntercepted.
 type netResolver struct {
 	// servers are TLD nameservers, queried in random order, without a port.
 	servers []string
