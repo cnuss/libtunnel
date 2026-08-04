@@ -652,6 +652,44 @@ func TestEdgeUpWatcher(t *testing.T) {
 	}
 }
 
+// TestEdgeUpWatcherCountsAttempts pins the count edgeTimeout reports: every
+// Reconnecting the supervisor sends before the edge is up is one failed attempt
+// to reach it, and Connected events are not attempts.
+func TestEdgeUpWatcherCountsAttempts(t *testing.T) {
+	w := newEdgeUpWatcher()
+
+	if got := w.attemptCount(); got != 0 {
+		t.Fatalf("initial attemptCount() = %d, want 0", got)
+	}
+
+	w.attempt()
+	w.attempt()
+	w.up()
+
+	if got := w.attemptCount(); got != 2 {
+		t.Errorf("attemptCount() = %d, want 2", got)
+	}
+}
+
+// TestEdgeUnreachableWrapsSentinel pins the error a caller matches on: the
+// timeout reports v1.ErrEdgeUnreachable, and carries cloudflared's own
+// diagnosis of a blocked egress port — which cloudflared logs at a level the
+// tunnel's default logger discards.
+func TestEdgeUnreachableWrapsSentinel(t *testing.T) {
+	err := fmt.Errorf("%w: no connection after %d attempts in %s: %s",
+		v1.ErrEdgeUnreachable, 3, edgeTimeout, edgeBlockedHint)
+
+	if !errors.Is(err, v1.ErrEdgeUnreachable) {
+		t.Errorf("errors.Is(err, ErrEdgeUnreachable) = false, want true")
+	}
+	if !strings.Contains(err.Error(), "7844") {
+		t.Errorf("Err() = %q, want the blocked port named", err)
+	}
+	if !strings.Contains(err.Error(), "WithEdge") {
+		t.Errorf("Err() = %q, want the WithEdge way around it", err)
+	}
+}
+
 func TestReconnectBeforeConnect(t *testing.T) {
 	if err := New().Reconnect(context.Background()); err == nil {
 		t.Fatal("Reconnect before connect: want error, got nil")

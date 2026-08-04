@@ -70,16 +70,25 @@ const backendName = "cloudflare"
 // The reconnect lever fires one ReconnectSignal per conn to cycle them all.
 const haConnections = 1
 
-// edgeUpWatcher counts edge Connected events so a caller can wait for N of them
-// past a barrier. The Observer sink calls up on every Connected; generation
-// returns the running count plus a channel that closes on the next one. Because
-// each delivered ReconnectSignal breaks exactly one edge conn and thus yields
-// exactly one Connected, waiting for the count to advance by haConnections is a
-// correct "all cycled conns are back up" barrier for any HA count.
+// edgeUpWatcher tracks the tunnel's edge connections from the Observer sink:
+// Connected events, so a caller can wait for N of them past a barrier, and the
+// failed attempts between them.
+//
+// The sink calls up on every Connected; generation returns the running count
+// plus a channel that closes on the next one. Because each delivered
+// ReconnectSignal breaks exactly one edge conn and thus yields exactly one
+// Connected, waiting for the count to advance by haConnections is a correct
+// "all cycled conns are back up" barrier for any HA count.
+//
+// The sink calls attempt on every Reconnecting, which the supervisor sends
+// before each backoff — including after a dial that never connected, so before
+// the first Connected the count is failed attempts to reach the edge, which is
+// what edgeTimeout reports.
 type edgeUpWatcher struct {
-	mu  sync.Mutex
-	gen uint64
-	ch  chan struct{}
+	mu       sync.Mutex
+	gen      uint64
+	ch       chan struct{}
+	attempts uint64
 }
 
 func newEdgeUpWatcher() *edgeUpWatcher { return &edgeUpWatcher{ch: make(chan struct{})} }
@@ -96,6 +105,18 @@ func (e *edgeUpWatcher) up() {
 	e.gen++
 	close(e.ch)
 	e.ch = make(chan struct{})
+}
+
+func (e *edgeUpWatcher) attempt() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.attempts++
+}
+
+func (e *edgeUpWatcher) attemptCount() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.attempts
 }
 
 // Backend is the cloudflared quick-tunnel engine. It carries the origin-scheme
@@ -133,7 +154,7 @@ type Backend struct {
 	// and pinned specs never hit the API, so these never apply to them.
 	headers http.Header
 	// Runtime state wired at connect. reconnected feeds the supervisor's
-	// external-control channel, edgeUp counts Connected events, and reconnectCtx
+	// external-control channel, edgeUp tracks edge connections, and reconnectCtx
 	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
 	// and listener is the loopback socket cloudflared dials to reach it. All nil
 	// until connect runs.
@@ -601,10 +622,9 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	// registerer at construction, which would collide across tunnels and
 	// pollute the host application's metrics, so it is pointed at a noop
 	// (under promMu) and restored by defer when construction finishes. The
-	// supervisor's run and the (unbounded) wait for the first edge connection
-	// happen below, outside the lock, so concurrent tunnels neither serialize
-	// behind one tunnel's connect nor discard the host's own registrations in
-	// the meantime.
+	// supervisor's run and the wait for the first edge connection happen below,
+	// outside the lock, so concurrent tunnels neither serialize behind one
+	// tunnel's connect nor discard the host's own registrations in the meantime.
 	sup, err := func() (*supervisor.Supervisor, error) {
 		promMu.Lock()
 		defer promMu.Unlock()
@@ -635,12 +655,15 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 		originDialer := ingress.NewOriginDialer(ingress.OriginConfig{}, log)
 
 		// The observer fans connection lifecycle events out to sinks; wire one
-		// that pokes edgeUp on every Connected so the Reconnect lever can block
-		// until the edge is back up.
+		// that feeds edgeUp, so the Reconnect lever can block until the edge is
+		// back up and edgeTimeout can report how many attempts it took.
 		observer := connection.NewObserver(log, log)
 		observer.RegisterSink(connection.EventSinkFunc(func(e connection.Event) {
-			if e.EventType == connection.Connected {
+			switch e.EventType {
+			case connection.Connected:
 				b.edgeUp.up()
+			case connection.Reconnecting:
+				b.edgeUp.attempt()
 			}
 		}))
 
@@ -745,13 +768,43 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 		}
 	}()
 
+	timeout := time.NewTimer(edgeTimeout)
+	defer timeout.Stop()
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-connected.Wait():
+	case <-timeout.C:
+		return fmt.Errorf("%w: no connection after %d attempts in %s: %s",
+			v1.ErrEdgeUnreachable, b.edgeUp.attemptCount(), edgeTimeout, edgeBlockedHint)
 	}
 	return nil
 }
+
+// edgeTimeout bounds the wait for the first edge connection. The supervisor
+// retries forever — cloudflared builds its backoff with retryForever set, so
+// TunnelConfig.Retries only caps the backoff ceiling, not the attempt count —
+// which leaves a blocked network looking exactly like a slow one until the
+// caller's context expires. This is the terminal state cloudflared has none of.
+//
+// It applies to the first connection only: connect returns once the edge is up,
+// and a connection dropped later is cloudflared's to retry indefinitely, which
+// is the right policy for a tunnel that has already proven the network works.
+//
+// Long enough to cover a slow network and cloudflared's own quic->http2
+// fallback is not one number: that fallback needs a couple of minutes of
+// backoff to arrive. This favors telling the caller quickly.
+const edgeTimeout = 30 * time.Second
+
+// edgeBlockedHint is cloudflared's own diagnosis of this failure, which it logs
+// at warn level from selectNextProtocol — where the tunnel's logger is silent
+// by default (see zerologger) and it is never seen. Repeated verbatim so the
+// error carries the same guidance, plus libtunnel's way around it.
+const edgeBlockedHint = "your machine/network is getting its egress UDP to port 7844 (or others) " +
+	"blocked or dropped. Make sure to allow egress connectivity as per " +
+	"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/ " +
+	"(WithEdge relays the edge through a port that is allowed)"
 
 // newOriginProxy builds the reverse proxy that always fronts the origin (see
 // connect, which serves it on a plaintext listener cloudflared dials). When the
