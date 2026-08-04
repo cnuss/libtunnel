@@ -1,6 +1,8 @@
 package v1alpha1
 
 import (
+	"time"
+
 	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
@@ -14,4 +16,12 @@ func SetResolver(r resolver.Resolver) (restore func()) {
 	next := resolverFactory(func() resolver.Resolver { return r })
 	newResolver.Store(&next)
 	return func() { newResolver.Store(prev) }
+}
+
+// SetResolveTimeout shortens how long readiness waits for the hostname to
+// resolve and returns a function restoring the previous bound, so a test can
+// reach the give-up path in milliseconds rather than the production minute.
+func SetResolveTimeout(d time.Duration) (restore func()) {
+	prev := resolveTimeout.Swap(int64(d))
+	return func() { resolveTimeout.Store(prev) }
 }

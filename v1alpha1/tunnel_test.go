@@ -711,6 +711,30 @@ func TestHostnameReadyWaitsForRecords(t *testing.T) {
 	}
 }
 
+// TestHostnameNeverResolvesFailsTunnel pins that the wait is bounded. A
+// resolver that answered for the name before the record was published holds
+// that negative for the zone's SOA, so waiting cannot fix it — and a caller
+// that set no deadline of its own would otherwise block forever, which is a
+// hang rather than patience.
+func TestHostnameNeverResolvesFailsTunnel(t *testing.T) {
+	t.Cleanup(v1alpha1.SetResolver(&unpublishedResolver{after: 1 << 30}))
+	t.Cleanup(v1alpha1.SetResolveTimeout(100 * time.Millisecond))
+
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})).
+		WithListener(listen(t))
+
+	select {
+	case <-conn.Done():
+	case <-conn.HostnameReady():
+		t.Fatal("HostnameReady closed though the hostname never resolved")
+	case <-time.After(15 * time.Second):
+		t.Fatal("tunnel neither resolved nor failed — readiness is unbounded")
+	}
+	if err := conn.Err(); !errors.Is(err, v1.ErrHostnameUnresolved) {
+		t.Errorf("Err() = %v, want ErrHostnameUnresolved", err)
+	}
+}
+
 // TestWithContextURLWaitsForTunnelReady pins WithContext's upgrade: with a
 // caller context set, URL blocks until TunnelReady (not DNS alone) and then
 // returns the public URL.

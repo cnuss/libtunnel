@@ -287,6 +287,22 @@ var newResolver = func() *atomic.Pointer[resolverFactory] {
 // place — the property that makes polling safe here at all.
 const resolveInterval = time.Second
 
+// resolveTimeout bounds that wait. Publication takes seconds, so reaching this
+// does not mean the record is slow — it means something answered for the name
+// before it existed and cached the negative, which lasts the zone's SOA (30
+// minutes here) no matter how long the wait. Past that point waiting is not
+// patience, it is a hang, and a caller with no deadline of its own would never
+// come back.
+//
+// Atomic for the same reason as newResolver: tests shorten it (SetResolveTimeout)
+// while start goroutines from other tests may still be reading it. Nanoseconds,
+// because that is what atomic.Int64 holds.
+var resolveTimeout = func() *atomic.Int64 {
+	var d atomic.Int64
+	d.Store(int64(60 * time.Second))
+	return &d
+}()
+
 // backend (nil engine, tunnel born canceled — see New) it does nothing.
 func (t *TunnelImpl[T]) start(connect func() error) {
 	if t.engine == nil {
@@ -310,10 +326,18 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 		// isHijacked) and the network does not change over the seconds this
 		// takes.
 		resolve := (*newResolver.Load())()
+		timeout := time.Duration(resolveTimeout.Load())
+		giveUp := time.After(timeout)
 		rec := resolve.Resolve(hostname)
 		for rec.Empty() {
 			select {
 			case <-t.ctx.Done():
+				return
+			case <-giveUp:
+				t.cancel(fmt.Errorf("%w: %s after %s: a resolver that answered for this "+
+					"name before the record was published holds that negative for the "+
+					"zone's SOA, and waiting cannot shorten it",
+					v1.ErrHostnameUnresolved, hostname, timeout))
 				return
 			case <-time.After(resolveInterval):
 			}

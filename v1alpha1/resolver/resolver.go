@@ -81,7 +81,12 @@ func (r *systemResolver) Resolve(hostname string) Records {
 // failure — a name that does not resolve and a lookup that broke are the same
 // answer to the caller: no records.
 func lookupVia(r *net.Resolver, network, hostname string) []netip.Addr {
-	ips, err := r.LookupIP(context.Background(), network, hostname)
+	// Bounded: the caller polls, and an unbounded lookup here would park the
+	// readiness wait somewhere its own deadline cannot see.
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	ips, err := r.LookupIP(ctx, network, hostname)
 	if err != nil {
 		return nil
 	}
