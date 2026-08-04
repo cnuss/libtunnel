@@ -415,6 +415,48 @@ func TestNetResolverFallsBackWithoutGlue(t *testing.T) {
 	}
 }
 
+// TestNetResolverBudgetsTheWholeWalk pins walkBudget. Per-query timeouts do not
+// bound a walk: a referral carries every nameserver the zone has, and asking
+// each for two families costs len(glue) x 2 x queryTimeout when none of them
+// answers. Measured on a CI runner that reached the TLD servers but not the
+// zone's own nameservers, that was one Resolve taking sixty seconds and learning
+// nothing, while the caller's readiness poll waited on it.
+func TestNetResolverBudgetsTheWholeWalk(t *testing.T) {
+	silent := serveUDP(t, func([]byte) []byte { return nil }) // never answers
+	_, silentPort := splitHostPort(t, silent)
+	restore := nameserverPort
+	nameserverPort = silentPort
+	t.Cleanup(func() { nameserverPort = restore })
+
+	// Ten glue addresses, as the real zones carry — all pointing at the server
+	// that never answers.
+	glue := make([]netip.Addr, 10)
+	for i := range glue {
+		glue[i] = netip.MustParseAddr("127.0.0.1")
+	}
+	tld := serveUDP(t, func(query []byte) []byte { return referral(t, query, glue) })
+
+	want := netip.MustParseAddr("9.9.9.9")
+	fallback := &stubResolver{records: Records{A: []netip.Addr{want}}}
+	r := &netResolver{servers: []string{tld}, fallback: fallback}
+
+	start := time.Now()
+	rec := r.Resolve("demo.trycloudflare.com")
+	elapsed := time.Since(start)
+
+	// Unbudgeted this is 10 x 2 x queryTimeout = 60s. The margin is wide on
+	// purpose: the point is the order of magnitude, not the exact bound.
+	if limit := 4 * walkBudget; elapsed > limit {
+		t.Errorf("Resolve took %s, want under %s — the walk is not bounded as a whole", elapsed, limit)
+	}
+	if !fallback.called {
+		t.Error("fallback not used once the walk ran out of budget")
+	}
+	if !slices.Equal(rec.A, []netip.Addr{want}) {
+		t.Errorf("A = %v, want the fallback's %v", rec.A, want)
+	}
+}
+
 // TestParseGlueSkipsNonAddressRecords pins that OPT — which every query now
 // provokes, since EDNS0 is advertised — does not derail the glue scan.
 func TestParseGlueSkipsNonAddressRecords(t *testing.T) {

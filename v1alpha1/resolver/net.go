@@ -37,6 +37,19 @@ var _ Resolver = &netResolver{}
 // milliseconds; this is a ceiling on an unresponsive one, not a normal cost.
 const queryTimeout = 3 * time.Second
 
+// walkBudget bounds the whole walk, which per-query timeouts do not. A referral
+// carries every nameserver the zone has — around ten for the zones here — and
+// the walk asks each for two families, so a network that reaches the TLD servers
+// but not the zone's own nameservers costs 10 x 2 x queryTimeout on the first
+// referral alone before anything is concluded. Measured at exactly that on a CI
+// runner: one Resolve, sixty seconds, nothing learned.
+//
+// The caller polls, so a Resolve that cannot answer quickly is worth less than
+// the DoH attempt it is holding up. Three exchanges is the normal cost of a
+// successful walk and each is tens of milliseconds; anything approaching this
+// is a path that is not going to work.
+const walkBudget = 5 * time.Second
+
 // nameserverPort is where glue addresses are dialed. Glue carries an address
 // and no port, so it is always 53 in practice; it is a variable only so tests
 // can point the walk at a stub.
@@ -44,19 +57,30 @@ var nameserverPort = "53"
 
 // Resolve implements [Resolver]. For each TLD server in turn it reads the
 // zone's delegation and asks the zone's own nameservers, returning the first
-// non-empty answer. It falls back only when the walk yields nothing.
+// non-empty answer. It falls back when the walk yields nothing, or when
+// walkBudget runs out first — a walk that has not answered by then is a path
+// this network does not carry, and the fallback is the one that might.
 func (r *netResolver) Resolve(hostname string) Records {
+	ctx, cancel := context.WithTimeout(context.Background(), walkBudget)
+	defer cancel()
+
 	records := Records{
 		CNAME: hostname,
 	}
 
 	for _, server := range shuffled(r.servers) {
-		for _, nameserver := range delegation(server, hostname) {
-			records.A = lookupAt(nameserver, hostname, dnsmessage.TypeA)
-			records.AAAA = lookupAt(nameserver, hostname, dnsmessage.TypeAAAA)
+		for _, nameserver := range delegation(ctx, server, hostname) {
+			records.A = lookupAt(ctx, nameserver, hostname, dnsmessage.TypeA)
+			records.AAAA = lookupAt(ctx, nameserver, hostname, dnsmessage.TypeAAAA)
 			if !records.Empty() {
 				return records
 			}
+			if ctx.Err() != nil {
+				return r.fallback.Resolve(hostname)
+			}
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
 
@@ -69,12 +93,12 @@ func (r *netResolver) Resolve(hostname string) Records {
 // The glue is used rather than the nameserver names: resolving those names
 // would mean asking a recursive resolver, which is the thing this path exists
 // to avoid.
-func delegation(server, hostname string) []string {
+func delegation(ctx context.Context, server, hostname string) []string {
 	query, err := buildQuery(hostname, dnsmessage.TypeA, false)
 	if err != nil {
 		return nil
 	}
-	wire, err := exchangeUDP(server, query)
+	wire, err := exchangeUDP(ctx, server, query)
 	if err != nil {
 		return nil
 	}
@@ -94,12 +118,12 @@ func delegation(server, hostname string) []string {
 // lookupAt asks one nameserver directly for hostname's records of type qtype.
 // A nameserver that does not answer, or does not yet hold the record, yields
 // nothing and the caller moves on.
-func lookupAt(nameserver, hostname string, qtype dnsmessage.Type) []netip.Addr {
+func lookupAt(ctx context.Context, nameserver, hostname string, qtype dnsmessage.Type) []netip.Addr {
 	query, err := buildQuery(hostname, qtype, false)
 	if err != nil {
 		return nil
 	}
-	wire, err := exchangeUDP(nameserver, query)
+	wire, err := exchangeUDP(ctx, nameserver, query)
 	if err != nil {
 		return nil
 	}
@@ -111,13 +135,15 @@ func lookupAt(nameserver, hostname string, qtype dnsmessage.Type) []netip.Addr {
 }
 
 // exchangeUDP sends one query to server and returns the reply. server may omit
-// the port, in which case 53 is assumed.
-func exchangeUDP(server string, query []byte) ([]byte, error) {
+// the port, in which case 53 is assumed. It is bounded by queryTimeout and by
+// whatever ctx has left, whichever expires first — the walk's overall budget
+// outranks any single exchange's.
+func exchangeUDP(ctx context.Context, server string, query []byte) ([]byte, error) {
 	if _, _, err := net.SplitHostPort(server); err != nil {
 		server = net.JoinHostPort(server, "53")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
 	var d net.Dialer
