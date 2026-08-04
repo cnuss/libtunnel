@@ -13,6 +13,12 @@
 // common enough — hotel and hotspot wifi, VPN exit nodes, and corporate
 // resolvers all answer DNS on the machine's behalf. isHijacked detects that,
 // and where it holds, lookups go out over DoH instead.
+//
+// The machine's resolver is not avoided, though — a caller connects through it,
+// so readiness it cannot see is readiness a caller cannot use. It is asked
+// last, and only once one of the above has shown the record exists, which is
+// the difference between a query it can answer and one that poisons it. See
+// confirmedResolver.
 package resolver
 
 import (
@@ -51,6 +57,83 @@ type Resolver interface {
 	Resolve(hostname string) Records
 }
 
+// systemResolver resolves through the machine's own resolver — the one the
+// calling process will use to reach the hostname. It is never asked first; see
+// confirmedResolver for why the order is the whole design.
+type systemResolver struct {
+}
+
+var _ Resolver = &systemResolver{}
+
+// Resolve implements [Resolver] using the system resolver.
+func (r *systemResolver) Resolve(hostname string) Records {
+	records := Records{
+		CNAME: hostname,
+	}
+	// The families are looked up independently: a host with only A records
+	// fails the AAAA lookup, and that must not discard the A records.
+	records.A = lookupVia(net.DefaultResolver, "ip4", hostname)
+	records.AAAA = lookupVia(net.DefaultResolver, "ip6", hostname)
+	return records
+}
+
+// lookupVia resolves one address family through r, returning nil for any
+// failure — a name that does not resolve and a lookup that broke are the same
+// answer to the caller: no records.
+func lookupVia(r *net.Resolver, network, hostname string) []netip.Addr {
+	ips, err := r.LookupIP(context.Background(), network, hostname)
+	if err != nil {
+		return nil
+	}
+	var addrs []netip.Addr
+	for _, ip := range ips {
+		// Parsed rather than asserted: a malformed address is skipped instead
+		// of panicking a caller's process.
+		if addr, ok := netip.AddrFromSlice(ip); ok {
+			addrs = append(addrs, addr.Unmap())
+		}
+	}
+	return addrs
+}
+
+// confirmedResolver reports a hostname resolved only once the machine's own
+// resolver resolves it too, and asks that resolver only after source has said
+// the record exists.
+//
+// Both halves are load-bearing. Callers reach the hostname through the system
+// resolver, so readiness that only a direct nameserver query can see is a
+// readiness the caller cannot act on — it hands back a URL that does not
+// resolve. And the system resolver is the one participant that caches, so a
+// query made before the record exists fixes an NXDOMAIN in place for the length
+// of the zone's SOA — 30 minutes for the zones here — which no amount of
+// retrying afterwards can shorten. Asking it early is not a slow answer, it is
+// a wrong one that outlives the truth.
+//
+// Ordering resolves the tension. source cannot cache anything, so it is free to
+// ask as often as it likes; once it has records the name demonstrably exists,
+// and a query to the system resolver then is one that can be answered rather
+// than one that poisons. Until both agree the answer is empty Records, which
+// the caller polls on.
+type confirmedResolver struct {
+	// source establishes that the record exists, without caching.
+	source Resolver
+	// system is the resolver the calling process will use.
+	system Resolver
+}
+
+var _ Resolver = &confirmedResolver{}
+
+// Resolve implements [Resolver], returning the addresses the machine's own
+// resolver gives — the ones a caller will actually connect to.
+func (c *confirmedResolver) Resolve(hostname string) Records {
+	if c.source.Resolve(hostname).Empty() {
+		// Not published yet. Asking the system resolver now is what would
+		// poison it, so it is not asked.
+		return Records{CNAME: hostname}
+	}
+	return c.system.Resolve(hostname)
+}
+
 // NewResolver returns the resolver best suited to the current network.
 //
 // Where DNS is trustworthy, nameservers are queried directly: their answers
@@ -61,14 +144,12 @@ type Resolver interface {
 // as well: the two fail for unrelated reasons, so one answering is worth more
 // than either verdict alone.
 //
-// Neither path ends at the system resolver, and that is the point. It is the
-// one participant that caches, so asking it about a name that is not published
-// yet is what fixes a negative in place for the length of the zone's SOA — on
-// the very resolver the calling process will use to reach the hostname once it
-// does resolve. The system resolver can only return an answer these two could
-// already get, or a negative that outlives its truth. Where neither of them
-// sees the name, "not published yet" is the honest answer, and empty Records
-// say exactly that.
+// Whichever is chosen answers only the question "does this record exist yet",
+// which is not the question a caller has: it connects through the system
+// resolver. So the choice is wrapped in a confirmedResolver, which asks that
+// resolver too — and, decisively, only once the record has been shown to exist.
+// Where neither has the name, "not published yet" is the honest answer, and
+// empty Records say exactly that.
 //
 // The choice is made per call rather than once, because a machine moves between
 // networks and a resolver chosen for the previous one would be wrong.
@@ -99,11 +180,12 @@ func NewResolver() Resolver {
 			"m.gtld-servers.net",
 		}}
 
+	source := Resolver(netResolver)
 	if isHijacked(netResolver.servers) {
-		return dohResolver
+		source = dohResolver
 	}
 
-	return netResolver
+	return &confirmedResolver{source: source, system: &systemResolver{}}
 }
 
 // shuffled returns a random permutation of servers, so no one server carries

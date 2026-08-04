@@ -28,6 +28,53 @@ func (s *stubResolver) Resolve(hostname string) Records {
 	return s.records
 }
 
+// TestConfirmedResolverSpareTheSystemResolver pins the ordering that the whole
+// design turns on: while the record does not exist, the machine's own resolver
+// is not asked at all. Asking it there is what fixes an NXDOMAIN in place for
+// the zone's SOA, on the resolver the caller will use to reach the hostname.
+func TestConfirmedResolverSparesTheSystemResolver(t *testing.T) {
+	system := &stubResolver{}
+	c := &confirmedResolver{source: &stubResolver{}, system: system}
+
+	if rec := c.Resolve("demo.trycloudflare.com"); !rec.Empty() {
+		t.Errorf("Resolve() = %+v, want empty Records while unpublished", rec)
+	}
+	if system.called {
+		t.Error("system resolver asked about a hostname not shown to exist")
+	}
+}
+
+// TestConfirmedResolverWaitsForTheSystemResolver pins the other half: the
+// record existing is not enough, because a caller connects through the system
+// resolver and that one may not see it yet. Readiness it cannot see is
+// readiness a caller cannot use.
+func TestConfirmedResolverWaitsForTheSystemResolver(t *testing.T) {
+	source := &stubResolver{records: Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}}
+	system := &stubResolver{}
+	c := &confirmedResolver{source: source, system: system}
+
+	if rec := c.Resolve("demo.trycloudflare.com"); !rec.Empty() {
+		t.Errorf("Resolve() = %+v, want empty Records until the system resolver agrees", rec)
+	}
+	if !system.called {
+		t.Error("system resolver not asked once the record was shown to exist")
+	}
+}
+
+// TestConfirmedResolverReturnsTheSystemAnswer pins which addresses are handed
+// back: the ones the caller will actually connect to.
+func TestConfirmedResolverReturnsTheSystemAnswer(t *testing.T) {
+	want := netip.MustParseAddr("104.16.231.132")
+	source := &stubResolver{records: Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}}
+	system := &stubResolver{records: Records{A: []netip.Addr{want}}}
+	c := &confirmedResolver{source: source, system: system}
+
+	rec := c.Resolve("demo.trycloudflare.com")
+	if !slices.Equal(rec.A, []netip.Addr{want}) {
+		t.Errorf("A = %v, want the system resolver's %v", rec.A, want)
+	}
+}
+
 // answer builds a DNS reply carrying addrs of the question's type.
 func answer(t *testing.T, query []byte, addrs []netip.Addr) []byte {
 	t.Helper()
