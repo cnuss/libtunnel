@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -273,8 +274,22 @@ func TestWithEdgePinsAddresses(t *testing.T) {
 	if len(got) != 2 || got[0] != "relay.example:443" || got[1] != "relay2.example:443" {
 		t.Errorf("edge addrs = %v, want both pinned addresses", got)
 	}
-	if edgeAddresses(nil) != nil {
-		t.Error("unset must stay empty so the edge is discovered by SRV")
+}
+
+// TestEdgeDefaultsToTheRegions pins that the edge is never discovered by SRV:
+// unset falls back to the regions that lookup would have returned, so starting a
+// tunnel does not depend on an SRV query succeeding on the machine's resolver.
+func TestEdgeDefaultsToTheRegions(t *testing.T) {
+	t.Setenv(v1.CloudflareEdgeEnv, "")
+
+	got := edgeAddresses(nil)
+	if !slices.Equal(got, defaultEdgeAddrs) {
+		t.Errorf("edge addrs = %v, want the defaults %v", got, defaultEdgeAddrs)
+	}
+	for _, addr := range got {
+		if _, port, err := net.SplitHostPort(addr); err != nil || port != "7844" {
+			t.Errorf("default edge addr %q: want host:7844", addr)
+		}
 	}
 }
 
@@ -649,6 +664,44 @@ func TestEdgeUpWatcher(t *testing.T) {
 	}
 	if ch2 == ch {
 		t.Fatal("generation channel not swapped after up()")
+	}
+}
+
+// TestEdgeUpWatcherCountsAttempts pins the count edgeTimeout reports: every
+// Reconnecting the supervisor sends before the edge is up is one failed attempt
+// to reach it, and Connected events are not attempts.
+func TestEdgeUpWatcherCountsAttempts(t *testing.T) {
+	w := newEdgeUpWatcher()
+
+	if got := w.attemptCount(); got != 0 {
+		t.Fatalf("initial attemptCount() = %d, want 0", got)
+	}
+
+	w.attempt()
+	w.attempt()
+	w.up()
+
+	if got := w.attemptCount(); got != 2 {
+		t.Errorf("attemptCount() = %d, want 2", got)
+	}
+}
+
+// TestEdgeUnreachableWrapsSentinel pins the error a caller matches on: the
+// timeout reports v1.ErrEdgeUnreachable, and carries cloudflared's own
+// diagnosis of a blocked egress port — which cloudflared logs at a level the
+// tunnel's default logger discards.
+func TestEdgeUnreachableWrapsSentinel(t *testing.T) {
+	err := fmt.Errorf("%w: no connection after %d attempts in %s: %s",
+		v1.ErrEdgeUnreachable, 3, edgeTimeout, edgeBlockedHint)
+
+	if !errors.Is(err, v1.ErrEdgeUnreachable) {
+		t.Errorf("errors.Is(err, ErrEdgeUnreachable) = false, want true")
+	}
+	if !strings.Contains(err.Error(), "7844") {
+		t.Errorf("Err() = %q, want the blocked port named", err)
+	}
+	if !strings.Contains(err.Error(), "WithEdge") {
+		t.Errorf("Err() = %q, want the WithEdge way around it", err)
 	}
 }
 

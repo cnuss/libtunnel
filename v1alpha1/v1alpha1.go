@@ -22,12 +22,7 @@ import (
 	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
-	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
-
-func init() {
-	net.DefaultResolver = resolver.NewResolver()
-}
 
 // Engine is the alpha-internal contract behind v1.Backend: what the tunnel
 // core needs from a transport implementation. It extends the opaque

@@ -1,31 +1,146 @@
-package resolver_test
+package resolver
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"os"
+	"slices"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
-
-	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
-// serveDNS starts a UDP DNS server on loopback that answers each query with
-// handler's wire response, and returns its ip:port. The server stops on test
-// cleanup.
-func serveDNS(t *testing.T, handler func(dnsmessage.Question) []byte) string {
+// discard is the logger the resolvers under test write to: their debug lines
+// are diagnostic detail for a live run, not behaviour to pin.
+func discard() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
+// testCtx returns a context that outlives any healthy exchange but not a hung
+// test.
+func testCtx(t *testing.T) context.Context {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// deadDoH is a DoH endpoint nothing listens on, for tests that exercise the
+// direct path alone. The doh field must not be empty, but it may be useless.
+const deadDoH = "http://127.0.0.1:1/dns-query"
+
+// answer builds a DNS reply carrying addrs of the question's type, with the
+// AA bit set as given — a zone's own nameserver when true, something
+// answering in its place when false.
+func answer(t *testing.T, query []byte, authoritative bool, addrs []netip.Addr) []byte {
+	t.Helper()
+	var p dnsmessage.Parser
+	if _, err := p.Start(query); err != nil {
+		t.Fatalf("parse query: %v", err)
+	}
+	q, err := p.Question()
+	if err != nil {
+		t.Fatalf("read question: %v", err)
+	}
+
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		Response:           true,
+		Authoritative:      authoritative,
+		RecursionAvailable: !authoritative, // a stand-in resolver advertises recursion
+	})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Question(q); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.StartAnswers(); err != nil {
+		t.Fatal(err)
+	}
+	h := dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: 60}
+	for _, addr := range addrs {
+		var err error
+		switch {
+		case addr.Is4() && q.Type == dnsmessage.TypeA:
+			err = b.AResource(h, dnsmessage.AResource{A: addr.As4()})
+		case addr.Is6() && q.Type == dnsmessage.TypeAAAA:
+			err = b.AAAAResource(h, dnsmessage.AAAAResource{AAAA: addr.As16()})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	wire, err := b.Finish()
 	if err != nil {
 		t.Fatal(err)
+	}
+	return wire
+}
+
+// referral builds the reply a TLD server sends for a name it does not hold:
+// no answer, and the zone's nameserver addresses as glue in the additional
+// section.
+func referral(t *testing.T, query []byte, glue []netip.Addr) []byte {
+	t.Helper()
+	var p dnsmessage.Parser
+	if _, err := p.Start(query); err != nil {
+		t.Fatal(err)
+	}
+	q, err := p.Question()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Question(q); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.StartAdditionals(); err != nil {
+		t.Fatal(err)
+	}
+	h := dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: 60}
+	for _, addr := range glue {
+		var err error
+		if addr.Is4() {
+			err = b.AResource(h, dnsmessage.AResource{A: addr.As4()})
+		} else {
+			err = b.AAAAResource(h, dnsmessage.AAAAResource{AAAA: addr.As16()})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	wire, err := b.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
+// serveUDP stands up a UDP DNS server that replies with handler's wire
+// response, and returns its host:port.
+func serveUDP(t *testing.T, handler func(query []byte) []byte) string {
+	return serveUDPOn(t, "udp", "127.0.0.1:0", handler)
+}
+
+// serveUDPOn is serveUDP bound to a specific network and address — how a test
+// stands up a second nameserver: loopback has one IPv4 address, so the second
+// listens on [::1] at the same port and the referral's glue carries both.
+func serveUDPOn(t *testing.T, network, address string, handler func(query []byte) []byte) string {
+	t.Helper()
+	pc, err := net.ListenPacket(network, address)
+	if err != nil {
+		t.Skipf("cannot listen on %s %s: %v", network, address, err)
 	}
 	t.Cleanup(func() { pc.Close() })
 
@@ -36,15 +151,7 @@ func serveDNS(t *testing.T, handler func(dnsmessage.Question) []byte) string {
 			if err != nil {
 				return
 			}
-			var p dnsmessage.Parser
-			if _, err := p.Start(buf[:n]); err != nil {
-				continue
-			}
-			q, err := p.Question()
-			if err != nil {
-				continue
-			}
-			if resp := handler(q); resp != nil {
+			if resp := handler(buf[:n]); resp != nil {
 				pc.WriteTo(resp, addr)
 			}
 		}
@@ -52,427 +159,532 @@ func serveDNS(t *testing.T, handler func(dnsmessage.Question) []byte) string {
 	return pc.LocalAddr().String()
 }
 
-// respond builds a response to q with the given rcode and A/AAAA answers,
-// echoing q's header ID via a fresh parse of nothing (the test server discards
-// IDs; the resolver matches on question, not ID, for these single-shot tests).
-func respond(t *testing.T, q dnsmessage.Question, rcode dnsmessage.RCode, v4 [][4]byte, v6 [][16]byte) []byte {
+// serveDoH stands up a stub RFC 8484 endpoint. It records the requests it saw
+// so a test can assert on method and headers.
+func serveDoH(t *testing.T, addrs []netip.Addr) (endpoint string, seen *[]*http.Request) {
 	t.Helper()
-	// Authoritative: these stand in for the zone's own nameservers, which set AA
-	// on RD=0 answers.
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true, Authoritative: true, RCode: rcode})
-	b.EnableCompression()
-	if err := b.StartQuestions(); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Question(q); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.StartAnswers(); err != nil {
-		t.Fatal(err)
-	}
-	rh := dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: 60}
-	if q.Type == dnsmessage.TypeA {
-		for _, ip := range v4 {
-			if err := b.AResource(rh, dnsmessage.AResource{A: ip}); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if q.Type == dnsmessage.TypeAAAA {
-		for _, ip := range v6 {
-			if err := b.AAAAResource(rh, dnsmessage.AAAAResource{AAAA: ip}); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	wire, err := b.Finish()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return wire
-}
-
-// TestMain disables the DoH leg by default so the suite stays offline; the DoH
-// tests below point it at a local stub.
-func TestMain(m *testing.M) {
-	resolver.DoHEndpoint = ""
-	os.Exit(m.Run())
-}
-
-// serveDoH stands up a stub DNS-over-HTTPS endpoint answering the JSON form.
-func serveDoH(t *testing.T, status int, v4 []string) string {
-	t.Helper()
+	var requests []*http.Request
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		type rr struct {
-			Type int    `json:"type"`
-			Data string `json:"data"`
+		requests = append(requests, r.Clone(context.Background()))
+		query, err := io.ReadAll(io.LimitReader(r.Body, maxDNSMessage))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
-		out := struct {
-			Status int  `json:"Status"`
-			Answer []rr `json:"Answer"`
-		}{Status: status}
-		if r.URL.Query().Get("type") == "1" { // 1 = A, the numeric form query sends
-			for _, ip := range v4 {
-				out.Answer = append(out.Answer, rr{Type: 1, Data: ip})
-			}
-		}
-		w.Header().Set("Content-Type", "application/dns-json")
-		json.NewEncoder(w).Encode(out)
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.Write(answer(t, query, false, addrs))
 	}))
 	t.Cleanup(srv.Close)
-	return srv.URL
+	return srv.URL, &requests
 }
 
-// TestQueryDoHBeatsHijackedNegative is the hotel/hotspot case: BOTH plaintext
-// transports are intercepted and serve a stale NXDOMAIN for a name that has
-// since been published. Believing them hangs readiness forever (observed live:
-// DoH saw the record 10s in, plain DNS said NXDOMAIN indefinitely). The DoH leg
-// must win, and the fast local negative must not short-circuit the race.
-func TestQueryDoHBeatsHijackedNegative(t *testing.T) {
-	hijacked := func(q dnsmessage.Question) []byte {
-		return respondNonAuth(t, q, dnsmessage.RCodeNameError)
-	}
-	server := serveDNSSplit(t, hijacked, hijacked)
-	resolver.DoHEndpoint = serveDoH(t, 0, []string{"104.16.230.132"})
-	t.Cleanup(func() { resolver.DoHEndpoint = "" })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	rec, err := resolver.Query(ctx, server, "demo.trycloudflare.com")
-	if err != nil {
-		t.Fatalf("DoH should resolve past a hijacked NXDOMAIN: %v", err)
-	}
-	if len(rec.A) != 1 || rec.A[0] != netip.AddrFrom4([4]byte{104, 16, 230, 132}) {
-		t.Errorf("A = %v, want the DoH answer", rec.A)
-	}
-}
-
-// TestQueryDoHNegativeIsBelieved pins the other side: when DoH also says the
-// name does not exist, that is a trustworthy "not published yet" — empty
-// records and a nil error, so the caller keeps polling rather than erroring.
-func TestQueryDoHNegativeIsBelieved(t *testing.T) {
-	hijacked := func(q dnsmessage.Question) []byte {
-		return respondNonAuth(t, q, dnsmessage.RCodeNameError)
-	}
-	server := serveDNSSplit(t, hijacked, hijacked)
-	resolver.DoHEndpoint = serveDoH(t, 3, nil) // 3 = NXDOMAIN
-	t.Cleanup(func() { resolver.DoHEndpoint = "" })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	rec, err := resolver.Query(ctx, server, "demo.trycloudflare.com")
-	if err != nil {
-		t.Fatalf("a DoH negative is definitive, not an error: %v", err)
-	}
-	if !rec.Empty() {
-		t.Errorf("records = %+v, want empty", rec)
-	}
-}
-
-// respondNonAuth builds a reply with the given rcode and no AA bit — what an
-// on-path interceptor returns while standing in for the zone's nameserver.
-func respondNonAuth(t *testing.T, q dnsmessage.Question, rcode dnsmessage.RCode) []byte {
+// splitHostPort splits a host:port into a netip.Addr and the port string.
+func splitHostPort(t *testing.T, hostport string) (netip.Addr, string) {
 	t.Helper()
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true, RecursionAvailable: true, RCode: rcode})
-	b.EnableCompression()
-	if err := b.StartQuestions(); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Question(q); err != nil {
-		t.Fatal(err)
-	}
-	wire, err := b.Finish()
+	ap, err := netip.ParseAddrPort(hostport)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return wire
+	return ap.Addr(), strconv.Itoa(int(ap.Port()))
 }
 
-// parseQ extracts the question from a raw DNS message.
-func parseQ(b []byte) (dnsmessage.Question, bool) {
+// TestResolveWalksDelegation pins the direct path: a TLD server hands back
+// glue, and the zone's own nameserver — answering authoritatively — supplies
+// the records. Neither step touches a recursive resolver, so neither can serve
+// a cached negative.
+func TestResolveWalksDelegation(t *testing.T) {
+	v4 := netip.MustParseAddr("104.16.230.132")
+	v6 := netip.MustParseAddr("2606:4700::6810:e684")
+
+	zone := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, true, []netip.Addr{v4, v6})
+	})
+	zoneAddr, zonePort := splitHostPort(t, zone)
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{zoneAddr})
+	})
+
+	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, port: zonePort, log: discard()}
+
+	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
+	if !slices.Equal(rec.A, []netip.Addr{v4}) {
+		t.Errorf("A = %v, want %v from the zone's nameserver", rec.A, v4)
+	}
+	if !slices.Equal(rec.AAAA, []netip.Addr{v6}) {
+		t.Errorf("AAAA = %v, want %v", rec.AAAA, v6)
+	}
+}
+
+// TestResolveDiscardsNonAuthoritativeAnswers is the intercepted network, and
+// the case the AA requirement exists for: something answers in the zone
+// nameserver's place, plausibly and with records — a captive portal resolves
+// every name to itself — but it cannot set AA honestly, so its answer must not
+// mark the hostname ready. DoH, which interception cannot touch, decides
+// instead.
+func TestResolveDiscardsNonAuthoritativeAnswers(t *testing.T) {
+	poison := netip.MustParseAddr("192.0.2.1") // the portal's own address
+	honest := netip.MustParseAddr("104.16.230.132")
+
+	middlebox := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, false, []netip.Addr{poison})
+	})
+	middleAddr, middlePort := splitHostPort(t, middlebox)
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{middleAddr})
+	})
+	doh, _ := serveDoH(t, []netip.Addr{honest})
+
+	r := &resolver{tlds: []string{tld}, doh: []string{doh}, port: middlePort, log: discard()}
+
+	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
+	if !slices.Equal(rec.A, []netip.Addr{honest}) {
+		t.Errorf("A = %v, want DoH's %v — a non-authoritative answer was believed", rec.A, honest)
+	}
+}
+
+// TestResolveWaitsForFleetConsensus pins the consensus rule. The record
+// propagates across the zone's nameservers asynchronously; readiness on the
+// first sighting releases a caller whose own resolver can still hit the
+// lagging nameserver and cache the negative this package exists to avoid.
+// Measured live: a CI runner's readiness fired off one nameserver while
+// another still lacked the A record, and the example's client — asking its
+// machine's resolver like any visitor — got AAAA-only for the rest of the
+// run. So an authoritative "not yet" from any nameserver holds readiness
+// open until the whole fleet serves the record.
+func TestResolveWaitsForFleetConsensus(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+	var published atomic.Bool
+
+	prompt := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	promptAddr, port := splitHostPort(t, prompt)
+	laggard := serveUDPOn(t, "udp6", "[::1]:"+port, func(query []byte) []byte {
+		if !published.Load() {
+			return answer(t, query, true, nil) // authoritative "not yet"
+		}
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	laggardAddr, _ := splitHostPort(t, laggard)
+
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{promptAddr, laggardAddr})
+	})
+
+	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, port: port, log: discard()}
+
+	ctx := testCtx(t)
+	done := make(chan Records, 1)
+	go func() { done <- r.Resolve(ctx, "demo.trycloudflare.com") }()
+
+	select {
+	case rec := <-done:
+		t.Fatalf("Resolve() = %+v while a nameserver still lacked the record", rec)
+	case <-time.After(600 * time.Millisecond):
+	}
+
+	published.Store(true)
+	select {
+	case rec := <-done:
+		if !slices.Equal(rec.A, []netip.Addr{want}) {
+			t.Errorf("A = %v, want %v once the fleet agrees", rec.A, want)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Resolve never returned once every nameserver served the record")
+	}
+}
+
+// TestResolveWaitsForRecursiveVantage pins the DoH endpoints as voters, not
+// tie-breakers. The zone's own nameservers all serving the record proves the
+// authoritative fleet agrees — but a visitor resolves recursively, through
+// anycast nodes the authoritative view cannot see. Measured live on CI: full
+// authoritative consensus, and the client's resolver still answered AAAA-only
+// for A. A recursive endpoint that answers without the record is an objection
+// that holds readiness open until its view catches up.
+func TestResolveWaitsForRecursiveVantage(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+	var published atomic.Bool
+
+	zone := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	zoneAddr, zonePort := splitHostPort(t, zone)
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{zoneAddr})
+	})
+	laggard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query, err := io.ReadAll(io.LimitReader(r.Body, maxDNSMessage))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		if !published.Load() {
+			w.Write(answer(t, query, false, nil)) // answers, but has no record yet
+			return
+		}
+		w.Write(answer(t, query, false, []netip.Addr{want}))
+	}))
+	t.Cleanup(laggard.Close)
+
+	r := &resolver{tlds: []string{tld}, doh: []string{laggard.URL}, port: zonePort, log: discard()}
+
+	ctx := testCtx(t)
+	done := make(chan Records, 1)
+	go func() { done <- r.Resolve(ctx, "demo.trycloudflare.com") }()
+
+	select {
+	case rec := <-done:
+		t.Fatalf("Resolve() = %+v while a recursive endpoint still lacked the record", rec)
+	case <-time.After(600 * time.Millisecond):
+	}
+
+	published.Store(true)
+	select {
+	case rec := <-done:
+		if !slices.Equal(rec.A, []netip.Addr{want}) {
+			t.Errorf("A = %v, want %v once every voice serves it", rec.A, want)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Resolve never returned once the recursive endpoint caught up")
+	}
+}
+
+// TestResolveServedVoiceCannotUnserve pins the ratchet. A recursive fleet's
+// anycast nodes flap between fresh and stale views — measured live as all
+// three DoH endpoints alternating served and not-served for a full minute —
+// so unanimity within a single round may never happen. A voice that has
+// served the record once has proven the record reached it; when it later
+// flaps back to a stale view, that objection is spent. Two endpoints
+// objecting in opposite phase agree on no single round, and only the ratchet
+// lets their votes settle.
+func TestResolveServedVoiceCannotUnserve(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+
+	zone := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	zoneAddr, zonePort := splitHostPort(t, zone)
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{zoneAddr})
+	})
+
+	// Each endpoint alternates per A query — the AAAA follow-ups leave the
+	// phase alone — and the two start in opposite phase, so no round sees
+	// both serve at once.
+	flapper := func(startServing bool) string {
+		var calls atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			query, err := io.ReadAll(io.LimitReader(r.Body, maxDNSMessage))
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			var p dnsmessage.Parser
+			if _, err := p.Start(query); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			q, err := p.Question()
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			serving := q.Type == dnsmessage.TypeA && (calls.Add(1)%2 == 1) == startServing
+			w.Header().Set("Content-Type", "application/dns-message")
+			if serving {
+				w.Write(answer(t, query, false, []netip.Addr{want}))
+				return
+			}
+			w.Write(answer(t, query, false, nil))
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL
+	}
+
+	r := &resolver{
+		tlds: []string{tld},
+		doh:  []string{flapper(true), flapper(false)},
+		port: zonePort,
+		log:  discard(),
+	}
+
+	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
+	if !slices.Equal(rec.A, []netip.Addr{want}) {
+		t.Errorf("A = %v, want %v — flapping endpoints should settle through the ratchet", rec.A, want)
+	}
+}
+
+// TestResolveSilentNameserverForfeitsVote pins the escape from consensus: a
+// nameserver that never answers cannot hold readiness hostage. When the next
+// round starts, the still-silent forfeit their vote and the nameservers that
+// did answer decide.
+func TestResolveSilentNameserverForfeitsVote(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+
+	prompt := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	promptAddr, port := splitHostPort(t, prompt)
+	silent := serveUDPOn(t, "udp6", "[::1]:"+port, func([]byte) []byte { return nil })
+	silentAddr, _ := splitHostPort(t, silent)
+
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{promptAddr, silentAddr})
+	})
+
+	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, port: port, log: discard()}
+
+	start := time.Now()
+	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
+	if !slices.Equal(rec.A, []netip.Addr{want}) {
+		t.Errorf("A = %v, want %v from the nameserver that answered", rec.A, want)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("Resolve took %s — a silent nameserver held the verdict", elapsed)
+	}
+}
+
+// TestResolveViaDoHWhenWalkHasNowhereToGo pins the other interception shape: a
+// network that answers the TLD query itself returns an answer, not a referral,
+// so the walk finds no glue and DoH is the source that resolves.
+func TestResolveViaDoHWhenWalkHasNowhereToGo(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+
+	tld := serveUDP(t, func(query []byte) []byte {
+		return answer(t, query, false, []netip.Addr{netip.MustParseAddr("192.0.2.1")})
+	})
+	doh, _ := serveDoH(t, []netip.Addr{want})
+
+	r := &resolver{tlds: []string{tld}, doh: []string{doh}, log: discard()}
+
+	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
+	if !slices.Equal(rec.A, []netip.Addr{want}) {
+		t.Errorf("A = %v, want DoH's %v", rec.A, want)
+	}
+}
+
+// TestResolveKeepsAskingUntilPublished pins the wait itself: a name that is
+// not published on the first round is asked about again, and Resolve returns
+// as soon as a round finds it. This is the readiness scenario — the record
+// appears moments after the first query misses.
+func TestResolveKeepsAskingUntilPublished(t *testing.T) {
+	want := netip.MustParseAddr("104.16.230.132")
+	var published atomic.Bool
+
+	zone := serveUDP(t, func(query []byte) []byte {
+		if !published.Load() {
+			return answer(t, query, true, nil)
+		}
+		return answer(t, query, true, []netip.Addr{want})
+	})
+	zoneAddr, zonePort := splitHostPort(t, zone)
+	tld := serveUDP(t, func(query []byte) []byte {
+		return referral(t, query, []netip.Addr{zoneAddr})
+	})
+
+	r := &resolver{tlds: []string{tld}, doh: []string{deadDoH}, port: zonePort, log: discard()}
+
+	time.AfterFunc(300*time.Millisecond, func() { published.Store(true) })
+	rec := r.Resolve(testCtx(t), "demo.trycloudflare.com")
+	if !slices.Equal(rec.A, []netip.Addr{want}) {
+		t.Errorf("A = %v, want %v once published", rec.A, want)
+	}
+}
+
+// TestResolveReturnsEmptyWhenCtxEnds pins the only way Resolve gives up: the
+// caller's ctx. Nothing answers here — the network drops every query — and
+// Resolve must come back empty when told to stop, not hang on the reads.
+func TestResolveReturnsEmptyWhenCtxEnds(t *testing.T) {
+	silent := serveUDP(t, func([]byte) []byte { return nil })
+
+	r := &resolver{tlds: []string{silent}, doh: []string{deadDoH}, log: discard()}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	rec := r.Resolve(ctx, "demo.trycloudflare.com")
+	if !rec.Empty() {
+		t.Errorf("Resolve() = %+v, want empty Records when ctx ends first", rec)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Resolve returned %s after ctx ended — hung on unanswered queries", elapsed)
+	}
+}
+
+// TestDoHRequestIsUncacheable pins the request shape. Readiness asks the same
+// name repeatedly while it is still unpublished, so a reply that an HTTP cache
+// may reuse is the one thing that must not happen: RFC 8484 responses to POST
+// are not cached, and Cache-Control asks the endpoint for a fresh answer.
+func TestDoHRequestIsUncacheable(t *testing.T) {
+	endpoint, seen := serveDoH(t, []netip.Addr{netip.MustParseAddr("1.2.3.4")})
+
+	if addrs, ok := queryDoH(testCtx(t), endpoint, "demo.trycloudflare.com", dnsmessage.TypeA); !ok || len(addrs) == 0 {
+		t.Fatal("queryDoH returned nothing from a live stub")
+	}
+	if len(*seen) == 0 {
+		t.Fatal("no request reached the endpoint")
+	}
+	for _, req := range *seen {
+		if req.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST (a GET reply is cacheable)", req.Method)
+		}
+		if got := req.Header.Get("Content-Type"); got != "application/dns-message" {
+			t.Errorf("Content-Type = %q, want application/dns-message", got)
+		}
+		if got := req.Header.Get("Accept"); got != "application/dns-message" {
+			t.Errorf("Accept = %q, want application/dns-message", got)
+		}
+		if got := req.Header.Get("Cache-Control"); got != "no-cache" {
+			t.Errorf("Cache-Control = %q, want no-cache", got)
+		}
+	}
+}
+
+// TestParseAnswerReportsAuthority pins the AA bit's journey through the
+// parser: the direct path trusts nothing without it.
+func TestParseAnswerReportsAuthority(t *testing.T) {
+	v4 := netip.MustParseAddr("104.16.230.132")
+	query, err := buildQuery("demo.trycloudflare.com", dnsmessage.TypeA, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, authoritative := range []bool{true, false} {
+		addrs, aa, err := parseAnswer(answer(t, query, authoritative, []netip.Addr{v4}), dnsmessage.TypeA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if aa != authoritative {
+			t.Errorf("authoritative = %v, want %v", aa, authoritative)
+		}
+		if !slices.Equal(addrs, []netip.Addr{v4}) {
+			t.Errorf("addrs = %v, want %v", addrs, []netip.Addr{v4})
+		}
+	}
+}
+
+// TestParseAnswerSkipsOtherTypes pins that a reply read for one family yields
+// nothing of the other.
+func TestParseAnswerSkipsOtherTypes(t *testing.T) {
+	query, err := buildQuery("demo.trycloudflare.com", dnsmessage.TypeA, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := answer(t, query, true, []netip.Addr{netip.MustParseAddr("104.16.230.132")})
+
+	addrs, _, err := parseAnswer(wire, dnsmessage.TypeAAAA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addrs) != 0 {
+		t.Errorf("AAAA addrs = %v, want none", addrs)
+	}
+}
+
+func TestParseAnswerRejectsMalformed(t *testing.T) {
+	if _, _, err := parseAnswer([]byte{0x00, 0x01}, dnsmessage.TypeA); err == nil {
+		t.Error("malformed response should error")
+	}
+}
+
+// TestParseGlueSkipsNonAddressRecords pins that OPT — which every query now
+// provokes, since EDNS0 is advertised — does not derail the glue scan.
+func TestParseGlueSkipsNonAddressRecords(t *testing.T) {
+	v4 := netip.MustParseAddr("192.0.2.53")
+	v6 := netip.MustParseAddr("2001:db8::53")
+	query, err := buildQuery("demo.trycloudflare.com", dnsmessage.TypeA, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addrs, err := parseGlue(referral(t, query, []netip.Addr{v4, v6}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(addrs, []netip.Addr{v4, v6}) {
+		t.Errorf("glue = %v, want %v", addrs, []netip.Addr{v4, v6})
+	}
+}
+
+// TestBuildQueryAdvertisesEDNS0 guards the buffer size. Without it a reply is
+// capped at 512 bytes, and a delegation's glue is exactly what gets cut — one
+// measured referral carried 20 addresses.
+func TestBuildQueryAdvertisesEDNS0(t *testing.T) {
+	query, err := buildQuery("demo.trycloudflare.com", dnsmessage.TypeA, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var p dnsmessage.Parser
-	if _, err := p.Start(b); err != nil {
-		return dnsmessage.Question{}, false
+	if _, err := p.Start(query); err != nil {
+		t.Fatal(err)
 	}
-	q, err := p.Question()
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SkipAllAnswers(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SkipAllAuthorities(); err != nil {
+		t.Fatal(err)
+	}
+	h, err := p.AdditionalHeader()
 	if err != nil {
-		return dnsmessage.Question{}, false
+		t.Fatalf("no additional section: EDNS0 not advertised")
 	}
-	return q, true
+	if h.Type != dnsmessage.TypeOPT {
+		t.Fatalf("additional record type = %v, want OPT", h.Type)
+	}
+	if got := h.DNSSECAllowed(); got {
+		t.Error("DNSSEC OK should not be set")
+	}
+	// The OPT record's class carries the advertised UDP payload size.
+	if uint16(h.Class) != maxUDPResponse {
+		t.Errorf("advertised buffer = %d, want %d", uint16(h.Class), maxUDPResponse)
+	}
 }
 
-// serveDNSSplit listens for DNS on both UDP and TCP at one loopback ip:port,
-// answering each transport from its own handler — so a test can simulate a
-// network where UDP/53 is intercepted but TCP reaches the real server. Returns
-// the shared ip:port.
-func serveDNSSplit(t *testing.T, udp, tcp func(dnsmessage.Question) []byte) string {
-	t.Helper()
-	tcpL, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { tcpL.Close() })
-	addr := tcpL.Addr().String()
-	pc, err := net.ListenPacket("udp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { pc.Close() })
-
-	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, raddr, err := pc.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			if q, ok := parseQ(buf[:n]); ok {
-				if resp := udp(q); resp != nil {
-					pc.WriteTo(resp, raddr)
-				}
-			}
+// TestShuffledIsAPermutation guards a bug this replaced: writing each element
+// to a random index drops roughly a third of them, leaving empty strings that
+// are then dialed.
+func TestShuffledIsAPermutation(t *testing.T) {
+	in := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"}
+	for range 50 {
+		got := shuffled(in)
+		if len(got) != len(in) {
+			t.Fatalf("len = %d, want %d", len(got), len(in))
 		}
-	}()
-	go func() {
-		for {
-			conn, err := tcpL.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer conn.Close()
-				var length uint16
-				if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-					return
-				}
-				msg := make([]byte, length)
-				if _, err := io.ReadFull(conn, msg); err != nil {
-					return
-				}
-				q, ok := parseQ(msg)
-				if !ok {
-					return
-				}
-				resp := tcp(q)
-				if resp == nil {
-					return
-				}
-				out := make([]byte, 2+len(resp))
-				binary.BigEndian.PutUint16(out, uint16(len(resp)))
-				copy(out[2:], resp)
-				conn.Write(out)
-			}()
-		}
-	}()
-	return addr
-}
-
-// nonAuthRefused mimics an intercepting recursive resolver answering an RD=0
-// query for a zone it is not authoritative for: RA set, no AA, REFUSED.
-func nonAuthRefused(t *testing.T, q dnsmessage.Question) []byte {
-	t.Helper()
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true, RecursionAvailable: true, RCode: dnsmessage.RCodeRefused})
-	b.EnableCompression()
-	if err := b.StartQuestions(); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Question(q); err != nil {
-		t.Fatal(err)
-	}
-	wire, err := b.Finish()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return wire
-}
-
-// TestQueryRacesTCPWhenUDPIntercepted pins the #123 fix: UDP/53 answers with a
-// hijacked non-authoritative REFUSED, TCP with the real authoritative record.
-// The race must take the TCP answer instead of hanging on the UDP REFUSED.
-func TestQueryRacesTCPWhenUDPIntercepted(t *testing.T) {
-	v4 := [][4]byte{{104, 16, 230, 132}}
-	server := serveDNSSplit(t,
-		func(q dnsmessage.Question) []byte { return nonAuthRefused(t, q) },
-		func(q dnsmessage.Question) []byte { return respond(t, q, dnsmessage.RCodeSuccess, v4, nil) },
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	rec, err := resolver.Query(ctx, server, "demo.trycloudflare.com")
-	if err != nil {
-		t.Fatalf("race should resolve over TCP when UDP is intercepted: %v", err)
-	}
-	if len(rec.A) != 1 || rec.A[0] != netip.AddrFrom4(v4[0]) {
-		t.Errorf("A = %v, want the TCP authoritative answer %v", rec.A, v4[0])
-	}
-}
-
-// nonAuthAnswer mimics a transparent recursive resolver that answers CORRECTLY
-// but does not set AA: RA set, NOERROR, real records. Common on home and
-// corporate networks.
-func nonAuthAnswer(t *testing.T, q dnsmessage.Question, v4 [][4]byte) []byte {
-	t.Helper()
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true, RecursionAvailable: true})
-	b.EnableCompression()
-	if err := b.StartQuestions(); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Question(q); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.StartAnswers(); err != nil {
-		t.Fatal(err)
-	}
-	if q.Type == dnsmessage.TypeA {
-		rh := dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: 60}
-		for _, ip := range v4 {
-			if err := b.AResource(rh, dnsmessage.AResource{A: ip}); err != nil {
-				t.Fatal(err)
-			}
+		sorted := slices.Clone(got)
+		slices.Sort(sorted)
+		if !slices.Equal(sorted, in) {
+			t.Fatalf("not a permutation: %v", got)
 		}
 	}
-	wire, err := b.Finish()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return wire
-}
-
-// TestQueryAcceptsNonAuthoritativeRecords is the regression guard for the AA
-// requirement that shipped in v0.0.39: a transparent resolver that answers
-// correctly without setting AA must still be believed. Requiring AA made every
-// probe fail on such networks, so hostname readiness never fired and the tunnel
-// hung at "waiting for DNS" forever. Records are the readiness signal — trust
-// them whether or not AA is set.
-func TestQueryAcceptsNonAuthoritativeRecords(t *testing.T) {
-	v4 := [][4]byte{{104, 16, 230, 132}}
-	server := serveDNSSplit(t,
-		func(q dnsmessage.Question) []byte { return nonAuthAnswer(t, q, v4) },
-		func(q dnsmessage.Question) []byte { return nonAuthAnswer(t, q, v4) },
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	rec, err := resolver.Query(ctx, server, "demo.trycloudflare.com")
-	if err != nil {
-		t.Fatalf("a correct answer without AA must be accepted, got error: %v", err)
-	}
-	if len(rec.A) != 1 || rec.A[0] != netip.AddrFrom4(v4[0]) {
-		t.Errorf("A = %v, want %v from the non-authoritative answer", rec.A, v4[0])
+	// The input must not be reordered under the caller.
+	if !slices.IsSorted(in) {
+		t.Error("shuffled mutated its argument")
 	}
 }
 
-// TestQueryNonAuthoritativeIsRejected pins that a non-authoritative NEGATIVE is
-// never trusted: when both transports return a hijacked (no-AA, no records)
-// response, Query errors rather than accepting it as "not published" or hanging.
-func TestQueryNonAuthoritativeIsRejected(t *testing.T) {
-	server := serveDNSSplit(t,
-		func(q dnsmessage.Question) []byte { return nonAuthRefused(t, q) },
-		func(q dnsmessage.Question) []byte { return nonAuthRefused(t, q) },
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := resolver.Query(ctx, server, "demo.trycloudflare.com"); err == nil {
-		t.Error("both transports non-authoritative should error, not succeed")
+func TestDNSName(t *testing.T) {
+	for in, want := range map[string]string{
+		"demo.trycloudflare.com":  "demo.trycloudflare.com.",
+		"demo.trycloudflare.com.": "demo.trycloudflare.com.",
+	} {
+		if got := dnsName(in); got != want {
+			t.Errorf("dnsName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
-func TestQueryReturnsSortedRecords(t *testing.T) {
-	v4 := [][4]byte{{104, 16, 231, 132}, {104, 16, 230, 132}}
-	v6 := [][16]byte{{0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x68, 0x10, 0xe6, 0x84}}
-	server := serveDNS(t, func(q dnsmessage.Question) []byte {
-		return respond(t, q, dnsmessage.RCodeSuccess, v4, v6)
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	rec, err := resolver.Query(ctx, server, "demo.trycloudflare.com")
-	if err != nil {
-		t.Fatal(err)
+func TestRecordsEmpty(t *testing.T) {
+	if !(Records{}).Empty() {
+		t.Error("zero Records should be empty")
 	}
-
-	wantA := []netip.Addr{netip.AddrFrom4([4]byte{104, 16, 230, 132}), netip.AddrFrom4([4]byte{104, 16, 231, 132})}
-	if rec.A[0] != wantA[0] || rec.A[1] != wantA[1] {
-		t.Errorf("A = %v, want sorted %v", rec.A, wantA)
+	if (Records{A: []netip.Addr{netip.MustParseAddr("1.2.3.4")}}).Empty() {
+		t.Error("Records with an A record should not be empty")
 	}
-	if len(rec.AAAA) != 1 || rec.AAAA[0] != netip.AddrFrom16(v6[0]) {
-		t.Errorf("AAAA = %v, want one address", rec.AAAA)
-	}
-	if rec.Empty() {
-		t.Error("Empty() = true for a populated record set")
-	}
-}
-
-func TestQueryNXDOMAINIsEmptyNotError(t *testing.T) {
-	server := serveDNS(t, func(q dnsmessage.Question) []byte {
-		return respond(t, q, dnsmessage.RCodeNameError, nil, nil)
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	rec, err := resolver.Query(ctx, server, "missing.trycloudflare.com")
-	if err != nil {
-		t.Fatalf("NXDOMAIN should not error: %v", err)
-	}
-	if !rec.Empty() {
-		t.Errorf("records = %+v, want empty for NXDOMAIN", rec)
-	}
-}
-
-func TestQueryServerFailureIsError(t *testing.T) {
-	server := serveDNS(t, func(q dnsmessage.Question) []byte {
-		return respond(t, q, dnsmessage.RCodeServerFailure, nil, nil)
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := resolver.Query(ctx, server, "demo.trycloudflare.com"); err == nil {
-		t.Error("SERVFAIL should be an error")
-	}
-}
-
-func TestRecordsEqual(t *testing.T) {
-	a := resolver.Records{
-		A:    []netip.Addr{netip.AddrFrom4([4]byte{1, 1, 1, 1})},
-		AAAA: []netip.Addr{netip.AddrFrom16([16]byte{0x20, 0x01})},
-	}
-	same := resolver.Records{
-		A:    []netip.Addr{netip.AddrFrom4([4]byte{1, 1, 1, 1})},
-		AAAA: []netip.Addr{netip.AddrFrom16([16]byte{0x20, 0x01})},
-	}
-	diff := resolver.Records{A: []netip.Addr{netip.AddrFrom4([4]byte{1, 1, 1, 2})}}
-
-	if !a.Equal(same) {
-		t.Error("Equal = false for identical records")
-	}
-	if a.Equal(diff) {
-		t.Error("Equal = true for differing records")
-	}
-}
-
-// TestNewResolverDialsPacketConn guards the framing seam: Go's resolver
-// type-asserts the dialed conn to net.PacketConn to choose datagram (bare) over
-// stream (length-prefixed) framing. The NXDOMAIN/timeout repair parses bare
-// messages, so the wrapper must keep presenting as a PacketConn on the UDP path.
-// If a future edit drops that interface, framing silently flips to stream and
-// the 2-byte length prefix desyncs every parse — this test fails first.
-func TestNewResolverDialsPacketConn(t *testing.T) {
-	server := serveDNS(t, func(q dnsmessage.Question) []byte {
-		return respond(t, q, dnsmessage.RCodeSuccess, [][4]byte{{1, 2, 3, 4}}, nil)
-	})
-
-	r := resolver.NewResolver()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	conn, err := r.Dial(ctx, "udp", server)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	if _, ok := conn.(net.PacketConn); !ok {
-		t.Fatalf("UDP conn %T does not implement net.PacketConn: Go will use stream framing and the repair parser will desync", conn)
+	if !(Records{AAAA: []netip.Addr{netip.MustParseAddr("::1")}}).Empty() {
+		t.Error("Records with only an AAAA record should be empty: IPv6 alone is not reachable everywhere")
 	}
 }

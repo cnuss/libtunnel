@@ -92,7 +92,7 @@ func TestMintCachesSpec(t *testing.T) {
 	t.Setenv(v1.SpecEnv, "") // force the mint path, not adopt
 
 	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "cached.trycloudflare.com"}}
-	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background()); err != nil {
+	if _, err := v1alpha1.Env("cloudflare", next).Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -113,7 +113,7 @@ func TestAdoptedSpecIsNotCached(t *testing.T) {
 	t.Setenv(v1.SpecEnv, `{"backend":"cloudflare","spec":{"hostname":"adopted.trycloudflare.com"}}`)
 
 	next := &trackingProvider{}
-	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background()); err != nil {
+	if _, err := v1alpha1.Env("cloudflare", next).Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -288,7 +288,7 @@ func TestEnvProviderAdoptsEnvironment(t *testing.T) {
 	t.Setenv(v1.SpecEnv, `{"backend":"cloudflare","spec":{"hostname":"fromenv.trycloudflare.com"}}`)
 
 	next := &trackingProvider{}
-	spec, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background())
+	spec, err := v1alpha1.Env("cloudflare", next).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestEnvProviderFallsBack(t *testing.T) {
 	t.Setenv(v1.SpecEnv, "")
 
 	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "minted.trycloudflare.com"}}
-	spec, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background())
+	spec, err := v1alpha1.Env("cloudflare", next).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +351,7 @@ func TestEnvProviderForwardsLogger(t *testing.T) {
 	want := slog.New(slog.DiscardHandler)
 	inner := &loggingProvider{trackingProvider: trackingProvider{spec: &cloudflare.Spec{}}}
 
-	wrapped := v1alpha1.Env[cloudflare.Spec]("cloudflare", inner)
+	wrapped := v1alpha1.Env("cloudflare", inner)
 	if pl, ok := wrapped.(interface{ SetLogger(*slog.Logger) }); !ok {
 		t.Fatal("Env provider does not forward SetLogger")
 	} else {
@@ -386,7 +386,7 @@ func TestEnvProviderExportsMintedSpec(t *testing.T) {
 	t.Setenv(v1.SpecEnv, "")
 
 	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "minted.trycloudflare.com"}}
-	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", next).Spec(context.Background()); err != nil {
+	if _, err := v1alpha1.Env("cloudflare", next).Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -403,12 +403,12 @@ func TestEnvProviderNeverAdoptsOwnExport(t *testing.T) {
 	t.Setenv(v1.SpecEnv, "")
 
 	first := &trackingProvider{spec: &cloudflare.Spec{Hostname: "alpha.trycloudflare.com"}}
-	if _, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", first).Spec(context.Background()); err != nil {
+	if _, err := v1alpha1.Env("cloudflare", first).Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
 	second := &trackingProvider{spec: &cloudflare.Spec{Hostname: "beta.trycloudflare.com"}}
-	spec, err := v1alpha1.Env[cloudflare.Spec]("cloudflare", second).Spec(context.Background())
+	spec, err := v1alpha1.Env("cloudflare", second).Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

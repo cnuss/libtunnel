@@ -1,679 +1,407 @@
-// Package resolver does direct DNS lookups against a specific server — the
-// dig(1) equivalent: build the query with golang.org/x/net/dns/dnsmessage, send
-// it over UDP (retrying over TCP when the answer is truncated), and parse the
-// reply. It backs hostname-readiness polling, which queries a zone's
-// authoritative nameservers directly so a recursive resolver's negative cache
-// never delays readiness.
+// Package resolver waits for a hostname to resolve, asking only sources that
+// cannot serve a cached negative.
 //
-// Queries are nonrecursive (RD=0): they target the zone's authoritative
-// nameservers, which answer in-zone names authoritatively (the AA bit) whether
-// or not recursion is requested, so RD is unnecessary — and a nonrecursive
-// query can't be served from any recursive cache.
+// It backs tunnel hostname readiness: the edge publishes the record moments
+// after the connection registers, and readiness wants the earliest honest yes.
+// A recursive resolver answers that badly — under RFC 2308 it caches the
+// negative it got before publication for as long as the zone's SOA allows, 30
+// minutes for the zones here. The machine's own resolver is worst of all: one
+// query about the not-yet-published name would fix that negative in place on
+// the very resolver the calling process will use to connect. Nothing here asks
+// it, ever.
+//
+// Ready means consensus, not first sighting. The record propagates across the
+// zone's nameservers — and across each nameserver's anycast nodes — over
+// seconds, and a caller told "ready" during that spread can ask its own
+// resolver, hit a node the record has not reached, and cache the negative for
+// the zone's SOA. So every voice that can be heard votes, and readiness waits
+// for agreement:
+//
+//   - The zone's own nameservers, found by following a TLD server's referral
+//     and asked all at once. Only replies carrying the AA bit have a voice:
+//     on networks that intercept port 53 — hotel and hotspot wifi, corporate
+//     proxies — whatever answers in the nameserver's place is not
+//     authoritative for the zone and cannot set that bit honestly.
+//   - DoH endpoints (RFC 8484), which ride HTTPS and so pass through networks
+//     that intercept port 53. They are recursive resolvers with anycast
+//     fleets of their own — the vantage a visitor actually resolves from,
+//     which the authoritative view alone cannot see. They join only after the
+//     authoritative fleet agrees: asked earlier, they would recurse for a
+//     name that does not exist yet and cache the negative — measured live as
+//     all three endpoints flapping stale negatives, planted by this package's
+//     own early rounds, for the rest of the wait.
+//
+// A round is ready when someone serves the record and nobody answers without
+// it; one "not yet" from either kind of voice holds readiness open. Voices
+// that cannot be heard at all — unreachable, blocked, intercepted — forfeit
+// rather than veto, so consensus needs whoever can answer, not everyone. And
+// consensus only ratchets forward: a voice that has served the record once
+// has proven the record reached it, and an anycast node behind it flapping
+// back to a stale view cannot take that vote away.
+//
+// Where no authoritative voice can be heard at all — port 53 intercepted or
+// blocked — the DoH endpoints are the only voices left, and the first of them
+// to serve the record decides. Unanimity there would measure nothing: the
+// negatives their fleets may hold are indistinguishable from the ones this
+// package's own pre-publication queries just planted.
+//
+// There are no timeouts here. Resolve keeps asking — a fresh round of queries
+// every resolveInterval, rotating through servers — until an answer arrives or
+// ctx ends. How long to wait is the caller's decision, expressed through ctx;
+// a query the network never answers is abandoned when ctx is done, not before.
+// The one clock consensus needs — how long to wait for a voice that may never
+// reply — is the pacing itself: a voice still silent when the next round
+// begins forfeits its vote, rather than holding readiness hostage.
 package resolver
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
+	"log/slog"
+	"math/rand"
 	"net/netip"
-	"net/url"
-	"slices"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-// NewResolver returns a *net.Resolver that transparently repairs a flaky system
-// resolver: every lookup runs through the system path first, and any UDP answer
-// that comes back NXDOMAIN is retried against the zone's authoritative
-// nameservers, the result spliced back in as if the system had answered. It
-// exists because a fresh record (e.g. a just-minted trycloudflare hostname) can
-// be live on the authoritative servers while a recursive resolver still serves a
-// stale negative cache — exactly the "no such host" a caller hits dialing the
-// tunnel URL the moment readiness reports green.
-//
-// PreferGo is mandatory: only Go's pure resolver consults Dial, so without it
-// (notably on macOS, where cgo is the default) the interception never runs.
-func NewResolver() *net.Resolver {
-	dialFn := net.DefaultResolver.Dial
-	if dialFn == nil {
-		var d net.Dialer
-		dialFn = d.DialContext
-	}
-
-	// clean is the un-patched path used for the fallback's own NS/A lookups, so
-	// resolving a zone's nameservers can't re-enter the wrapper and recurse.
-	clean := &net.Resolver{PreferGo: true, Dial: dialFn}
-
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			conn, err := dialFn(ctx, network, address)
-			if err != nil {
-				return nil, err
-			}
-			// Only the UDP path is wrapped, and the wrapper must keep presenting
-			// as a net.PacketConn (see ResolverConn): Go's resolver type-asserts
-			// the conn to choose datagram vs stream framing, and a stream-framed
-			// conn prepends a 2-byte length our bare-message parsing doesn't
-			// expect. A TCP conn is returned unwrapped — its single-name answers
-			// never need repair.
-			pc, ok := conn.(net.PacketConn)
-			if network != "udp" || !ok {
-				return conn, nil
-			}
-			return &ResolverConn{conn: conn, pc: pc, network: network, ctx: ctx, clean: clean}, nil
-		},
-	}
-}
-
-// ResolverConn wraps a DNS-server connection so it can watch answers flow back
-// and substitute an authoritative result when the upstream fails a fresh name.
-// ctx is captured at dial time because Read carries none; clean is the
-// un-patched resolver used for the fallback lookups; query holds the last
-// outbound message so a silent (dropped/timed-out) upstream — which yields no
-// response to read the question from — can still be recovered and re-resolved.
-type ResolverConn struct {
-	conn    net.Conn
-	pc      net.PacketConn
-	network string
-	ctx     context.Context
-	clean   *net.Resolver
-	query   []byte
-}
-
-// ResolverConn must satisfy net.PacketConn, not just net.Conn: Go's resolver
-// type-asserts the dialed conn to net.PacketConn to select datagram (bare)
-// framing over stream (length-prefixed) framing. Hiding the underlying
-// *net.UDPConn's PacketConn methods would silently flip it to stream framing.
-var _ net.PacketConn = &ResolverConn{}
-
-// ReadFrom implements [net.PacketConn], delegating to the underlying conn. It
-// exists to preserve the PacketConn identity; Go's connected-UDP DNS path reads
-// via Read, so this is not on the hot path.
-func (r *ResolverConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	return r.pc.ReadFrom(p)
-}
-
-// WriteTo implements [net.PacketConn], delegating to the underlying conn.
-func (r *ResolverConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	return r.pc.WriteTo(p, addr)
-}
-
-// Close implements [net.Conn].
-func (r *ResolverConn) Close() error {
-	return r.conn.Close()
-}
-
-// LocalAddr implements [net.Conn].
-func (r *ResolverConn) LocalAddr() net.Addr {
-	return r.conn.LocalAddr()
-}
-
-// Write implements [net.Conn]. It stashes the outbound query so Read can recover
-// the question when the upstream answers with silence (a drop/timeout) rather
-// than a packet.
-func (r *ResolverConn) Write(b []byte) (int, error) {
-	r.query = append(r.query[:0], b...)
-	return r.conn.Write(b)
-}
-
-// Read implements [net.Conn]. It reads one DNS answer from the upstream server
-// and, when the upstream fails a name two ways a fresh record provokes — an
-// NXDOMAIN response, or a silent drop that surfaces as a read timeout — replaces
-// it with an authoritative answer if one exists. This is the wire-level seam
-// where "no such host" is caught and repaired.
-func (r *ResolverConn) Read(b []byte) (n int, err error) {
-	n, err = r.conn.Read(b)
-	// Only UDP is rewritten: TCP frames a 2-byte length prefix Go reads
-	// separately, and a single-name A/AAAA answer never truncates onto TCP.
-	if r.network != "udp" || !r.shouldRepair(b[:n], err) {
-		return n, err
-	}
-	// On NXDOMAIN the response echoes the question; on a timeout there is no
-	// response at all. Either way the stashed outbound query carries the ID and
-	// question to re-resolve.
-	id, q, ok := parseQuestion(r.query)
-	if !ok {
-		return n, err
-	}
-	repl, ok := r.fallback(id, q)
-	if !ok {
-		return n, err // authoritative path found nothing: keep the upstream failure
-	}
-	return copy(b, repl), nil
-}
-
-// shouldRepair reports whether a UDP read is a failure worth retrying against
-// authoritative nameservers: an NXDOMAIN response, or a timeout (the upstream
-// dropped the query — some flaky resolvers stay silent instead of answering
-// NXDOMAIN). Other read errors and successful responses pass through untouched.
-func (r *ResolverConn) shouldRepair(resp []byte, readErr error) bool {
-	if readErr != nil {
-		var ne net.Error
-		return errors.As(readErr, &ne) && ne.Timeout()
-	}
-	var p dnsmessage.Parser
-	h, err := p.Start(resp)
-	return err == nil && h.RCode == dnsmessage.RCodeNameError
-}
-
-// parseQuestion pulls the transaction ID and the (single) question out of a DNS
-// message — used on the stashed outbound query to learn what to re-resolve.
-func parseQuestion(msg []byte) (uint16, dnsmessage.Question, bool) {
-	var p dnsmessage.Parser
-	h, err := p.Start(msg)
-	if err != nil {
-		return 0, dnsmessage.Question{}, false
-	}
-	q, err := p.Question()
-	if err != nil {
-		return 0, dnsmessage.Question{}, false
-	}
-	return h.ID, q, true
-}
-
-// fallback re-resolves q against the zone's authoritative nameservers and, on a
-// hit, returns a wire response (echoing id and the question) to splice in for
-// the failed upstream answer. ok is false when nothing resolves, leaving the
-// upstream failure intact.
-func (r *ResolverConn) fallback(id uint16, q dnsmessage.Question) ([]byte, bool) {
-	name := strings.TrimSuffix(q.Name.String(), ".")
-	_, zone, found := strings.Cut(name, ".")
-	if !found {
-		return nil, false // apex/single-label name has no parent zone to query
-	}
-
-	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
-	defer cancel()
-
-	servers, err := NameserverIPs(ctx, zone, r.clean)
-	if err != nil || len(servers) == 0 {
-		return nil, false
-	}
-	for _, server := range servers {
-		rec, err := Query(ctx, server, name)
-		if err != nil || rec.Empty() {
-			continue
-		}
-		if repl, err := buildResponse(id, q, rec); err == nil {
-			return repl, true
-		}
-	}
-	return nil, false
-}
-
-// buildResponse encodes a DNS response answering q from rec: it echoes id and
-// the question, sets the response/recursion-available flags with RCode success,
-// and appends the A or AAAA records matching q.Type. It is the inverse of
-// buildQuery — what a nameserver would have returned had the upstream not
-// NXDOMAIN'd.
-func buildResponse(id uint16, q dnsmessage.Question, rec Records) ([]byte, error) {
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
-		ID:                 id,
-		Response:           true,
-		RecursionAvailable: true,
-		RCode:              dnsmessage.RCodeSuccess,
-	})
-	b.EnableCompression()
-	if err := b.StartQuestions(); err != nil {
-		return nil, err
-	}
-	if err := b.Question(q); err != nil {
-		return nil, err
-	}
-	if err := b.StartAnswers(); err != nil {
-		return nil, err
-	}
-	// TTL is short: these are freshly-propagated records, and we don't want a
-	// downstream cache holding them past their real lifetime.
-	hdr := dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: 30}
-	switch q.Type {
-	case dnsmessage.TypeA:
-		for _, addr := range rec.A {
-			if err := b.AResource(hdr, dnsmessage.AResource{A: addr.As4()}); err != nil {
-				return nil, err
-			}
-		}
-	case dnsmessage.TypeAAAA:
-		for _, addr := range rec.AAAA {
-			if err := b.AAAAResource(hdr, dnsmessage.AAAAResource{AAAA: addr.As16()}); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return b.Finish()
-}
-
-// RemoteAddr implements [net.Conn].
-func (r *ResolverConn) RemoteAddr() net.Addr {
-	return r.conn.RemoteAddr()
-}
-
-// SetDeadline implements [net.Conn].
-func (r *ResolverConn) SetDeadline(t time.Time) error {
-	return r.conn.SetDeadline(t)
-}
-
-// SetReadDeadline implements [net.Conn].
-func (r *ResolverConn) SetReadDeadline(t time.Time) error {
-	return r.conn.SetReadDeadline(t)
-}
-
-// SetWriteDeadline implements [net.Conn].
-func (r *ResolverConn) SetWriteDeadline(t time.Time) error {
-	return r.conn.SetWriteDeadline(t)
-}
-
-// maxResponse bounds a single DNS reply read; an A/AAAA answer for one name is
-// far smaller.
-const maxResponse = 64 << 10
-
-// Records is a name's resolved address set — A and AAAA, each sorted so two
-// servers' answers compare by value.
+// Records is a hostname's resolved address set.
 type Records struct {
-	A    []netip.Addr
+	// A records are IPv4 addresses.
+	A []netip.Addr
+	// AAAA records are IPv6 addresses.
 	AAAA []netip.Addr
 }
 
-// Empty reports whether neither family resolved.
-func (r Records) Empty() bool { return len(r.A) == 0 && len(r.AAAA) == 0 }
+// Empty reports whether the hostname resolved to an address the caller can
+// expect to reach. That means IPv4: a quick tunnel's families are published
+// independently and the AAAA half routinely lands first, so counting it would
+// call a hostname ready on a host with no IPv6 route — a macOS runner, or
+// anything behind IPv4-only NAT — that then cannot connect to it. AAAA alone is
+// therefore still "not yet".
+func (r Records) Empty() bool { return len(r.A) == 0 }
 
-// Equal reports whether r and o hold the same addresses in both families.
-func (r Records) Equal(o Records) bool {
-	return slices.Equal(r.A, o.A) && slices.Equal(r.AAAA, o.AAAA)
+// Resolver looks up a hostname's addresses.
+type Resolver interface {
+	// Resolve blocks until hostname resolves, then returns its addresses.
+	// Empty Records mean ctx ended first: the name was not published within
+	// the time the caller was willing to wait.
+	Resolve(ctx context.Context, hostname string) Records
 }
 
-// Query asks server (an ip:port DNS endpoint) for hostname's A and AAAA records
-// directly (RD=0), returning both families sorted. Each family is raced over UDP
-// and TCP, preferring but not requiring an authoritative (AA) answer, so a
-// network intercepting port 53 cannot stall the result (see query). A name that
-// does not (yet) resolve comes back as empty Records with a nil error (the "keep
-// polling" signal); transport and DNS-level failures return an error.
-func Query(ctx context.Context, server, hostname string) (Records, error) {
-	a, aErr := query(ctx, server, hostname, dnsmessage.TypeA)
-	aaaa, aaaaErr := query(ctx, server, hostname, dnsmessage.TypeAAAA)
-	// Records from either family answer the readiness question, so one family
-	// coming back inconclusive does not discard the other's answer — an A-only
-	// hostname whose AAAA lookup is unusable is still resolvable.
-	if len(a) > 0 || len(aaaa) > 0 {
-		return Records{A: a, AAAA: aaaa}, nil
+// NewResolver returns a Resolver that races the delegation walk against DoH.
+//
+// log records, at debug, which source answered. A hostname that will not
+// resolve looks identical from outside whichever way it fails, and these are
+// the only lines that say which. It must not be nil.
+func NewResolver(log *slog.Logger) Resolver {
+	return &resolver{
+		log: log,
+		tlds: shuffled([]string{
+			"a.gtld-servers.net",
+			"b.gtld-servers.net",
+			"c.gtld-servers.net",
+			"d.gtld-servers.net",
+			"e.gtld-servers.net",
+			"f.gtld-servers.net",
+			"g.gtld-servers.net",
+			"h.gtld-servers.net",
+			"i.gtld-servers.net",
+			"j.gtld-servers.net",
+			"k.gtld-servers.net",
+			"l.gtld-servers.net",
+			"m.gtld-servers.net",
+		}),
+		doh: shuffled([]string{
+			"https://cloudflare-dns.com/dns-query",
+			"https://dns.google/dns-query",
+			"https://dns.quad9.net/dns-query",
+		}),
+		port: "53",
 	}
-	if aErr != nil {
-		return Records{}, aErr
-	}
-	if aaaaErr != nil {
-		return Records{}, aaaaErr
-	}
-	return Records{}, nil
 }
 
-// query races the question three ways — UDP and TCP against server, plus DoH
-// (see DoHEndpoint) — and returns the addresses from the first usable answer.
-// Racing defeats a network that intercepts port 53 by standing in for the zone's
-// nameserver: it may REFUSE an RD=0 query it is not authoritative for, or serve
-// a stale cached miss for a name that has since been published. Where an
-// interceptor takes only UDP, the TCP leg reaches the real server; where it
-// takes both — hotel and hotspot wifi routinely do — DoH rides HTTPS past it.
-//
-// Only records end the race early. A negative is weighed after every leg
-// reports, so the local liar (always fastest) cannot beat DoH to the answer.
-//
-// The AA bit is NOT required — only consulted to judge a refusal:
-//
-//   - Any response CARRYING RECORDS is accepted. Records are the readiness
-//     signal, and plenty of benign middleboxes answer correctly without setting
-//     AA (a transparent recursive resolver on a home or corporate network).
-//     Requiring AA here hangs the poll on those networks.
-//   - A well-formed negative — NOERROR with no records, or NXDOMAIN — is "not
-//     published yet": empty addrs, nil error, keep polling. Believed with or
-//     without AA, since an empty family (an A-only host's AAAA) is routine.
-//   - A REFUSED/SERVFAIL-class failure is judged by AA: from the zone's own
-//     nameserver it is a real error; from anything else it is likely an
-//     interceptor rejecting the RD=0 query, so it is set aside to let the other
-//     legs speak. If no leg produces anything usable, that failure is returned —
-//     naming the likely interception — rather than silently polling on a lie.
-//
-// A negative is only believed from the zone's nameserver (AA) or over DoH;
-// a plaintext non-authoritative "no such name" is treated as unusable, since it
-// may be an interceptor's stale miss.
-func query(ctx context.Context, server, hostname string, qtype dnsmessage.Type) ([]netip.Addr, error) {
-	wire, err := buildQuery(hostname, qtype)
-	if err != nil {
-		return nil, err
-	}
+// resolver asks the zone's own nameservers and DoH endpoints side by side and
+// takes whichever answers first. It holds no state between calls and caches
+// nothing — the property the whole package exists for.
+type resolver struct {
+	// tlds are TLD nameservers the delegation walk starts from, one per round.
+	// Shuffled at construction so no process favors the same server; must not
+	// be empty.
+	tlds []string
+	// doh are RFC 8484 endpoints, all asked every round. Shuffled at
+	// construction; must not be empty.
+	doh []string
+	// port is where glue addresses are dialed. Glue carries an address and no
+	// port, so it is always 53 in practice; it is a field only so tests can
+	// point the walk at stubs.
+	port string
+	// log records which source answered, at debug.
+	log *slog.Logger
+}
 
+var _ Resolver = &resolver{}
+
+// resolveInterval paces the rounds. It is not a timeout: a round's queries are
+// never cut off by the next round starting — a slow answer from round one can
+// still win during round three. Nothing asked here caches, so another round
+// costs a handful of queries and can never fix a negative in place.
+const resolveInterval = time.Second
+
+// Resolve implements [Resolver]. Each round asks one TLD server for the
+// zone's delegation, then every nameserver in it and every DoH endpoint at
+// once; see round for how the votes decide. Rounds repeat, rotating through
+// the TLD servers, until one delivers or ctx ends; every in-flight query is
+// released when Resolve returns.
+func (r *resolver) Resolve(ctx context.Context, hostname string) Records {
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel() // stop the slower legs once one answers with records
+	defer cancel()
 
-	type result struct {
-		transport string
-		ans       answer
-		err       error
-	}
-	results := make(chan result, 3) // buffered: losers never block on send
-	race := func(transport string, exchange func() (answer, error)) {
-		ans, err := exchange()
-		results <- result{transport: transport, ans: ans, err: err}
-	}
-	legs := 2
-	go race("udp", func() (answer, error) { return exchangeWire(ctx, server, wire, qtype, exchangeUDP) })
-	go race("tcp", func() (answer, error) { return exchangeWire(ctx, server, wire, qtype, exchangeTCP) })
-	if DoHEndpoint != "" {
-		legs++
-		go race("doh", func() (answer, error) { return exchangeDoH(ctx, DoHEndpoint, hostname, qtype) })
-	}
+	found := make(chan Records, 1)
+	pace := time.NewTicker(resolveInterval)
+	defer pace.Stop()
 
-	// Negatives do NOT short-circuit: on an intercepting network the local liar
-	// answers first, and believing its "no such name" would beat DoH to the
-	// punch. Only records end the race early; negatives are weighed at the end.
-	var (
-		trustedNeg bool // a negative from a source that cannot be the interceptor
-		lastErr    error
-	)
-	for range legs {
-		r := <-results
-		switch {
-		case r.err != nil:
-			lastErr = fmt.Errorf("%s: %w", r.transport, r.err)
-		case r.ans.truncated:
-			// UDP hit the 512-byte limit; the TCP leg carries the full message.
-		case len(r.ans.addrs) > 0:
-			// Records answer the question, authoritative or not.
-			addrs := r.ans.addrs
-			slices.SortFunc(addrs, func(a, b netip.Addr) int { return a.Compare(b) })
-			return addrs, nil
-		case r.ans.rcode == dnsmessage.RCodeSuccess, r.ans.rcode == dnsmessage.RCodeNameError:
-			// A well-formed negative: no record of this family yet (NOERROR) or
-			// the name does not exist yet (NXDOMAIN). Believe it only from the
-			// zone's own nameserver or over DoH — a plaintext negative from an
-			// interceptor may be a stale cached miss for a name that now exists.
-			if r.ans.authoritative || r.transport == "doh" {
-				trustedNeg = true
-			} else {
-				lastErr = fmt.Errorf("%s: non-authoritative %v (port 53 may be intercepted)", r.transport, r.ans.rcode)
-			}
-		case !r.ans.authoritative:
-			// A refusal from something that is not the zone's nameserver: likely
-			// an interceptor rejecting the RD=0 query. Set aside for the others.
-			lastErr = fmt.Errorf("%s: non-authoritative %v (port 53 may be intercepted)", r.transport, r.ans.rcode)
-		default:
-			lastErr = fmt.Errorf("%s: authoritative server returned rcode %v", r.transport, r.ans.rcode)
+	tally := &tally{served: make(map[string]bool)}
+	var supersede chan struct{}
+	for round := 0; ; round++ {
+		// Starting a round supersedes the previous one: whatever has not
+		// answered it by now forfeits its vote (see round).
+		if supersede != nil {
+			close(supersede)
+		}
+		supersede = make(chan struct{})
+		go r.round(ctx, r.tlds[round%len(r.tlds)], hostname, tally, supersede, found)
+
+		select {
+		case rec := <-found:
+			return rec
+		case <-ctx.Done():
+			r.log.Debug("hostname did not resolve before ctx ended",
+				"hostname", hostname, "rounds", round+1)
+			return Records{}
+		case <-pace.C:
 		}
 	}
-	if trustedNeg {
-		return nil, nil // not published yet: keep polling
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no usable DNS answer for %s", hostname)
-	}
-	return nil, lastErr
 }
 
-// exchangeWire sends the prebuilt query over one plaintext transport and parses
-// the reply.
-func exchangeWire(ctx context.Context, server string, wire []byte, qtype dnsmessage.Type,
-	exchange func(context.Context, string, []byte) ([]byte, error)) (answer, error) {
-	resp, err := exchange(ctx, server, wire)
-	if err != nil {
-		return answer{}, err
-	}
-	return parse(resp, qtype)
+// vote is one voice's view of the hostname. A voice that answered with the A
+// record serves it (and brings the AAAA half along for the caller); one that
+// answered without it objects — the record has not reached it, and a visitor
+// resolving through it would cache that negative. A voice that could not
+// answer at all — unreachable, blocked, or a middlebox without the AA bit it
+// cannot set honestly — casts no vote.
+type vote struct {
+	source  string
+	a, aaaa []netip.Addr
+	voiced  bool
+	// recursive marks a DoH endpoint's vote, as opposed to a nameserver's.
+	recursive bool
 }
 
-// DoHEndpoint is the DNS-over-HTTPS resolver raced alongside plaintext UDP/TCP
-// (see query). DoH rides HTTPS, so a network that hijacks port 53 — which is
-// common enough on hotel and hotspot wifi, and which no plaintext transport can
-// escape — cannot answer in its place. Empty disables the DoH leg.
-var DoHEndpoint = "https://cloudflare-dns.com/dns-query"
-
-// exchangeDoH resolves hostname over DNS-over-HTTPS (RFC 8484's JSON form) and
-// shapes the reply like a plaintext answer. The result is never marked
-// authoritative — it comes from a recursive resolver, not the zone — but it is
-// trusted for negatives because it cannot have come from an on-path interceptor.
-func exchangeDoH(ctx context.Context, endpoint, hostname string, qtype dnsmessage.Type) (answer, error) {
-	// The RR type goes over as its numeric code: dnsmessage's String() renders
-	// "TypeA", which is not what the API expects.
-	rrType := dohTypeA
-	if qtype == dnsmessage.TypeAAAA {
-		rrType = dohTypeAAAA
-	}
-	q := url.Values{"name": {hostname}, "type": {strconv.Itoa(rrType)}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
-	if err != nil {
-		return answer{}, err
-	}
-	req.Header.Set("Accept", "application/dns-json")
-
-	resp, err := dohClient.Do(req)
-	if err != nil {
-		return answer{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return answer{}, fmt.Errorf("doh: HTTP %s", resp.Status)
-	}
-	var body struct {
-		Status int `json:"Status"`
-		Answer []struct {
-			Type int    `json:"type"`
-			Data string `json:"data"`
-		} `json:"Answer"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxDoHResponse)).Decode(&body); err != nil {
-		return answer{}, fmt.Errorf("doh: %w", err)
-	}
-
-	ans := answer{rcode: dnsmessage.RCode(body.Status)}
-	for _, rr := range body.Answer {
-		// Skip the CNAME links in a chain; keep the family asked for.
-		if (qtype == dnsmessage.TypeA && rr.Type != dohTypeA) ||
-			(qtype == dnsmessage.TypeAAAA && rr.Type != dohTypeAAAA) {
-			continue
-		}
-		addr, err := netip.ParseAddr(rr.Data)
-		if err != nil {
-			continue
-		}
-		ans.addrs = append(ans.addrs, addr)
-	}
-	return ans, nil
+// tally is what one wait has established across its rounds. Rounds overlap,
+// so it is shared under a lock; it lives and dies with a single Resolve call,
+// so nothing here outlasts the wait — the package still caches nothing.
+type tally struct {
+	mu sync.Mutex
+	// served holds every voice that has answered with the record. The record
+	// provably reached these; a stale anycast node flapping back into view
+	// cannot un-serve them, so their later objections are spent.
+	served map[string]bool
+	// askDoH opens the recursive polls: set once the authoritative fleet has
+	// agreed — before that, a DoH query would recurse for a name that does
+	// not exist yet and plant the very negative consensus is waiting out — or
+	// once a round establishes there is no authoritative voice to hear.
+	askDoH bool
+	// authHeard records that some round got an authoritative reply. It
+	// decides what DoH votes mean: confirmation on a network that can hear
+	// the zone's nameservers, the only voice there is on one that cannot.
+	authHeard bool
 }
 
-const (
-	dohTypeA       = 1 // RR type codes as the JSON API reports them
-	dohTypeAAAA    = 28
-	maxDoHResponse = 1 << 16
-
-	// The default DoH endpoint's host and the anycast address it is dialed at.
-	defaultDoHHost = "cloudflare-dns.com"
-	defaultDoHAddr = "1.1.1.1:443"
-)
-
-// dohClient dials the default DoH endpoint by IP so the DNS bypass never itself
-// depends on DNS. Without this, resolving cloudflare-dns.com goes through
-// net.DefaultResolver — which this package replaces with a repairing resolver
-// that falls back to Query, whose DoH leg would resolve cloudflare-dns.com
-// again. TLS still verifies against the URL's hostname, so pinning the address
-// costs nothing. A non-default endpoint (tests, a private resolver) is dialed
-// normally.
-var dohClient = &http.Client{
-	Timeout: 10 * time.Second,
-	Transport: &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if host, _, err := net.SplitHostPort(addr); err == nil && host == defaultDoHHost {
-				addr = defaultDoHAddr
-			}
-			var d net.Dialer
-			return d.DialContext(ctx, network, addr)
-		},
-	},
-}
-
-func buildQuery(hostname string, qtype dnsmessage.Type) ([]byte, error) {
-	name, err := dnsmessage.NewName(hostname + ".")
-	if err != nil {
-		return nil, fmt.Errorf("invalid hostname %q: %w", hostname, err)
-	}
-	// RD=0: these queries go straight to the zone's authoritative nameservers,
-	// which answer in-zone names authoritatively regardless, so recursion is
-	// neither needed nor wanted. (Authoritative/AA is a response flag the server
-	// sets — pointless on an outbound query.) RD=0 is also what makes an
-	// intercepting recursive resolver REFUSE rather than answer — the signal
-	// query keys on — but only if the packet reaches the real nameserver at all,
-	// which is why query races TCP alongside UDP.
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{RecursionDesired: false})
-	b.EnableCompression()
-	if err := b.StartQuestions(); err != nil {
-		return nil, err
-	}
-	if err := b.Question(dnsmessage.Question{Name: name, Type: qtype, Class: dnsmessage.ClassINET}); err != nil {
-		return nil, err
-	}
-	return b.Finish()
-}
-
-func exchangeUDP(ctx context.Context, server string, wire []byte) ([]byte, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "udp", server)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	if dl, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(dl)
-	}
-	if _, err := conn.Write(wire); err != nil {
-		return nil, err
-	}
-	buf := make([]byte, maxResponse)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-	return buf[:n], nil
-}
-
-func exchangeTCP(ctx context.Context, server string, wire []byte) ([]byte, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", server)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	if dl, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(dl)
-	}
-	// RFC 1035: TCP DNS messages are prefixed with a two-byte length.
-	msg := make([]byte, 2+len(wire))
-	binary.BigEndian.PutUint16(msg, uint16(len(wire)))
-	copy(msg[2:], wire)
-	if _, err := conn.Write(msg); err != nil {
-		return nil, err
-	}
-	var length uint16
-	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-		return nil, err
-	}
-	resp := make([]byte, length)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-// answer is a parsed DNS response: the header bits query needs to judge it plus
-// any A/AAAA addresses (populated only on an RCodeSuccess, non-truncated reply).
-// A malformed response is the only error — rcode and the AA/TC flags are data
-// the caller interprets, not failures.
-type answer struct {
-	authoritative bool // AA: the responder is the zone's own nameserver
-	truncated     bool // TC: retry over TCP for the full message
-	rcode         dnsmessage.RCode
-	addrs         []netip.Addr
-}
-
-func parse(resp []byte, qtype dnsmessage.Type) (answer, error) {
-	var p dnsmessage.Parser
-	header, err := p.Start(resp)
-	if err != nil {
-		return answer{}, fmt.Errorf("malformed DNS response: %w", err)
-	}
-	ans := answer{authoritative: header.Authoritative, truncated: header.Truncated, rcode: header.RCode}
-	if header.Truncated || header.RCode != dnsmessage.RCodeSuccess {
-		return ans, nil // nothing to parse; query decides on the flags/rcode
-	}
-	if err := p.SkipAllQuestions(); err != nil {
-		return answer{}, err
-	}
-
-	for {
-		rh, err := p.AnswerHeader()
-		if err == dnsmessage.ErrSectionDone {
-			break
-		}
-		if err != nil {
-			return answer{}, err
-		}
-		if rh.Type != qtype {
-			// CNAME links and other-family records in the chain: skip.
-			if err := p.SkipAnswer(); err != nil {
-				return answer{}, err
-			}
-			continue
-		}
-		switch qtype {
-		case dnsmessage.TypeA:
-			r, err := p.AResource()
-			if err != nil {
-				return answer{}, err
-			}
-			ans.addrs = append(ans.addrs, netip.AddrFrom4(r.A))
-		case dnsmessage.TypeAAAA:
-			r, err := p.AAAAResource()
-			if err != nil {
-				return answer{}, err
-			}
-			ans.addrs = append(ans.addrs, netip.AddrFrom16(r.AAAA))
-		}
-	}
-	return ans, nil
-}
-
-// NameserverIPs resolves the zone's NS records to IPv4 ip:53 endpoints via the
-// system resolver. NS records are stable and are not the propagation target, so
-// the system resolver is fine here — the record we wait on is queried at these
-// servers directly. Any :port on domain is stripped (DNS queries take bare
-// names, which the v1 contract allows GetHostname to carry).
+// round is one complete attempt to call the hostname resolved.
 //
-// Only IPv4 endpoints are kept: an IPv6 NS anycast address on an IPv4-only host
-// (e.g. a GitHub Actions runner) yields "connect: no route to host", burning a
-// 5s query timeout each round for nothing. Every Cloudflare NS has an IPv4
-// anycast address, so v4-only loses no nameserver.
-func NameserverIPs(ctx context.Context, domain string, resolver *net.Resolver) ([]string, error) {
-	if host, _, err := net.SplitHostPort(domain); err == nil {
-		domain = host
+// The zone's nameservers, from the delegation tld hands back, are asked all
+// at once — joined by every DoH endpoint once tally says their votes carry
+// meaning. The round delivers on consensus: someone serves the record and
+// nobody answers without it, spent objections excepted. A live objection
+// means the record is still propagating somewhere a visitor might resolve
+// from, so the round delivers nothing and lets a later round find agreement.
+// Voices still silent when the next round supersedes this one forfeit their
+// vote rather than stalling the verdict.
+//
+// The first round with authoritative consensus does not deliver; it opens the
+// recursive polls, and delivery waits for a round where the DoH endpoints —
+// the vantage a visitor resolves from — concur. Where no authoritative voice
+// has ever been heard, the first DoH endpoint to serve the record decides
+// alone.
+func (r *resolver) round(ctx context.Context, tld, hostname string, tally *tally, superseded <-chan struct{}, found chan<- Records) {
+	glue := delegation(ctx, tld, hostname, r.port)
+	doh := tally.recursivePolls(r.doh)
+	votes := make(chan vote, len(glue)+len(doh))
+	for _, ns := range glue {
+		go func() { votes <- lookupNameserver(ctx, ns, hostname) }()
 	}
-	ns, err := resolver.LookupNS(ctx, domain)
-	if err != nil {
-		return nil, fmt.Errorf("authoritative NS lookup failed for %q: %w", domain, err)
+	for _, endpoint := range doh {
+		go func() { votes <- lookupDoH(ctx, endpoint, hostname) }()
 	}
-	var servers []string
-	for _, record := range ns {
-		ips, err := resolver.LookupIP(ctx, "ip4", record.Host)
-		if err != nil {
-			continue
+
+	var served vote
+	var objectors []string
+	serving, authVoiced := 0, 0
+collect:
+	for range len(glue) + len(doh) {
+		select {
+		case v := <-votes:
+			if !v.voiced {
+				continue
+			}
+			if !v.recursive {
+				authVoiced++
+			}
+			if len(v.a) > 0 {
+				serving++
+				served = v
+				tally.serve(v.source)
+			} else if !tally.hasServed(v.source) {
+				objectors = append(objectors, v.source)
+			}
+		case <-superseded:
+			break collect // the still-silent forfeit their vote
+		case <-ctx.Done():
+			return
 		}
-		for _, ip := range ips {
-			servers = append(servers, net.JoinHostPort(ip.String(), "53"))
+	}
+
+	authHeard := tally.hearAuth(authVoiced)
+	switch {
+	case serving > 0 && !authHeard:
+		// No authoritative voice exists on this network; the recursive
+		// endpoints are the only voices, and one serving the record is the
+		// best answer there is.
+		if deliver(found, Records{A: served.a, AAAA: served.aaaa}) {
+			r.log.Debug("doh endpoint serves the record", "hostname", hostname,
+				"source", served.source)
+		}
+	case serving > 0 && len(objectors) == 0:
+		if len(doh) == 0 {
+			// Authoritative consensus. Not delivered on: it opens the
+			// recursive polls, and a later round delivers once the visitor's
+			// vantage concurs.
+			tally.openPolls()
+			r.log.Debug("authoritative nameservers agree, polling recursive endpoints",
+				"hostname", hostname, "serving", serving)
+			return
+		}
+		if deliver(found, Records{A: served.a, AAAA: served.aaaa}) {
+			r.log.Debug("resolvers agree the record is served", "hostname", hostname,
+				"serving", serving, "source", served.source)
+		}
+	case len(objectors) > 0:
+		r.log.Debug("resolvers lack consensus", "hostname", hostname,
+			"serving", serving, "objecting", objectors)
+	default:
+		// Nothing voiced anything. If there is no authoritative voice to
+		// wait for, the recursive endpoints are the only ones left to ask.
+		if !authHeard {
+			tally.openPolls()
 		}
 	}
-	return servers, nil
+}
+
+// recursivePolls returns the DoH endpoints to include in a round: none until
+// askDoH opens them.
+func (t *tally) recursivePolls(endpoints []string) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.askDoH {
+		return nil
+	}
+	return endpoints
+}
+
+// serve latches source as having served the record.
+func (t *tally) serve(source string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.served[source] = true
+}
+
+// hasServed reports whether source has ever served the record this wait.
+func (t *tally) hasServed(source string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.served[source]
+}
+
+// hearAuth folds a round's count of authoritative voices into the tally and
+// reports whether any round has heard one.
+func (t *tally) hearAuth(voiced int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if voiced > 0 {
+		t.authHeard = true
+	}
+	return t.authHeard
+}
+
+// openPolls admits the DoH endpoints to later rounds.
+func (t *tally) openPolls() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.askDoH = true
+}
+
+// lookupNameserver casts one zone nameserver's vote. Only an AA reply is a
+// voice: the nameserver answering for itself, not a middlebox in its place.
+func lookupNameserver(ctx context.Context, ns, hostname string) vote {
+	a, authoritative := lookupUDP(ctx, ns, hostname, dnsmessage.TypeA)
+	v := vote{source: ns, a: a, voiced: authoritative}
+	if v.voiced && len(a) > 0 {
+		v.aaaa, _ = lookupUDP(ctx, ns, hostname, dnsmessage.TypeAAAA)
+	}
+	return v
+}
+
+// lookupDoH casts one DoH endpoint's vote. AA is not expected here — the
+// endpoint is a recursive resolver; what makes its voice trustworthy is the
+// transport, which a network intercepting port 53 cannot answer for.
+func lookupDoH(ctx context.Context, endpoint, hostname string) vote {
+	a, ok := queryDoH(ctx, endpoint, hostname, dnsmessage.TypeA)
+	v := vote{source: endpoint, a: a, voiced: ok, recursive: true}
+	if v.voiced && len(a) > 0 {
+		v.aaaa, _ = queryDoH(ctx, endpoint, hostname, dnsmessage.TypeAAAA)
+	}
+	return v
+}
+
+// deliver offers rec as the answer, reporting whether it was taken. Exactly
+// one answer is; later arrivals are dropped rather than blocking their
+// goroutines.
+func deliver(found chan<- Records, rec Records) bool {
+	select {
+	case found <- rec:
+		return true
+	default:
+		return false
+	}
+}
+
+// shuffled returns a random permutation of servers, so no one server carries
+// every lookup and a single bad one cannot decide every result. It copies:
+// the caller's slice is left alone.
+func shuffled(servers []string) []string {
+	out := make([]string, len(servers))
+	copy(out, servers)
+	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	return out
+}
+
+// dnsName returns hostname as a fully qualified name, which is what the wire
+// format expects.
+func dnsName(hostname string) string {
+	if strings.HasSuffix(hostname, ".") {
+		return hostname
+	}
+	return hostname + "."
 }

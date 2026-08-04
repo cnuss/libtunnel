@@ -24,6 +24,21 @@ import (
 // closing the listener returned from Tunnel.Listener.
 var ErrClosed = errors.New("tunnel closed")
 
+// ErrEdgeUnreachable is the Err result of a tunnel that never reached its
+// backend's edge. The engine retries the edge indefinitely, so without a bound
+// a blocked network is indistinguishable from a slow one and the tunnel hangs
+// until the caller's context expires; the bound turns it into an error a caller
+// can act on (errors.Is) and a message that names the likely cause.
+var ErrEdgeUnreachable = errors.New("edge unreachable")
+
+// ErrHostnameUnresolved is the Err result of a tunnel whose hostname never
+// resolved. The edge publishes the record moments after the connection
+// registers, so readiness waits for it — bounded, because a resolver that
+// cached a negative before publication holds it for the zone's SOA and no
+// amount of waiting will shorten that. Failing says so; blocking forever
+// does not.
+var ErrHostnameUnresolved = errors.New("hostname unresolved")
+
 // The environment variables, centralized: every code knob with an
 // env-expressible value has a mirror here, and env beats code — an operator
 // reconfigures a deployed binary without a rebuild. (The one exception is

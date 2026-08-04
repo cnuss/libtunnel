@@ -268,6 +268,36 @@ func (t *TunnelImpl[T]) provideURL(u *url.URL) {
 // propagation overlaps the (seconds-long) edge dial instead of queuing behind
 // it — then dial the edge via connect (which blocks until the connection is
 // up) and close tunnelReady once DNS readiness lands too. On a foreign
+// resolverFactory builds the resolver used for hostname readiness.
+type resolverFactory = func(*slog.Logger) resolver.Resolver
+
+// newResolver holds that constructor as a swappable hook. It is atomic because
+// tests replace it (SetResolver) while background start goroutines from other
+// tests may still be reading it — production only reads it, set once here.
+var newResolver = func() *atomic.Pointer[resolverFactory] {
+	var p atomic.Pointer[resolverFactory]
+	fn := resolverFactory(resolver.NewResolver)
+	p.Store(&fn)
+	return &p
+}()
+
+// resolveTimeout bounds the wait for the hostname's record to be published.
+// Publication takes seconds, so reaching this does not mean the record is slow
+// — it means something answered for the name before it existed and cached the
+// negative, which lasts the zone's SOA (30 minutes here) no matter how long
+// the wait. Past that point waiting is not patience, it is a hang, and a
+// caller with no deadline of its own would never come back. The resolver has
+// no clock of its own; this deadline, handed down as a ctx, is the only one.
+//
+// Atomic for the same reason as newResolver: tests shorten it (SetResolveTimeout)
+// while start goroutines from other tests may still be reading it. Nanoseconds,
+// because that is what atomic.Int64 holds.
+var resolveTimeout = func() *atomic.Int64 {
+	var d atomic.Int64
+	d.Store(int64(60 * time.Second))
+	return &d
+}()
+
 // backend (nil engine, tunnel born canceled — see New) it does nothing.
 func (t *TunnelImpl[T]) start(connect func() error) {
 	if t.engine == nil {
@@ -276,7 +306,6 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 
 	go func() {
 		t.Logger().Info("starting tunnel")
-		go t.pollAuthoritative()
 		t.Spec()
 		if err := connect(); err != nil {
 			t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
@@ -284,9 +313,26 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 		}
 
 		t.Logger().Info("tunnel connected, waiting for DNS")
-		if !await(t.ctx, t.hostnameReady) {
+		hostname := t.Hostname()
+		// The edge publishes the record moments after the connection
+		// registers; Resolve waits out that gap, asking sources that cannot
+		// cache a negative until one serves the record. The deadline is this
+		// tunnel's policy, not the resolver's — see resolveTimeout.
+		resolve := (*newResolver.Load())(t.Logger())
+		timeout := time.Duration(resolveTimeout.Load())
+		ctx, cancel := context.WithTimeout(t.ctx, timeout)
+		rec := resolve.Resolve(ctx, hostname)
+		cancel()
+		if rec.Empty() {
+			if t.ctx.Err() == nil {
+				t.cancel(fmt.Errorf("%w: %s after %s: a resolver that answered for this "+
+					"name before the record was published holds that negative for the "+
+					"zone's SOA, and waiting cannot shorten it",
+					v1.ErrHostnameUnresolved, hostname, timeout))
+			}
 			return
 		}
+		t.markHostnameReady(hostname, rec)
 
 		t.Logger().Info("tunnel is ready")
 		close(t.tunnelReady)
@@ -618,106 +664,27 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 	return t.tunnelReady
 }
 
-// fibonacciBackoff is the wait between authoritative poll rounds, in seconds.
-// It tracks the observed ~5s window for a fresh quick-tunnel record to land on
-// the zone's nameservers and caps at 21s; spot-tests showed the record absent
-// at 1–3s, reliably present by 5s. After the sequence is exhausted the poll
-// holds at the 21s cap and keeps going until the record appears or tunnel cancel.
-var fibonacciBackoff = []time.Duration{1, 1, 2, 3, 5, 8, 13, 21}
-
-// HostnameReady returns the channel closed once the public hostname resolves on
-// the zone's authoritative nameservers. The poll that closes it is started by
-// WithListener and gated on hostnameProvided, so this is a pure accessor —
-// select on it (and on Done).
+// HostnameReady returns the channel closed once the public hostname resolves.
+// The wait that closes it is started by WithListener and gated on
+// hostnameProvided, so this is a pure accessor — select on it (and on Done).
 //
-// Readiness is authoritative-only: pollAuthoritative queries the zone's
-// nameservers directly (the dig equivalent, via package resolver) and fires as
-// soon as one of them serves a non-empty A+AAAA set — a record on any
-// authoritative nameserver, never a recursive resolver's cache. Queries are
-// RD=1 (the quick-tunnel nameservers REFUSE RD=0).
+// Readiness is consensus across every resolving voice package resolver can
+// hear: the zone's own nameservers (trusting only authoritative replies) and
+// independent DoH endpoints, which see the record from the recursive vantage
+// a visitor actually resolves through. It fires once someone serves the A
+// record and nobody answers without it — one voice still missing the record
+// holds readiness open, because a visitor's resolver could hit that one and
+// cache the negative. The machine's own resolver is never asked.
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	return t.hostnameReady
 }
 
 // markHostnameReady logs the resolved record and closes the readiness channel.
-// One caller (pollAuthoritative) reaches it once, so the close needs no guard.
+// One caller (start's readiness wait) reaches it once, so the close needs no
+// guard.
 func (t *TunnelImpl[T]) markHostnameReady(host string, rec resolver.Records) {
 	t.Logger().Info("hostname resolved", "hostname", host, "A", rec.A, "AAAA", rec.AAAA)
 	close(t.hostnameReady)
-}
-
-// pollAuthoritative waits for the spec to provide the public hostname, then
-// probes the nameservers each round and fires as soon as one serves the record.
-// Rounds ramp through fibonacciBackoff and then hold at its cap; it runs until
-// the record appears or the tunnel is canceled.
-func (t *TunnelImpl[T]) pollAuthoritative() {
-	if !await(t.ctx, t.hostnameProvided) {
-		return
-	}
-	host := dnsName(t.Hostname())
-	for round := 0; ; round++ {
-		if rec, ok := (*authoritativeProbe.Load())(t.ctx, t.Logger(), t.Domain(), host); ok {
-			t.markHostnameReady(host, rec)
-			return
-		}
-		wait := fibonacciBackoff[len(fibonacciBackoff)-1]
-		if round < len(fibonacciBackoff) {
-			wait = fibonacciBackoff[round]
-		}
-		t.Logger().Debug("authoritative rung not resolved yet, backing off",
-			"hostname", host, "round", round+1, "nextWait", wait*time.Second)
-		select {
-		case <-t.ctx.Done():
-			return
-		case <-time.After(wait * time.Second):
-		}
-	}
-}
-
-// probeFunc runs one readiness probe for host in zone domain, returning
-// records and true as soon as one authoritative nameserver serves a non-empty
-// A+AAAA set.
-type probeFunc = func(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool)
-
-// authoritativeProbe holds the readiness probe as a swappable hook. It is
-// atomic because tests replace it (SetAuthoritativeProbe) while background
-// pollAuthoritative goroutines from other tests may still be reading it —
-// production only reads it, set once here to realAuthoritativeProbe.
-var authoritativeProbe = func() *atomic.Pointer[probeFunc] {
-	var p atomic.Pointer[probeFunc]
-	fn := probeFunc(realAuthoritativeProbe)
-	p.Store(&fn)
-	return &p
-}()
-
-// realAuthoritativeProbe queries the zone's nameservers for host's A+AAAA and
-// returns the first non-empty answer — one authoritative nameserver serving the
-// record is enough, no cross-server agreement required. Nameservers are
-// re-resolved each round so a changed delegation is picked up; a server that
-// errors, times out, or has no record yet is skipped, and a round with no
-// non-empty answer keeps polling.
-func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool) {
-	servers, err := resolver.NameserverIPs(ctx, domain, net.DefaultResolver)
-	if err != nil {
-		log.Debug("authoritative NS lookup failed", "domain", domain, "error", err)
-		return resolver.Records{}, false
-	}
-	if len(servers) == 0 {
-		log.Debug("no authoritative nameservers discovered yet", "domain", domain)
-		return resolver.Records{}, false
-	}
-
-	for _, server := range servers {
-		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		rec, err := resolver.Query(qctx, server, host)
-		cancel()
-		log.Debug("authoritative query", "hostname", host, "server", server, "A", rec.A, "AAAA", rec.AAAA, "error", err)
-		if err != nil || rec.Empty() {
-			continue
-		}
-		return rec, true
-	}
-	return resolver.Records{}, false
 }
 
 // hostOf returns the first label of hostname.

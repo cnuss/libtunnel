@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -34,6 +35,19 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
+
+// TestMain raises the default logger to debug before any test runs. The live
+// tests hand slog.Default() to their tunnels, and the resolver reports what each
+// attempt found only at that level — which is the sole record of why a hostname
+// never resolved, and was missing exactly when it was needed. It reaches the
+// re-exec'd children too, since they run this same binary and their stderr is
+// the parent's only view of them.
+func TestMain(m *testing.M) {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
+	os.Exit(m.Run())
+}
 
 // roleEnv selects a child role inside a re-exec'd test binary.
 const roleEnv = "LIBTUNNEL_E2E_ROLE"

@@ -584,9 +584,7 @@ func TestWithLoggerWriteOnce(t *testing.T) {
 // URL can only return via the first (already canceled) context — if the
 // second context won, URL would hang past the test timeout.
 func TestWithContextWriteOnce(t *testing.T) {
-	t.Cleanup(v1alpha1.SetAuthoritativeProbe(func(context.Context, *slog.Logger, string, string) (resolver.Records, bool) {
-		return resolver.Records{}, false // never ready
-	}))
+	stubNeverReady(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
 
 	canceled, cancel := context.WithCancel(context.Background())
@@ -606,14 +604,57 @@ func TestWithContextWriteOnce(t *testing.T) {
 	}
 }
 
-// stubReady makes the readiness consensus probe fire immediately so these tests
+// fakeResolver resolves every hostname to a fixed address without touching the
+// network.
+type fakeResolver struct{}
+
+func (fakeResolver) Resolve(context.Context, string) resolver.Records {
+	return resolver.Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}
+}
+
+// unpublishedResolver answers once publish is closed — a hostname whose record
+// is published a moment after the tunnel connects, which is the ordinary case.
+// Like the real resolver, it comes back empty only when ctx ends first.
+type unpublishedResolver struct{ publish chan struct{} }
+
+func (u *unpublishedResolver) Resolve(ctx context.Context, _ string) resolver.Records {
+	select {
+	case <-u.publish:
+		return resolver.Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}
+	case <-ctx.Done():
+		return resolver.Records{}
+	}
+}
+
+// neverResolver never answers, so hostname readiness never fires. It returns
+// empty on release — closed at test cleanup, so the tunnel's goroutine is not
+// left parked — or when ctx ends, whichever comes first.
+type neverResolver struct{ release <-chan struct{} }
+
+func (n neverResolver) Resolve(ctx context.Context, _ string) resolver.Records {
+	select {
+	case <-n.release:
+	case <-ctx.Done():
+	}
+	return resolver.Records{}
+}
+
+// stubNeverReady holds hostname readiness open for the duration of a test, for
+// the cases that need to observe what happens while a tunnel is not yet ready.
+func stubNeverReady(t *testing.T) {
+	t.Helper()
+	release := make(chan struct{})
+	t.Cleanup(v1alpha1.SetResolver(neverResolver{release: release}))
+	t.Cleanup(func() { close(release) })
+}
+
+// stubReady makes hostname readiness resolve immediately so these tests
 // exercise the readiness plumbing (channel close, URL unblock) deterministically
-// without live DNS — the real probe is covered by the live e2e suite.
+// without live DNS — the real resolvers are covered by the resolver package's
+// own tests and the live e2e suite.
 func stubReady(t *testing.T) {
 	t.Helper()
-	t.Cleanup(v1alpha1.SetAuthoritativeProbe(func(context.Context, *slog.Logger, string, string) (resolver.Records, bool) {
-		return resolver.Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}, true
-	}))
+	t.Cleanup(v1alpha1.SetResolver(fakeResolver{}))
 }
 
 // TestTunnelReadyAfterEngineConnects pins that TunnelReady closes once the
@@ -629,6 +670,55 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 	case <-conn.TunnelReady():
 	case <-time.After(15 * time.Second):
 		t.Fatal("TunnelReady never closed after the engine connected")
+	}
+}
+
+// TestHostnameReadyWaitsForRecords pins that readiness means the record
+// exists. The edge publishes it moments after the connection registers, so the
+// resolver ordinarily waits out that gap; readiness firing before the record
+// is published would hand the caller a URL that does not resolve.
+func TestHostnameReadyWaitsForRecords(t *testing.T) {
+	r := &unpublishedResolver{publish: make(chan struct{})}
+	t.Cleanup(v1alpha1.SetResolver(r))
+
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
+	conn := tun.WithListener(listen(t))
+
+	select {
+	case <-conn.HostnameReady():
+		t.Fatal("HostnameReady closed before the record was published")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(r.publish)
+	select {
+	case <-conn.HostnameReady():
+	case <-time.After(30 * time.Second):
+		t.Fatal("HostnameReady never closed once the record was published")
+	}
+}
+
+// TestHostnameNeverResolvesFailsTunnel pins that the wait is bounded. A
+// resolver that answered for the name before the record was published holds
+// that negative for the zone's SOA, so waiting cannot fix it — and a caller
+// that set no deadline of its own would otherwise block forever, which is a
+// hang rather than patience.
+func TestHostnameNeverResolvesFailsTunnel(t *testing.T) {
+	stubNeverReady(t)
+	t.Cleanup(v1alpha1.SetResolveTimeout(100 * time.Millisecond))
+
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})).
+		WithListener(listen(t))
+
+	select {
+	case <-conn.Done():
+	case <-conn.HostnameReady():
+		t.Fatal("HostnameReady closed though the hostname never resolved")
+	case <-time.After(15 * time.Second):
+		t.Fatal("tunnel neither resolved nor failed — readiness is unbounded")
+	}
+	if err := conn.Err(); !errors.Is(err, v1.ErrHostnameUnresolved) {
+		t.Errorf("Err() = %v, want ErrHostnameUnresolved", err)
 	}
 }
 
@@ -720,7 +810,7 @@ func TestWithContextCancelTearsDownURLOrigin(t *testing.T) {
 }
 
 func TestForeignBackendCancels(t *testing.T) {
-	tun := v1alpha1.New[*cloudflare.Spec](foreignBackend{})
+	tun := v1alpha1.New(foreignBackend{})
 	tun.WithListener(listen(t))
 
 	select {
@@ -737,7 +827,7 @@ func TestForeignBackendCancels(t *testing.T) {
 // never resolve must report through Done/Err — callers select on Done next
 // to TunnelReady instead of blocking forever.
 func TestDoneSurfacesSpecFailure(t *testing.T) {
-	tun := v1alpha1.New[*cloudflare.Spec](failingEngine{})
+	tun := v1alpha1.New(failingEngine{})
 
 	if err := tun.Err(); err != nil {
 		t.Fatalf("Err() = %v before any failure, want nil", err)
@@ -765,7 +855,7 @@ func TestDoneSurfacesSpecFailure(t *testing.T) {
 // URL: a tunnel canceled before the hostname resolves must yield nil, not a
 // non-nil URL with an empty host that defeats callers' nil checks.
 func TestURLReturnsNilWhenCanceled(t *testing.T) {
-	tun := v1alpha1.New[*cloudflare.Spec](failingEngine{})
+	tun := v1alpha1.New(failingEngine{})
 
 	if u := tun.URL(); u != nil {
 		t.Errorf("URL() = %v after the spec fetch failed, want nil", u)
@@ -854,7 +944,7 @@ func proxyEngine(t *testing.T, body string) *fakeEngine {
 // engine's InterceptCtx) and serves it, returning the recorded response.
 func serveIntercept(tun *v1alpha1.TunnelImpl[*cloudflare.Spec], engine *fakeEngine, req *http.Request) *httptest.ResponseRecorder {
 	rr := httptest.NewRecorder()
-	tun.Intercept(v1alpha1.NewInterceptCtx[*cloudflare.Spec](engine, rr, req))(rr, req)
+	tun.Intercept(v1alpha1.NewInterceptCtx(engine, rr, req))(rr, req)
 	return rr
 }
 

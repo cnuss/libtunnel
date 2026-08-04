@@ -438,7 +438,11 @@ func liveServeChild() {
 		fmt.Printf("listen: %v\n", err)
 		os.Exit(3)
 	}
-	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
+	// Logged: this child is spawned by TestLiveResurrection, whose only view of
+	// a readiness failure is whatever the child wrote before exiting.
+	conn := libtunnel.New(libtunnel.Cloudflare()).
+		WithLogger(slog.Default()).
+		WithListener(l)
 	serveBody(conn.Listener(), os.Getenv("LIBTUNNEL_E2E_BODY"))
 	select {
 	case <-conn.TunnelReady():
@@ -480,7 +484,10 @@ func TestLiveTwoTunnels(t *testing.T) {
 				return
 			}
 			defer l.Close()
-			tun := libtunnel.New(libtunnel.Cloudflare())
+			// Logged, and tagged: two tunnels resolve concurrently here, so an
+			// untagged line cannot be attributed to either.
+			tun := libtunnel.New(libtunnel.Cloudflare()).
+				WithLogger(slog.Default().With("tunnel", body))
 			conn := tun.WithListener(l)
 			serveBody(conn.Listener(), body)
 
