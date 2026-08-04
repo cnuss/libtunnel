@@ -23,6 +23,7 @@ package resolver
 
 import (
 	"context"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/netip"
@@ -124,6 +125,11 @@ type confirmedResolver struct {
 	source Resolver
 	// system is the resolver the calling process will use.
 	system Resolver
+	// log reports which of the two is holding a wait up. The two failures want
+	// opposite responses — an unpublished record resolves itself, a system
+	// resolver that will not see a published one does not — and they are
+	// indistinguishable from the empty Records both produce.
+	log *slog.Logger
 }
 
 var _ Resolver = &confirmedResolver{}
@@ -134,9 +140,15 @@ func (c *confirmedResolver) Resolve(hostname string) Records {
 	if c.source.Resolve(hostname).Empty() {
 		// Not published yet. Asking the system resolver now is what would
 		// poison it, so it is not asked.
+		c.log.Debug("hostname not published yet", "hostname", hostname)
 		return Records{CNAME: hostname}
 	}
-	return c.system.Resolve(hostname)
+	records := c.system.Resolve(hostname)
+	if records.Empty() {
+		c.log.Debug("hostname published, but the system resolver does not see it yet",
+			"hostname", hostname)
+	}
+	return records
 }
 
 // NewResolver returns the resolver best suited to the current network.
@@ -158,7 +170,10 @@ func (c *confirmedResolver) Resolve(hostname string) Records {
 //
 // The choice is made per call rather than once, because a machine moves between
 // networks and a resolver chosen for the previous one would be wrong.
-func NewResolver() Resolver {
+//
+// log reports, at debug, which half of a wait is unfinished — see
+// confirmedResolver. It must not be nil.
+func NewResolver(log *slog.Logger) Resolver {
 	dohResolver := &dohResolver{
 		servers: []string{
 			"https://cloudflare-dns.com/dns-query",
@@ -190,7 +205,7 @@ func NewResolver() Resolver {
 		source = dohResolver
 	}
 
-	return &confirmedResolver{source: source, system: &systemResolver{}}
+	return &confirmedResolver{source: source, system: &systemResolver{}, log: log}
 }
 
 // shuffled returns a random permutation of servers, so no one server carries

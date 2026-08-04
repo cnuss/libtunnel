@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	v1 "github.com/cnuss/libtunnel/v1"
 )
 
 // runTimeout bounds a single example run. A wedged example (e.g. a
@@ -54,7 +56,9 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 	cmd.WaitDelay = 5 * time.Second
 	// Run examples at Debug so a CI failure (e.g. a DNS-readiness stall) carries
 	// the per-rung probe detail; the examples default to Info for humans.
-	cmd.Env = append(os.Environ(), "LIBTUNNEL_LOG_LEVEL=debug")
+	// Both names: v1.LogEnv is what the library reads, LIBTUNNEL_LOG_LEVEL what
+	// serve-tls checks to build its own logger.
+	cmd.Env = append(os.Environ(), v1.LogEnv+"=debug", "LIBTUNNEL_LOG_LEVEL=debug")
 	out, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {
