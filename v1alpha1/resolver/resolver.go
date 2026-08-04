@@ -78,13 +78,22 @@ func (r *systemResolver) Resolve(hostname string) Records {
 	return records
 }
 
+// systemLookupTimeout bounds one system-resolver lookup. Deliberately not
+// queryTimeout: that one paces direct UDP queries to a nameserver that already
+// holds the answer, tens of milliseconds' work. This is a recursive resolve of a
+// name minted moments ago, so the resolver has nothing cached and must walk to
+// the authority itself, on a machine that may be loaded. Borrowing the tighter
+// bound made a family fail on a busy CI runner and readiness report the other
+// one alone.
+const systemLookupTimeout = 10 * time.Second
+
 // lookupVia resolves one address family through r, returning nil for any
 // failure — a name that does not resolve and a lookup that broke are the same
 // answer to the caller: no records.
 func lookupVia(r *net.Resolver, network, hostname string) []netip.Addr {
 	// Bounded: the caller polls, and an unbounded lookup here would park the
 	// readiness wait somewhere its own deadline cannot see.
-	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), systemLookupTimeout)
 	defer cancel()
 
 	ips, err := r.LookupIP(ctx, network, hostname)

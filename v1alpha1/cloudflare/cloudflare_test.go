@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -273,8 +274,22 @@ func TestWithEdgePinsAddresses(t *testing.T) {
 	if len(got) != 2 || got[0] != "relay.example:443" || got[1] != "relay2.example:443" {
 		t.Errorf("edge addrs = %v, want both pinned addresses", got)
 	}
-	if edgeAddresses(nil) != nil {
-		t.Error("unset must stay empty so the edge is discovered by SRV")
+}
+
+// TestEdgeDefaultsToTheRegions pins that the edge is never discovered by SRV:
+// unset falls back to the regions that lookup would have returned, so starting a
+// tunnel does not depend on an SRV query succeeding on the machine's resolver.
+func TestEdgeDefaultsToTheRegions(t *testing.T) {
+	t.Setenv(v1.CloudflareEdgeEnv, "")
+
+	got := edgeAddresses(nil)
+	if !slices.Equal(got, defaultEdgeAddrs) {
+		t.Errorf("edge addrs = %v, want the defaults %v", got, defaultEdgeAddrs)
+	}
+	for _, addr := range got {
+		if _, port, err := net.SplitHostPort(addr); err != nil || port != "7844" {
+			t.Errorf("default edge addr %q: want host:7844", addr)
+		}
 	}
 }
 
