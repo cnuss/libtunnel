@@ -584,9 +584,7 @@ func TestWithLoggerWriteOnce(t *testing.T) {
 // URL can only return via the first (already canceled) context — if the
 // second context won, URL would hang past the test timeout.
 func TestWithContextWriteOnce(t *testing.T) {
-	t.Cleanup(v1alpha1.SetAuthoritativeProbe(func(context.Context, *slog.Logger, string, string) (resolver.Records, bool) {
-		return resolver.Records{}, false // never ready
-	}))
+	stubNeverReady(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.trycloudflare.com"}))
 
 	canceled, cancel := context.WithCancel(context.Background())
@@ -606,14 +604,42 @@ func TestWithContextWriteOnce(t *testing.T) {
 	}
 }
 
-// stubReady makes the readiness consensus probe fire immediately so these tests
+// fakeResolver resolves every hostname to a fixed address without touching the
+// network.
+type fakeResolver struct{}
+
+func (fakeResolver) Resolve(hostname string) resolver.Records {
+	return resolver.Records{
+		A:     []netip.Addr{netip.MustParseAddr("104.16.230.132")},
+		CNAME: hostname,
+	}
+}
+
+// blockingResolver never answers, so hostname readiness never fires. It
+// releases on test cleanup so the tunnel's goroutine is not left parked.
+type blockingResolver struct{ release <-chan struct{} }
+
+func (b blockingResolver) Resolve(hostname string) resolver.Records {
+	<-b.release
+	return resolver.Records{CNAME: hostname}
+}
+
+// stubNeverReady holds hostname readiness open for the duration of a test, for
+// the cases that need to observe what happens while a tunnel is not yet ready.
+func stubNeverReady(t *testing.T) {
+	t.Helper()
+	release := make(chan struct{})
+	t.Cleanup(v1alpha1.SetResolver(blockingResolver{release: release}))
+	t.Cleanup(func() { close(release) })
+}
+
+// stubReady makes hostname readiness resolve immediately so these tests
 // exercise the readiness plumbing (channel close, URL unblock) deterministically
-// without live DNS — the real probe is covered by the live e2e suite.
+// without live DNS — the real resolvers are covered by the resolver package's
+// own tests and the live e2e suite.
 func stubReady(t *testing.T) {
 	t.Helper()
-	t.Cleanup(v1alpha1.SetAuthoritativeProbe(func(context.Context, *slog.Logger, string, string) (resolver.Records, bool) {
-		return resolver.Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}, true
-	}))
+	t.Cleanup(v1alpha1.SetResolver(fakeResolver{}))
 }
 
 // TestTunnelReadyAfterEngineConnects pins that TunnelReady closes once the
@@ -720,7 +746,7 @@ func TestWithContextCancelTearsDownURLOrigin(t *testing.T) {
 }
 
 func TestForeignBackendCancels(t *testing.T) {
-	tun := v1alpha1.New[*cloudflare.Spec](foreignBackend{})
+	tun := v1alpha1.New(foreignBackend{})
 	tun.WithListener(listen(t))
 
 	select {
@@ -737,7 +763,7 @@ func TestForeignBackendCancels(t *testing.T) {
 // never resolve must report through Done/Err — callers select on Done next
 // to TunnelReady instead of blocking forever.
 func TestDoneSurfacesSpecFailure(t *testing.T) {
-	tun := v1alpha1.New[*cloudflare.Spec](failingEngine{})
+	tun := v1alpha1.New(failingEngine{})
 
 	if err := tun.Err(); err != nil {
 		t.Fatalf("Err() = %v before any failure, want nil", err)
@@ -765,7 +791,7 @@ func TestDoneSurfacesSpecFailure(t *testing.T) {
 // URL: a tunnel canceled before the hostname resolves must yield nil, not a
 // non-nil URL with an empty host that defeats callers' nil checks.
 func TestURLReturnsNilWhenCanceled(t *testing.T) {
-	tun := v1alpha1.New[*cloudflare.Spec](failingEngine{})
+	tun := v1alpha1.New(failingEngine{})
 
 	if u := tun.URL(); u != nil {
 		t.Errorf("URL() = %v after the spec fetch failed, want nil", u)
@@ -854,7 +880,7 @@ func proxyEngine(t *testing.T, body string) *fakeEngine {
 // engine's InterceptCtx) and serves it, returning the recorded response.
 func serveIntercept(tun *v1alpha1.TunnelImpl[*cloudflare.Spec], engine *fakeEngine, req *http.Request) *httptest.ResponseRecorder {
 	rr := httptest.NewRecorder()
-	tun.Intercept(v1alpha1.NewInterceptCtx[*cloudflare.Spec](engine, rr, req))(rr, req)
+	tun.Intercept(v1alpha1.NewInterceptCtx(engine, rr, req))(rr, req)
 	return rr
 }
 

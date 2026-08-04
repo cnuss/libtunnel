@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1/resolver"
@@ -268,6 +267,19 @@ func (t *TunnelImpl[T]) provideURL(u *url.URL) {
 // propagation overlaps the (seconds-long) edge dial instead of queuing behind
 // it — then dial the edge via connect (which blocks until the connection is
 // up) and close tunnelReady once DNS readiness lands too. On a foreign
+// resolverFactory builds the resolver used for hostname readiness.
+type resolverFactory = func() resolver.Resolver
+
+// newResolver holds that constructor as a swappable hook. It is atomic because
+// tests replace it (SetResolver) while background start goroutines from other
+// tests may still be reading it — production only reads it, set once here.
+var newResolver = func() *atomic.Pointer[resolverFactory] {
+	var p atomic.Pointer[resolverFactory]
+	fn := resolverFactory(resolver.NewResolver)
+	p.Store(&fn)
+	return &p
+}()
+
 // backend (nil engine, tunnel born canceled — see New) it does nothing.
 func (t *TunnelImpl[T]) start(connect func() error) {
 	if t.engine == nil {
@@ -276,7 +288,6 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 
 	go func() {
 		t.Logger().Info("starting tunnel")
-		go t.pollAuthoritative()
 		t.Spec()
 		if err := connect(); err != nil {
 			t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
@@ -284,9 +295,8 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 		}
 
 		t.Logger().Info("tunnel connected, waiting for DNS")
-		if !await(t.ctx, t.hostnameReady) {
-			return
-		}
+		rec := (*newResolver.Load())().Resolve(t.Hostname())
+		t.markHostnameReady(t.Hostname(), rec)
 
 		t.Logger().Info("tunnel is ready")
 		close(t.tunnelReady)
@@ -618,13 +628,6 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 	return t.tunnelReady
 }
 
-// fibonacciBackoff is the wait between authoritative poll rounds, in seconds.
-// It tracks the observed ~5s window for a fresh quick-tunnel record to land on
-// the zone's nameservers and caps at 21s; spot-tests showed the record absent
-// at 1–3s, reliably present by 5s. After the sequence is exhausted the poll
-// holds at the 21s cap and keeps going until the record appears or tunnel cancel.
-var fibonacciBackoff = []time.Duration{1, 1, 2, 3, 5, 8, 13, 21}
-
 // HostnameReady returns the channel closed once the public hostname resolves on
 // the zone's authoritative nameservers. The poll that closes it is started by
 // WithListener and gated on hostnameProvided, so this is a pure accessor —
@@ -644,80 +647,6 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 func (t *TunnelImpl[T]) markHostnameReady(host string, rec resolver.Records) {
 	t.Logger().Info("hostname resolved", "hostname", host, "A", rec.A, "AAAA", rec.AAAA)
 	close(t.hostnameReady)
-}
-
-// pollAuthoritative waits for the spec to provide the public hostname, then
-// probes the nameservers each round and fires as soon as one serves the record.
-// Rounds ramp through fibonacciBackoff and then hold at its cap; it runs until
-// the record appears or the tunnel is canceled.
-func (t *TunnelImpl[T]) pollAuthoritative() {
-	if !await(t.ctx, t.hostnameProvided) {
-		return
-	}
-	host := dnsName(t.Hostname())
-	for round := 0; ; round++ {
-		if rec, ok := (*authoritativeProbe.Load())(t.ctx, t.Logger(), t.Domain(), host); ok {
-			t.markHostnameReady(host, rec)
-			return
-		}
-		wait := fibonacciBackoff[len(fibonacciBackoff)-1]
-		if round < len(fibonacciBackoff) {
-			wait = fibonacciBackoff[round]
-		}
-		t.Logger().Debug("authoritative rung not resolved yet, backing off",
-			"hostname", host, "round", round+1, "nextWait", wait*time.Second)
-		select {
-		case <-t.ctx.Done():
-			return
-		case <-time.After(wait * time.Second):
-		}
-	}
-}
-
-// probeFunc runs one readiness probe for host in zone domain, returning
-// records and true as soon as one authoritative nameserver serves a non-empty
-// A+AAAA set.
-type probeFunc = func(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool)
-
-// authoritativeProbe holds the readiness probe as a swappable hook. It is
-// atomic because tests replace it (SetAuthoritativeProbe) while background
-// pollAuthoritative goroutines from other tests may still be reading it —
-// production only reads it, set once here to realAuthoritativeProbe.
-var authoritativeProbe = func() *atomic.Pointer[probeFunc] {
-	var p atomic.Pointer[probeFunc]
-	fn := probeFunc(realAuthoritativeProbe)
-	p.Store(&fn)
-	return &p
-}()
-
-// realAuthoritativeProbe queries the zone's nameservers for host's A+AAAA and
-// returns the first non-empty answer — one authoritative nameserver serving the
-// record is enough, no cross-server agreement required. Nameservers are
-// re-resolved each round so a changed delegation is picked up; a server that
-// errors, times out, or has no record yet is skipped, and a round with no
-// non-empty answer keeps polling.
-func realAuthoritativeProbe(ctx context.Context, log *slog.Logger, domain, host string) (resolver.Records, bool) {
-	servers, err := resolver.NameserverIPs(ctx, domain, net.DefaultResolver)
-	if err != nil {
-		log.Debug("authoritative NS lookup failed", "domain", domain, "error", err)
-		return resolver.Records{}, false
-	}
-	if len(servers) == 0 {
-		log.Debug("no authoritative nameservers discovered yet", "domain", domain)
-		return resolver.Records{}, false
-	}
-
-	for _, server := range servers {
-		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		rec, err := resolver.Query(qctx, server, host)
-		cancel()
-		log.Debug("authoritative query", "hostname", host, "server", server, "A", rec.A, "AAAA", rec.AAAA, "error", err)
-		if err != nil || rec.Empty() {
-			continue
-		}
-		return rec, true
-	}
-	return resolver.Records{}, false
 }
 
 // hostOf returns the first label of hostname.
