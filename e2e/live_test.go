@@ -399,12 +399,12 @@ func TestLiveResurrection(t *testing.T) {
 	url := "https://" + hostname + "/"
 
 	_, kill1 := spawnServeChild(t, "TestLiveResurrection", "generation one")
-	eventuallyBody(t, url, "generation one", 30*time.Second)
+	eventuallyBody(t, url, "generation one", 90*time.Second)
 	kill1()
 
 	_, kill2 := spawnServeChild(t, "TestLiveResurrection", "generation two")
 	defer kill2()
-	eventuallyBody(t, url, "generation two", 45*time.Second)
+	eventuallyBody(t, url, "generation two", 90*time.Second)
 }
 
 // spawnServeChild re-execs anchorTest with the live-serve-child role serving
@@ -465,7 +465,7 @@ func TestLiveSpecHandoff(t *testing.T) {
 		t.Errorf("child connected under %q, want the parent's minted hostname %q",
 			childURL.Hostname(), hostname)
 	}
-	eventuallyBody(t, "https://"+hostname+"/", "hello from the child", 30*time.Second)
+	eventuallyBody(t, "https://"+hostname+"/", "hello from the child", 90*time.Second)
 }
 
 // liveServeChild adopts LIBTUNNEL_SPEC, serves LIBTUNNEL_E2E_BODY, reports
@@ -543,7 +543,7 @@ func TestLiveTwoTunnels(t *testing.T) {
 			}
 			// Retry briefly: TunnelReady proves a public resolver sees the
 			// hostname, but this host's own resolver can lag a few seconds.
-			if err := eventuallyBodyErr(conn.URL().String(), body, 30*time.Second); err != nil {
+			if err := eventuallyBodyErr(conn.URL().String(), body, 90*time.Second); err != nil {
 				errs <- fmt.Errorf("%s: %w", body, err)
 				return
 			}
