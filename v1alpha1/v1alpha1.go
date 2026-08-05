@@ -67,13 +67,12 @@ type Engine[T v1.Spec] interface {
 func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	t := &TunnelImpl[T]{
-		ctx:              ctx,
-		cancel:           cancel,
-		backend:          backend,
-		originProvided:   make(chan struct{}),
-		hostnameProvided: make(chan struct{}),
-		tunnelReady:      make(chan struct{}),
-		hostnameReady:    make(chan struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
+		backend:        backend,
+		originProvided: make(chan struct{}),
+		tunnelReady:    make(chan struct{}),
+		hostnameReady:  make(chan struct{}),
 	}
 	// Auto-assigned interceptor Priorities count down from the top of the range.
 	t.autoPriority.Store(math.MaxUint16)
@@ -148,10 +147,6 @@ type TunnelImpl[T v1.Spec] struct {
 
 	specOnce sync.Once
 	spec     T
-	// hostnameProvided is closed once Spec resolves the public hostname. It
-	// starts the authoritative DNS poll (mirrors listenerProvided), so polling
-	// begins at mint time rather than when a caller first asks HostnameReady.
-	hostnameProvided chan struct{}
 
 	caCertsOnce sync.Once
 	caCerts     []*x509.Certificate

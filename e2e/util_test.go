@@ -37,11 +37,10 @@ import (
 )
 
 // TestMain raises the default logger to debug before any test runs. The live
-// tests hand slog.Default() to their tunnels, and the resolver reports what each
-// attempt found only at that level — which is the sole record of why a hostname
-// never resolved, and was missing exactly when it was needed. It reaches the
-// re-exec'd children too, since they run this same binary and their stderr is
-// the parent's only view of them.
+// tests hand slog.Default() to their tunnels, and the interesting detail of a
+// failing run shows up only at that level. It reaches the re-exec'd children
+// too, since they run this same binary and their stderr is the parent's only
+// view of them.
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelDebug,

@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
-	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -20,7 +19,6 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
-	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
 // fakeEngine satisfies the Engine contract without dialing anything: it
@@ -604,57 +602,20 @@ func TestWithContextWriteOnce(t *testing.T) {
 	}
 }
 
-// fakeResolver resolves every hostname to a fixed address without touching the
-// network.
-type fakeResolver struct{}
-
-func (fakeResolver) Resolve(context.Context, string) resolver.Records {
-	return resolver.Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}
-}
-
-// unpublishedResolver answers once publish is closed — a hostname whose record
-// is published a moment after the tunnel connects, which is the ordinary case.
-// Like the real resolver, it comes back empty only when ctx ends first.
-type unpublishedResolver struct{ publish chan struct{} }
-
-func (u *unpublishedResolver) Resolve(ctx context.Context, _ string) resolver.Records {
-	select {
-	case <-u.publish:
-		return resolver.Records{A: []netip.Addr{netip.MustParseAddr("104.16.230.132")}}
-	case <-ctx.Done():
-		return resolver.Records{}
-	}
-}
-
-// neverResolver never answers, so hostname readiness never fires. It returns
-// empty on release — closed at test cleanup, so the tunnel's goroutine is not
-// left parked — or when ctx ends, whichever comes first.
-type neverResolver struct{ release <-chan struct{} }
-
-func (n neverResolver) Resolve(ctx context.Context, _ string) resolver.Records {
-	select {
-	case <-n.release:
-	case <-ctx.Done():
-	}
-	return resolver.Records{}
-}
-
 // stubNeverReady holds hostname readiness open for the duration of a test, for
 // the cases that need to observe what happens while a tunnel is not yet ready.
 func stubNeverReady(t *testing.T) {
 	t.Helper()
-	release := make(chan struct{})
-	t.Cleanup(v1alpha1.SetResolver(neverResolver{release: release}))
-	t.Cleanup(func() { close(release) })
+	t.Cleanup(v1alpha1.SetSettleDelay(24 * time.Hour))
 }
 
-// stubReady makes hostname readiness resolve immediately so these tests
-// exercise the readiness plumbing (channel close, URL unblock) deterministically
-// without live DNS — the real resolvers are covered by the resolver package's
-// own tests and the live e2e suite.
+// stubReady makes hostname readiness immediate so these tests exercise the
+// readiness plumbing (channel close, URL unblock) deterministically without
+// waiting out the production settle delay — the delay itself is pinned by
+// TestHostnameReadyWaitsOutSettle, and the live e2e suite pays it for real.
 func stubReady(t *testing.T) {
 	t.Helper()
-	t.Cleanup(v1alpha1.SetResolver(fakeResolver{}))
+	t.Cleanup(v1alpha1.SetSettleDelay(0))
 }
 
 // TestTunnelReadyAfterEngineConnects pins that TunnelReady closes once the
@@ -673,52 +634,28 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 	}
 }
 
-// TestHostnameReadyWaitsForRecords pins that readiness means the record
-// exists. The edge publishes it moments after the connection registers, so the
-// resolver ordinarily waits out that gap; readiness firing before the record
-// is published would hand the caller a URL that does not resolve.
-func TestHostnameReadyWaitsForRecords(t *testing.T) {
-	r := &unpublishedResolver{publish: make(chan struct{})}
-	t.Cleanup(v1alpha1.SetResolver(r))
+// TestHostnameReadyWaitsOutSettle pins that readiness is not immediate: the
+// edge publishes the record moments after the connection registers and it
+// spreads across the zone's nameservers over seconds, so HostnameReady holds
+// for the settle delay before closing. Firing at connect would hand the
+// caller a URL whose record may not have reached the nameserver their
+// resolver asks.
+func TestHostnameReadyWaitsOutSettle(t *testing.T) {
+	t.Cleanup(v1alpha1.SetSettleDelay(500 * time.Millisecond))
 
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
 	conn := tun.WithListener(listen(t))
 
 	select {
 	case <-conn.HostnameReady():
-		t.Fatal("HostnameReady closed before the record was published")
+		t.Fatal("HostnameReady closed before the settle delay elapsed")
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	close(r.publish)
 	select {
 	case <-conn.HostnameReady():
-	case <-time.After(30 * time.Second):
-		t.Fatal("HostnameReady never closed once the record was published")
-	}
-}
-
-// TestHostnameNeverResolvesFailsTunnel pins that the wait is bounded. A
-// resolver that answered for the name before the record was published holds
-// that negative for the zone's SOA, so waiting cannot fix it — and a caller
-// that set no deadline of its own would otherwise block forever, which is a
-// hang rather than patience.
-func TestHostnameNeverResolvesFailsTunnel(t *testing.T) {
-	stubNeverReady(t)
-	t.Cleanup(v1alpha1.SetResolveTimeout(100 * time.Millisecond))
-
-	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})).
-		WithListener(listen(t))
-
-	select {
-	case <-conn.Done():
-	case <-conn.HostnameReady():
-		t.Fatal("HostnameReady closed though the hostname never resolved")
 	case <-time.After(15 * time.Second):
-		t.Fatal("tunnel neither resolved nor failed — readiness is unbounded")
-	}
-	if err := conn.Err(); !errors.Is(err, v1.ErrHostnameUnresolved) {
-		t.Errorf("Err() = %v, want ErrHostnameUnresolved", err)
+		t.Fatal("HostnameReady never closed after the settle delay")
 	}
 }
 
