@@ -273,7 +273,7 @@ cmd := exec.Command(os.Args[0], "child") // inherits the environment
 conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 ```
 
-(Full source: [`examples/subprocess/main.go`](./examples/subprocess/main.go).)
+(Live coverage: `TestLiveSpecHandoff` in [`e2e/live_test.go`](./e2e/live_test.go).)
 
 ## Replaying a spec
 
@@ -395,14 +395,12 @@ Self-contained programs in [`./examples`](./examples):
 | --------- | ------------------------------------------------------------------ |
 | `serve`   | Real quick tunnel: serve locally, request the public URL.           |
 | `serve-tls` | Same as `serve`, but a TLS listener (`tls.Listen`) — ingress flips to https. |
-| `subprocess` | Parent mints a spec; child adopts it via `LIBTUNNEL_SPEC` and serves. |
 
 Run one locally:
 
 ```sh
 make run serve
 make run serve-tls
-make run subprocess
 ```
 
 ## Testing
@@ -416,7 +414,7 @@ make e2e    # live tier: real tunnels through the real edge (gated)
 cache, since the harness builds the example binaries at runtime and the cache
 key wouldn't otherwise pick up example source changes. The e2e tier is live
 tunnels only — everything mints from `api.trycloudflare.com` (rate-limited),
-so the whole tier is skipped unless you opt in (offline subprocess handoff
+so the whole tier is skipped unless you opt in (offline spec-handoff
 coverage lives in the unit tier and always runs):
 
 ```sh

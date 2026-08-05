@@ -83,8 +83,10 @@ func gateLive(t *testing.T) {
 // identity: it scrubs any inherited LIBTUNNEL_SPEC so the tunnel mints a fresh
 // hostname rather than adopting the shared preflight spec. Used by
 // TestLiveResurrection (kills and resurrects a connector on its own hostname —
-// reusing the shared one risks a sticky 530 after unregister) and
-// TestLiveTwoTunnels (needs two distinct hostnames).
+// reusing the shared one risks a sticky 530 after unregister),
+// TestLiveSpecHandoff (the parent-side mint is half its scenario, and its
+// child gets killed too), and TestLiveTwoTunnels (needs two distinct
+// hostnames).
 func gateLiveOwnSpec(t *testing.T) {
 	t.Helper()
 	gateLiveBare(t)

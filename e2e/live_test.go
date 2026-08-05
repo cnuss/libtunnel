@@ -9,7 +9,8 @@ package e2e_test
 // are stingy with mints: preflight mints ONE spec and every SHARE test adopts it
 // (gateLive), reconnecting a fresh connector to that one hostname in sequence.
 // Only scenarios that own a hostname's whole lifecycle mint their own
-// (gateLiveOwnSpec): TestLiveResurrection (kills/resurrects a connector) and
+// (gateLiveOwnSpec): TestLiveResurrection (kills/resurrects a connector),
+// TestLiveSpecHandoff (the parent-side mint is half its scenario), and
 // TestLiveTwoTunnels (two distinct hostnames). The SHARE tests run first and
 // contiguous so the preflight spec stays continuously connected (well inside its
 // ~5min idle TTL); the two OWN tests run last, where preflight GC is moot. This
@@ -397,37 +398,74 @@ func TestLiveResurrection(t *testing.T) {
 	t.Logf("minted: %s", hostname)
 	url := "https://" + hostname + "/"
 
-	spawn := func(body string) (kill func()) {
-		t.Helper()
-		cmd := reexec("TestLiveResurrection", roleEnv+"=live-serve-child", "LIBTUNNEL_E2E_BODY="+body)
-		cmd.Stderr = os.Stderr
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			t.Logf("child[%s]: %s", body, line)
-			if strings.HasPrefix(line, readyPrefix) {
-				return func() { cmd.Process.Kill(); cmd.Wait() }
-			}
-		}
-		cmd.Wait()
-		t.Fatalf("child[%s] exited before the tunnel became ready (scan err: %v)", body, scanner.Err())
-		return nil
-	}
-
-	kill1 := spawn("generation one")
+	_, kill1 := spawnServeChild(t, "TestLiveResurrection", "generation one")
 	eventuallyBody(t, url, "generation one", 30*time.Second)
 	kill1()
 
-	kill2 := spawn("generation two")
+	_, kill2 := spawnServeChild(t, "TestLiveResurrection", "generation two")
 	defer kill2()
 	eventuallyBody(t, url, "generation two", 45*time.Second)
+}
+
+// spawnServeChild re-execs anchorTest with the live-serve-child role serving
+// body, waits for the child's ready line, and returns the URL that line
+// carried plus a kill func. The child inherits this process's environment,
+// LIBTUNNEL_SPEC included — that inheritance is the spec handoff under test.
+func spawnServeChild(t *testing.T, anchorTest, body string) (ready string, kill func()) {
+	t.Helper()
+	cmd := reexec(anchorTest, roleEnv+"=live-serve-child", "LIBTUNNEL_E2E_BODY="+body)
+	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		t.Logf("child[%s]: %s", body, line)
+		if u, ok := strings.CutPrefix(line, readyPrefix); ok {
+			return u, func() { cmd.Process.Kill(); cmd.Wait() }
+		}
+	}
+	cmd.Wait()
+	t.Fatalf("child[%s] exited before the tunnel became ready (scan err: %v)", body, scanner.Err())
+	return "", nil
+}
+
+// TestLiveSpecHandoff is the canonical parent→child spec handoff, promoted
+// from the old examples/subprocess: the parent mints a spec and never
+// connects — minting exports LIBTUNNEL_SPEC into this process's environment,
+// so the spawned child inherits the tunnel identity with no plumbing at all.
+// The child provides the listener, connects, and serves; the parent then
+// reaches the child through the very hostname it minted.
+func TestLiveSpecHandoff(t *testing.T) {
+	if role() == "live-serve-child" {
+		liveServeChild()
+		return
+	}
+	gateLiveOwnSpec(t) // the parent-side mint is half the scenario; mints its own
+
+	hostname := libtunnel.New(libtunnel.Cloudflare()).Hostname()
+	if hostname == "" {
+		t.Fatal("failed to mint a spec")
+	}
+	t.Logf("minted: %s", hostname)
+
+	ready, kill := spawnServeChild(t, "TestLiveSpecHandoff", "hello from the child")
+	defer kill()
+
+	childURL, err := url.Parse(ready)
+	if err != nil {
+		t.Fatalf("child ready line %q is not a URL: %v", ready, err)
+	}
+	if childURL.Hostname() != hostname {
+		t.Errorf("child connected under %q, want the parent's minted hostname %q",
+			childURL.Hostname(), hostname)
+	}
+	eventuallyBody(t, "https://"+hostname+"/", "hello from the child", 30*time.Second)
 }
 
 // liveServeChild adopts LIBTUNNEL_SPEC, serves LIBTUNNEL_E2E_BODY, reports
