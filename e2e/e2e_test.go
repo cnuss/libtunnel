@@ -118,4 +118,3 @@ func TestExamples(t *testing.T) {
 		})
 	}
 }
-
