@@ -16,7 +16,6 @@ import (
 	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
-	"github.com/cnuss/libtunnel/v1alpha1/resolver"
 )
 
 // WithLogger sets the logger, once: the first call wins, and a nil logger is
@@ -262,43 +261,29 @@ func (t *TunnelImpl[T]) provideURL(u *url.URL) {
 	t.start(func() error { return t.engine.WithLocalURL(t, u) })
 }
 
-// start runs the connect sequence in the background: kick off the DNS
-// readiness poller (it waits on hostnameProvided) and mint the spec, both
-// before the edge connect — the record exists from spec-mint time, so DNS
-// propagation overlaps the (seconds-long) edge dial instead of queuing behind
-// it — then dial the edge via connect (which blocks until the connection is
-// up) and close tunnelReady once DNS readiness lands too. On a foreign
-// resolverFactory builds the resolver used for hostname readiness.
-type resolverFactory = func(*slog.Logger) resolver.Resolver
-
-// newResolver holds that constructor as a swappable hook. It is atomic because
-// tests replace it (SetResolver) while background start goroutines from other
-// tests may still be reading it — production only reads it, set once here.
-var newResolver = func() *atomic.Pointer[resolverFactory] {
-	var p atomic.Pointer[resolverFactory]
-	fn := resolverFactory(resolver.NewResolver)
-	p.Store(&fn)
-	return &p
-}()
-
-// resolveTimeout bounds the wait for the hostname's record to be published.
-// Publication takes seconds, so reaching this does not mean the record is slow
-// — it means something answered for the name before it existed and cached the
-// negative, which lasts the zone's SOA (30 minutes here) no matter how long
-// the wait. Past that point waiting is not patience, it is a hang, and a
-// caller with no deadline of its own would never come back. The resolver has
-// no clock of its own; this deadline, handed down as a ctx, is the only one.
+// settleDelay is how long readiness waits after the edge connection registers
+// before calling the hostname ready. The edge publishes the record moments
+// after the connection registers and it spreads across the zone's nameserver
+// fleet node by node over a few seconds (measured at ~5s); the delay waits
+// that spread out. Nothing is queried: every scheme that asked DNS during the
+// spread either trusted a vantage that could not see the node a visitor
+// resolves through, or planted the very negatives it was trying to avoid
+// (#130, #133). Waiting blind is honest about what one vantage can know.
 //
-// Atomic for the same reason as newResolver: tests shorten it (SetResolveTimeout)
-// while start goroutines from other tests may still be reading it. Nanoseconds,
-// because that is what atomic.Int64 holds.
-var resolveTimeout = func() *atomic.Int64 {
+// Atomic because tests shorten it (SetSettleDelay) while background start
+// goroutines from other tests may still be reading it. Nanoseconds, because
+// that is what atomic.Int64 holds.
+var settleDelay = func() *atomic.Int64 {
 	var d atomic.Int64
-	d.Store(int64(60 * time.Second))
+	d.Store(int64(5 * time.Second))
 	return &d
 }()
 
-// backend (nil engine, tunnel born canceled — see New) it does nothing.
+// start runs the connect sequence in the background: mint the spec, dial the
+// edge via connect (which blocks until the connection is up), wait out
+// settleDelay for the hostname's record to spread, then close hostname and
+// tunnel readiness together. On a foreign backend (nil engine, tunnel born
+// canceled — see New) it does nothing.
 func (t *TunnelImpl[T]) start(connect func() error) {
 	if t.engine == nil {
 		return
@@ -312,27 +297,13 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 			return
 		}
 
-		t.Logger().Info("tunnel connected, waiting for DNS")
-		hostname := t.Hostname()
-		// The edge publishes the record moments after the connection
-		// registers; Resolve waits out that gap, asking sources that cannot
-		// cache a negative until one serves the record. The deadline is this
-		// tunnel's policy, not the resolver's — see resolveTimeout.
-		resolve := (*newResolver.Load())(t.Logger())
-		timeout := time.Duration(resolveTimeout.Load())
-		ctx, cancel := context.WithTimeout(t.ctx, timeout)
-		rec := resolve.Resolve(ctx, hostname)
-		cancel()
-		if rec.Empty() {
-			if t.ctx.Err() == nil {
-				t.cancel(fmt.Errorf("%w: %s after %s: a resolver that answered for this "+
-					"name before the record was published holds that negative for the "+
-					"zone's SOA, and waiting cannot shorten it",
-					v1.ErrHostnameUnresolved, hostname, timeout))
-			}
+		t.Logger().Info("tunnel connected, waiting for DNS to settle")
+		select {
+		case <-t.ctx.Done():
 			return
+		case <-time.After(time.Duration(settleDelay.Load())):
 		}
-		t.markHostnameReady(hostname, rec)
+		t.markHostnameReady(t.Hostname())
 
 		t.Logger().Info("tunnel is ready")
 		close(t.tunnelReady)
@@ -572,9 +543,6 @@ func (t *TunnelImpl[T]) Spec() T {
 		}
 		t.spec = spec
 		t.Logger().Info("fetched tunnel spec", "hostname", spec.GetHostname())
-		// The public hostname is now known; release the authoritative poll
-		// (started by WithListener) so DNS propagation overlaps the edge dial.
-		close(t.hostnameProvided)
 	})
 	return t.spec
 }
@@ -599,8 +567,8 @@ func (t *TunnelImpl[T]) Port() int {
 	return portOf(t.Hostname())
 }
 
-// URL is https://<Hostname>/. It blocks until the hostname resolves on the
-// zone's authoritative nameservers. Returns nil if the tunnel is canceled
+// URL is https://<Hostname>/. It blocks until the hostname is expected to
+// resolve publicly (see HostnameReady). Returns nil if the tunnel is canceled
 // before that happens, per the v1 contract's zero-value-on-cancel rule.
 //
 // URL demands public reachability, so like Listener it is a start trigger:
@@ -655,8 +623,8 @@ func (t *TunnelImpl[T]) CACerts() []*x509.Certificate {
 	return t.caCerts
 }
 
-// TunnelReady is closed when the edge connection is up and the hostname
-// resolves publicly. Waiting on readiness demands a running tunnel, so like
+// TunnelReady is closed when the edge connection is up and the hostname's
+// settle delay has passed. Waiting on readiness demands a running tunnel, so like
 // URL it is a start trigger: with no origin provided it mints a loopback
 // listener and starts the edge connection before handing back the channel.
 func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
@@ -664,26 +632,20 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 	return t.tunnelReady
 }
 
-// HostnameReady returns the channel closed once the public hostname resolves.
-// The wait that closes it is started by WithListener and gated on
-// hostnameProvided, so this is a pure accessor — select on it (and on Done).
-//
-// Readiness is consensus across every resolving voice package resolver can
-// hear: the zone's own nameservers (trusting only authoritative replies) and
-// independent DoH endpoints, which see the record from the recursive vantage
-// a visitor actually resolves through. It fires once someone serves the A
-// record and nobody answers without it — one voice still missing the record
-// holds readiness open, because a visitor's resolver could hit that one and
-// cache the negative. The machine's own resolver is never asked.
+// HostnameReady returns the channel closed once the public hostname is
+// expected to resolve: a fixed settle delay after the edge connection
+// registers (see settleDelay), waiting out the record's spread across the
+// zone's nameservers. Nothing on this machine is asked about the hostname —
+// its resolver's first sight of the name stays the caller's. This is a pure
+// accessor — select on it (and on Done).
 func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 	return t.hostnameReady
 }
 
-// markHostnameReady logs the resolved record and closes the readiness channel.
-// One caller (start's readiness wait) reaches it once, so the close needs no
-// guard.
-func (t *TunnelImpl[T]) markHostnameReady(host string, rec resolver.Records) {
-	t.Logger().Info("hostname resolved", "hostname", host, "A", rec.A, "AAAA", rec.AAAA)
+// markHostnameReady logs the settled hostname and closes the readiness
+// channel. One caller (start) reaches it once, so the close needs no guard.
+func (t *TunnelImpl[T]) markHostnameReady(host string) {
+	t.Logger().Info("hostname ready", "hostname", host)
 	close(t.hostnameReady)
 }
 

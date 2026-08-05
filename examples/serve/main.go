@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -57,15 +58,33 @@ func main() {
 	}
 	log.Printf("✓ tunneled %s to %s\n", tun.LocalURL(), url)
 
-	// The first request can race propagation: TunnelReady proves the
-	// authoritative nameservers serve the record, but this machine's own
-	// resolver and the edge route may lag a few seconds behind. Retry — the
-	// same ctx bounds the wait, so it shares the deadline with readiness above.
+	// The first request can race propagation: the record and the edge route
+	// may lag readiness by a few seconds. Retry — the same ctx bounds the
+	// wait, so it shares the deadline with readiness above.
 	body, err := fetch(ctx, url.String())
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("served: %s\n", body)
+}
+
+// fetchClient resolves through a public resolver (1.1.1.1) instead of this
+// machine's own: an OS resolver asked moments too early caches the NXDOMAIN
+// for the zone's SOA (30 minutes here), which would turn every retry in fetch
+// into a no-op. A public resolver is asked fresh on each attempt, so retrying
+// actually rides out propagation.
+var fetchClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Resolver: &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, network, "1.1.1.1:53")
+				},
+			},
+		}).DialContext,
+	},
 }
 
 // fetch GETs url, retrying until it answers 200 or ctx is done.
@@ -76,7 +95,7 @@ func fetch(ctx context.Context, url string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := fetchClient.Do(req)
 		if err != nil {
 			lastErr = err
 		} else {

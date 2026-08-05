@@ -2,7 +2,6 @@ package e2e_test
 
 import (
 	"context"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,12 +46,12 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, r.bin, args...)
-	// CombinedOutput reads until every writer closes the pipe, and an example
-	// that spawns a child (subprocess) hands it that same pipe. Killing the
-	// example on ctx leaves the child holding it open, so the read — and the
-	// whole suite — blocks past runTimeout with nothing to show for it.
-	// WaitDelay closes the pipe regardless, turning a wedged example back into
-	// a test failure carrying whatever output it did produce.
+	// CombinedOutput reads until every writer closes the pipe. If an example
+	// wedges and is killed on ctx while anything it spawned still holds the
+	// pipe, the read — and the whole suite — blocks past runTimeout with
+	// nothing to show for it. WaitDelay closes the pipe regardless, turning a
+	// wedged example back into a test failure carrying whatever output it did
+	// produce.
 	cmd.WaitDelay = 5 * time.Second
 	// Run examples at Debug so a CI failure (e.g. a DNS-readiness stall) carries
 	// the per-rung probe detail; the examples default to Info for humans.
@@ -100,7 +99,6 @@ func TestExamples(t *testing.T) {
 	}{
 		{"serve", "served: hello from libtunnel", true, nil},
 		{"serve-tls", "served: hello from libtunnel (tls)", true, nil},
-		{"subprocess", "handoff: hello from the child", true, verifySharedHostname},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -118,41 +116,5 @@ func TestExamples(t *testing.T) {
 				tc.verify(t, out)
 			}
 		})
-	}
-}
-
-// capture returns the remainder of the first output line starting with
-// prefix, and whether one was found.
-func capture(out, prefix string) (string, bool) {
-	for _, line := range strings.Split(out, "\n") {
-		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), prefix); ok {
-			return rest, true
-		}
-	}
-	return "", false
-}
-
-// verifySharedHostname asserts the parent→child spec handoff on the
-// subprocess example's output: the parent mints a hostname, the child (a subprocess)
-// provides the listener and connects, and both interact with the tunnel
-// under the exact same hostname.
-func verifySharedHostname(t *testing.T, out string) {
-	t.Helper()
-
-	minted, ok := capture(out, "minted: ")
-	if !ok {
-		t.Fatalf("parent never printed the minted hostname:\n%s", out)
-	}
-
-	ready, ok := capture(out, "child: ready: ")
-	if !ok {
-		t.Fatalf("child never reported the tunnel ready:\n%s", out)
-	}
-	childURL, err := url.Parse(ready)
-	if err != nil {
-		t.Fatalf("child ready line %q is not a URL: %v", ready, err)
-	}
-	if childURL.Hostname() != minted {
-		t.Errorf("child connected under %q, want the parent's minted hostname %q", childURL.Hostname(), minted)
 	}
 }

@@ -31,12 +31,10 @@ var ErrClosed = errors.New("tunnel closed")
 // can act on (errors.Is) and a message that names the likely cause.
 var ErrEdgeUnreachable = errors.New("edge unreachable")
 
-// ErrHostnameUnresolved is the Err result of a tunnel whose hostname never
-// resolved. The edge publishes the record moments after the connection
-// registers, so readiness waits for it — bounded, because a resolver that
-// cached a negative before publication holds it for the zone's SOA and no
-// amount of waiting will shorten that. Failing says so; blocking forever
-// does not.
+// ErrHostnameUnresolved was the Err result of a tunnel whose hostname never
+// resolved, back when readiness polled DNS and could give up. Readiness is
+// now a fixed settle delay after the edge connection registers and produces
+// no error; the variable remains so callers matching on it keep compiling.
 var ErrHostnameUnresolved = errors.New("hostname unresolved")
 
 // The environment variables, centralized: every code knob with an
@@ -252,16 +250,17 @@ type Tunnel interface {
 	// listener handed to WithListener instead and rebind the same address; a
 	// minted listener has no separate owner, so closing it is terminal.
 	Listener() net.Listener
-	// URL is https://<Hostname>/. It blocks until the hostname resolves on
-	// the zone's authoritative nameservers (see HostnameReady). URL demands
-	// public reachability, so like Listener it is a start trigger: with no
-	// origin provided it mints a loopback listener and starts the edge
-	// connection, instead of waiting on readiness that could never arrive.
+	// URL is https://<Hostname>/. It blocks until the hostname is expected
+	// to resolve publicly (see HostnameReady). URL demands public
+	// reachability, so like Listener it is a start trigger: with no origin
+	// provided it mints a loopback listener and starts the edge connection,
+	// instead of waiting on readiness that could never arrive.
 	URL() *url.URL
 
-	// HostnameReady is closed when the hostname resolves on the zone's
-	// authoritative nameservers — polled directly, so recursive resolvers'
-	// negative caches never delay readiness.
+	// HostnameReady is closed once the hostname is expected to resolve
+	// publicly: a settle delay after the edge connection registers, waiting
+	// out the record's spread across the zone's nameservers. Nothing on this
+	// machine is asked about the hostname before then.
 	HostnameReady() <-chan struct{}
 	// TunnelReady is closed when the edge connection is up and the hostname
 	// resolves publicly — the tunnel is reachable end to end. It is never

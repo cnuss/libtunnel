@@ -37,11 +37,10 @@ import (
 )
 
 // TestMain raises the default logger to debug before any test runs. The live
-// tests hand slog.Default() to their tunnels, and the resolver reports what each
-// attempt found only at that level — which is the sole record of why a hostname
-// never resolved, and was missing exactly when it was needed. It reaches the
-// re-exec'd children too, since they run this same binary and their stderr is
-// the parent's only view of them.
+// tests hand slog.Default() to their tunnels, and the interesting detail of a
+// failing run shows up only at that level. It reaches the re-exec'd children
+// too, since they run this same binary and their stderr is the parent's only
+// view of them.
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
@@ -84,8 +83,10 @@ func gateLive(t *testing.T) {
 // identity: it scrubs any inherited LIBTUNNEL_SPEC so the tunnel mints a fresh
 // hostname rather than adopting the shared preflight spec. Used by
 // TestLiveResurrection (kills and resurrects a connector on its own hostname —
-// reusing the shared one risks a sticky 530 after unregister) and
-// TestLiveTwoTunnels (needs two distinct hostnames).
+// reusing the shared one risks a sticky 530 after unregister),
+// TestLiveSpecHandoff (the parent-side mint is half its scenario, and its
+// child gets killed too), and TestLiveTwoTunnels (needs two distinct
+// hostnames).
 func gateLiveOwnSpec(t *testing.T) {
 	t.Helper()
 	gateLiveBare(t)
@@ -177,10 +178,45 @@ func waitReady(t *testing.T, conn v1.Tunnel, d time.Duration) {
 	}
 }
 
-// httpClient fetches the public URL. Readiness already guarantees the hostname
-// resolves on every authoritative nameserver before a tunnel reports ready, so
-// the stdlib client suffices — no DoH/dualstack workaround is needed here.
-var httpClient = &http.Client{Timeout: 15 * time.Second}
+// edgeAddrs are trycloudflare.com's anycast edge addresses. The harness dials
+// them directly instead of resolving the tunnel hostname: the edge routes by
+// TLS SNI, which the transport still sets from the URL's hostname, so DNS is
+// out of the request path entirely. That is deliberate — these scenarios are
+// about spec handoff and connector lifecycle, not DNS propagation (the serve
+// examples cover that), and a lookup racing a fresh tunnel's propagation
+// window gets an NXDOMAIN the OS caches for the zone's SOA (1800s), turning
+// every later retry into a no-op. Measured as the dominant live-tier flake:
+// whichever test drew the fastest mint lost its whole retry window to one
+// early lookup.
+var edgeAddrs = []string{"104.16.230.132:443", "104.16.231.132:443"}
+
+// dialEdge dials one of edgeAddrs for any :443 destination, falling back to a
+// normal resolve-and-dial (covering both a non-edge URL and the day the
+// anycast addresses move).
+func dialEdge(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	var edgeErr error
+	if _, port, err := net.SplitHostPort(addr); err == nil && port == "443" {
+		for _, edge := range edgeAddrs {
+			conn, err := d.DialContext(ctx, network, edge)
+			if err == nil {
+				return conn, nil
+			}
+			edgeErr = err
+		}
+	}
+	conn, err := d.DialContext(ctx, network, addr)
+	if err != nil && edgeErr != nil {
+		err = fmt.Errorf("%w (edge dial also failed: %v)", err, edgeErr)
+	}
+	return conn, err
+}
+
+// edgeTransport carries dialEdge for every harness request to the public URL.
+var edgeTransport = &http.Transport{DialContext: dialEdge}
+
+// httpClient fetches the public URL, through edgeTransport.
+var httpClient = &http.Client{Timeout: 15 * time.Second, Transport: edgeTransport}
 
 // getBody requests url once and returns the body.
 func getBody(url string) (string, int, error) {
@@ -381,9 +417,10 @@ func chopStream(t *testing.T, ctx context.Context, url string) []chopEvent {
 		t.Logf("chopStream: build request: %v", err)
 		return nil
 	}
-	// DefaultClient, not httpClient: a long-lived response would trip a
-	// client-level timeout, so reqCtx bounds the read instead.
-	resp, err := http.DefaultClient.Do(req)
+	// Not httpClient: a long-lived response would trip its client-level
+	// timeout, so reqCtx bounds the read instead. Same edge transport, though
+	// — this fetch must not depend on DNS either.
+	resp, err := (&http.Client{Transport: edgeTransport}).Do(req)
 	if err != nil {
 		t.Logf("chopStream: request ended: %v", err)
 		return nil
