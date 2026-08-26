@@ -286,6 +286,13 @@ cached hostname — connecting under the same hostname instead of minting. Only
 minted specs are cached (adopted or `From`-loaded ones are not), and a
 bad/unknown spec yields a tunnel already canceled with the cause (off `Err()`).
 
+A mint also writes `latest.spec.json` — the most recent spec under a fixed
+name. It is never adopted as credentials: its fields seed the next mint's
+reclaim hints (`X-Id`/`X-Name`/`X-Secret`, under any explicit setters), so a
+provider that reaps idle tunnels hands the same tunnel back instead of minting
+fresh. If the provider refuses the reclaim, the mint retries once without the
+cached hints and the fresh spec overwrites `latest.spec.json`.
+
 ```go
 // replay the most recently cached tunnel by hostname
 conn := libtunnel.From("foo.tunneled.pizza").WithListener(l)
@@ -306,7 +313,7 @@ rebuild. (The one exception is noted below.)
 | `LIBTUNNEL_HTTP2` | `WithHTTP2()` | Same rules as `LIBTUNNEL_TLS`. |
 | `LIBTUNNEL_LOG` | `WithLogger()` | `debug`\|`info`\|`warn`\|`error`: the default logger becomes a stderr text logger at that level instead of silent. *The exception:* an explicit `WithLogger` keeps its handler — env carries a level, not a sink. |
 | `LIBTUNNEL_HOSTNAME` | — | Export-only mirror of the minted spec's hostname, for tooling; never adopted. |
-| `LIBTUNNEL_CACHE_DIR` | — | Where minted specs are cached and `From`/`Hosts` look. |
+| `LIBTUNNEL_CACHE_DIR` | — | Where minted specs are cached and `From`/`Hosts` look; also holds `latest.spec.json`, which seeds the next mint's reclaim hints. |
 
 Backend-scoped variables follow `LIBTUNNEL__<BACKEND>_<FIELD>` (double
 underscore namespaces the backend) and live with their backend package. For

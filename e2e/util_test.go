@@ -45,11 +45,6 @@ func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	})))
-	// Every mint this suite performs is marked ephemeral: the provider does
-	// not hold an ephemeral tunnel for reclamation once it is reaped, so test
-	// tunnels stay out of the reclaim pool. The env mirror reaches the
-	// re-exec'd children and example subprocesses too.
-	os.Setenv(v1.CloudflareHeadersEnv, "X-Ephemeral=true")
 	os.Exit(m.Run())
 }
 
@@ -130,14 +125,20 @@ func preflight() error {
 		// the first hang.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		// Hand the provider the suite's debug logger, or a throttled
+		// preflight fails with nothing but a deadline in the CI log. Not
+		// ephemeral (and not since #142): reclaimability is the point — the
+		// provider reads latest.spec.json for reclaim hints, so a CI-cache
+		// restore turns this mint into a reclaim of the previous run's
+		// tunnel.
 		qt := cloudflare.QuickTunnel()
-		// The backend's env-header overlay doesn't reach a directly
-		// constructed provider, so mark the preflight mint ephemeral here —
-		// and hand it the suite's debug logger, or a throttled preflight
-		// fails with nothing but a deadline in the CI log.
-		qt.Headers = http.Header{"X-Ephemeral": []string{"true"}}
 		qt.Log = slog.Default()
 		preflightSpec, preflightErr = qt.Spec(ctx)
+		if preflightErr == nil {
+			// The direct provider bypasses the chain's cache write; record
+			// the mint so the next run (via the Actions cache) reclaims it.
+			_ = v1alpha1.CacheSpec(preflightSpec)
+		}
 		lastLiveStart = time.Now() // the mint counts toward pacing
 	})
 	return preflightErr

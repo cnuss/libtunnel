@@ -419,3 +419,39 @@ func TestEnvProviderNeverAdoptsOwnExport(t *testing.T) {
 		t.Errorf("second tunnel's Hostname = %q, want its own mint", spec.Hostname)
 	}
 }
+
+// TestMintCachesLatestSpec pins the latest.spec.json write (#142): a mint
+// through the env chain records the spec under the fixed name, and LatestSpec
+// loads it back — for the matching backend only.
+func TestMintCachesLatestSpec(t *testing.T) {
+	t.Setenv(v1.SpecEnv, "")
+	t.Setenv(v1.CacheDirEnv, t.TempDir())
+
+	spec := &cloudflare.Spec{ID: "id-latest", Hostname: "cachedmint.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
+	if _, err := v1alpha1.Env("cloudflare", v1alpha1.Static(spec)).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var got cloudflare.Spec
+	if !v1alpha1.LatestSpec("cloudflare", &got) {
+		t.Fatal("LatestSpec = false, want the freshly minted spec loaded")
+	}
+	if got.ID != spec.ID || got.Hostname != spec.Hostname {
+		t.Errorf("LatestSpec loaded %+v, want %+v", got, *spec)
+	}
+	var foreign cloudflare.Spec
+	if v1alpha1.LatestSpec("other", &foreign) {
+		t.Error("LatestSpec = true for a foreign backend tag, want absent")
+	}
+}
+
+// TestLatestSpecAbsent pins the quiet default: an empty cache reads as
+// absent, never an error — the file is a hint source, not credentials.
+func TestLatestSpecAbsent(t *testing.T) {
+	t.Setenv(v1.CacheDirEnv, t.TempDir())
+
+	var got cloudflare.Spec
+	if v1alpha1.LatestSpec("cloudflare", &got) {
+		t.Error("LatestSpec = true with an empty cache, want false")
+	}
+}

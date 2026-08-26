@@ -260,7 +260,9 @@ func (b *Backend) Reconnect(ctx context.Context) error {
 // resolve entirely. When the chain does mint, the fields known beforehand
 // also ride the mint request as reclaim hints — X-Id, X-Name, X-Secret
 // (base64) — so a provider that reaps idle tunnels can hand the matching
-// tunnel back instead of minting fresh (see mintHeaders). Each is superseded
+// tunnel back instead of minting fresh (see mintHeaders; hint keys the
+// caller leaves unset are seeded from the most recently minted spec,
+// latest.spec.json — see QuickTunnelProvider.Spec). Each is superseded
 // field-by-field by its LIBTUNNEL__CLOUDFLARE_* variable (env beats code).
 // They return the concrete backend, so chain them before the v1.Backend
 // mutators (WithTLS, WithHTTP2), which return the interface.
