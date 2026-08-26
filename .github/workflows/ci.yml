@@ -117,18 +117,20 @@ jobs:
       # Keyed per cell (a shared spec would put concurrent connectors with
       # different origins on one hostname — crosstalk) and per ref (a PR run
       # and a main push overlap in time; sharing a spec across them has the
-      # same problem, so each ref works its own tunnel). The run_id suffix
-      # makes every run save a fresh entry; restore-keys falls back to the
-      # ref's newest. Gated exactly like LIBTUNNEL_E2E_LIVE below — only the
-      # live cells have a spec worth keeping.
+      # same problem, so each ref works its own tunnel). The key is static:
+      # run 1 saves, later runs exact-hit and skip the save, which is fine
+      # while the spec never changes — tunnel.pizza reclaims reaped tunnels
+      # indefinitely, so the same spec keeps working. The trade: cache
+      # entries are immutable, so if a reclaim is ever refused (fresh mint,
+      # new spec) the entry cannot self-update — `gh cache delete` the key to
+      # heal it. Gated exactly like LIBTUNNEL_E2E_LIVE below — only the live
+      # cells have a spec worth keeping.
       - name: spec cache
         if: github.event.pull_request.user.login != 'dependabot[bot]' && matrix.go == 'stable' && contains(fromJSON('["ubuntu-24.04", "windows-2025", "macos-26"]'), matrix.os)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/libtunnel-cache
-          key: libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-${{ github.run_id }}
-          restore-keys: |
-            libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-
+          key: libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}
 
       - name: e2e
         env:
