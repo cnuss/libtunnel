@@ -35,6 +35,17 @@ var (
 	selfExported   = map[string]bool{}
 )
 
+// selfCached is the disk-cache analogue of selfExported: hostnames of specs
+// this process cached itself. LatestSpec skips them — without this, a second
+// tunnel minted in the same process would read the first tunnel's fresh
+// latest.spec.json and reclaim its LIVE tunnel, putting two connectors with
+// different origins behind one hostname. Reclaim hints are for a spec left
+// behind by a previous process, never one alive in this one.
+var (
+	selfCachedMu sync.Mutex
+	selfCached   = map[string]bool{}
+)
+
 // LoggerSetter is the optional provider capability the tunnel core probes to
 // thread its logger into providers that can log (retry warnings, rate
 // limits). Provider wrappers must forward SetLogger to what they wrap, or
@@ -242,6 +253,12 @@ func CacheSpec[T v1.Spec](spec T) error {
 	if host == "" {
 		return nil // nothing to key the file on
 	}
+	// Recorded before the write (and regardless of its outcome): this
+	// process now owns that tunnel, so its own LatestSpec must never hand
+	// the spec back out as a reclaim hint (see selfCached).
+	selfCachedMu.Lock()
+	selfCached[host] = true
+	selfCachedMu.Unlock()
 	dir, err := CacheDir()
 	if err != nil {
 		return err
@@ -262,7 +279,8 @@ func CacheSpec[T v1.Spec](spec T) error {
 // mint request's reclaim hints and the backend decides whether to hand the
 // tunnel back — never adopt it as credentials. Accordingly every failure —
 // no file, unreadable cache dir, malformed envelope, foreign backend — reads
-// as absent rather than an error.
+// as absent rather than an error, and so does a spec this process cached
+// itself (its tunnel is alive right here — see selfCached).
 func LatestSpec[T v1.Spec](backend string, spec T) bool {
 	dir, err := CacheDir()
 	if err != nil {
@@ -276,7 +294,13 @@ func LatestSpec[T v1.Spec](backend string, spec T) bool {
 	if err != nil || tag != backend {
 		return false
 	}
-	return json.Unmarshal(raw, spec) == nil
+	if json.Unmarshal(raw, spec) != nil {
+		return false
+	}
+	selfCachedMu.Lock()
+	self := selfCached[spec.GetHostname()]
+	selfCachedMu.Unlock()
+	return !self
 }
 
 // cacheFileName builds a filesystem-safe "<hostname>.spec.json": GetHostname

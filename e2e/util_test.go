@@ -91,6 +91,12 @@ func gateLiveOwnSpec(t *testing.T) {
 	t.Helper()
 	gateLiveBare(t)
 	t.Setenv(v1.SpecEnv, "")
+	// Own-spec means own cache too: the shared cache dir's latest.spec.json
+	// (the preflight's tunnel, or the previous run's via the CI cache) would
+	// otherwise seed this mint's reclaim hints and hand back the very tunnel
+	// these scenarios must not share. (In-process the library already skips
+	// self-cached specs; this also isolates from the restored cross-run one.)
+	t.Setenv(v1.CacheDirEnv, t.TempDir())
 }
 
 // gateLiveBare is the shared gate — enable check, preflight, pace — behind both
