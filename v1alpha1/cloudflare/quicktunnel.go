@@ -17,7 +17,7 @@ import (
 )
 
 // quickTunnelURL is the public endpoint that mints anonymous quick tunnels.
-const quickTunnelURL = "https://api.trycloudflare.com/tunnel"
+const quickTunnelURL = "https://tunnel.pizza/tunnel"
 
 // ErrRateLimited marks a quick-tunnel mint rejected with HTTP 429. The
 // provider retries through it with backoff; it surfaces in the returned error

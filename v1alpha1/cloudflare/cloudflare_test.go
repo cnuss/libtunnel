@@ -308,7 +308,7 @@ func TestEdgeEnvBeatsCode(t *testing.T) {
 // TestProviderHostSynthesizesEndpoint pins the bare-host → https://host/tunnel
 // synthesis and the verbatim passthrough for a scheme-carrying value.
 func TestProviderHostSynthesizesEndpoint(t *testing.T) {
-	if got := providerEndpoint("api.trycloudflare.com"); got != "https://api.trycloudflare.com/tunnel" {
+	if got := providerEndpoint("tunnel.pizza"); got != "https://tunnel.pizza/tunnel" {
 		t.Errorf("providerEndpoint(host) = %q, want the synthesized https/…/tunnel URL", got)
 	}
 	if got := providerEndpoint("http://127.0.0.1:8080/tunnel"); got != "http://127.0.0.1:8080/tunnel" {

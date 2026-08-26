@@ -2,7 +2,7 @@
 // Cloudflare quick tunnel, waits until the tunnel is reachable end to end,
 // then requests its own public URL to prove the round trip.
 //
-// It needs network access (it mints a tunnel from api.trycloudflare.com); the
+// It needs network access (it mints a tunnel from tunnel.pizza); the
 // e2e harness only runs it when LIBTUNNEL_E2E_LIVE=1.
 package main
 

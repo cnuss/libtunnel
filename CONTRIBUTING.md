@@ -17,7 +17,7 @@ Deep-link by filename; line numbers will drift.
 | Lazy getters + `With*` mutators + DNS readiness | [`v1alpha1/tunnel.go`](./v1alpha1/tunnel.go)                     |
 | Generic providers (`Static`, `Env`) + handoff helpers | [`v1alpha1/provider.go`](./v1alpha1/provider.go)          |
 | Cloudflare engine (cloudflared supervisor wiring) | [`v1alpha1/cloudflare/cloudflare.go`](./v1alpha1/cloudflare/cloudflare.go) |
-| Quick-tunnel provider (api.trycloudflare.com)  | [`v1alpha1/cloudflare/quicktunnel.go`](./v1alpha1/cloudflare/quicktunnel.go) |
+| Quick-tunnel provider (tunnel.pizza)  | [`v1alpha1/cloudflare/quicktunnel.go`](./v1alpha1/cloudflare/quicktunnel.go) |
 | Unit tests + fuzz target                       | [`v1alpha1/tunnel_test.go`](./v1alpha1/tunnel_test.go)           |
 | Live e2e scenarios + helpers                   | [`e2e/live_test.go`](./e2e/live_test.go), [`e2e/util_test.go`](./e2e/util_test.go) |
 | Subprocess handoff unit tests                  | [`lib_test.go`](./lib_test.go)                                   |
@@ -115,7 +115,7 @@ Easy to get wrong from the diff alone:
 - **e2e builds binaries at runtime**, so the test cache can't see example
   source changes — `make e2e` passes `-count=1` to force a rebuild.
 - **Live examples are gated.** `serve` and `serve-tls` mint real tunnels from
-  `api.trycloudflare.com`, which rate-limits — minting from all 12 CI matrix
+  `tunnel.pizza`, which rate-limits — minting from all 12 CI matrix
   cells would trip 429s, so one stable-Go cell per OS (ubuntu-24.04,
   windows-2025, macos-26) sets `LIBTUNNEL_E2E_LIVE=1` and the rest skip the
   live tier. For local verification, prefer `make run serve` (one tunnel)

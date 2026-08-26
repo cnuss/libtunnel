@@ -10,7 +10,7 @@
 # load-balanced across cells serving different bodies). One runner here, one
 # connector, no cross-talk.
 #
-# Setup: mint once with `curl -XPOST https://api.trycloudflare.com/tunnel`, then
+# Setup: mint once with `curl -XPOST https://tunnel.pizza/tunnel`, then
 # store the env envelope as the repo secret TUNNEL_SPEC:
 #   TUNNEL_SPEC={"backend":"cloudflare","spec":{<the .result object>}}
 # Until the secret is set the job skips green (it never mints — minting hourly

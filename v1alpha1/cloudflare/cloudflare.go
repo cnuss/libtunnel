@@ -141,7 +141,7 @@ type Backend struct {
 	fields Spec
 	// providerHost overrides the quick-tunnel mint provider host (WithProvider);
 	// the endpoint https://<host>/tunnel is synthesized from it (a value carrying
-	// a scheme is used verbatim). Empty means the default (api.trycloudflare.com);
+	// a scheme is used verbatim). Empty means the default (tunnel.pizza);
 	// v1.CloudflareProviderEnv supersedes either.
 	providerHost string
 	// edgeAddrs pins the cloudflared<->edge addresses (WithEdge), bypassing the
@@ -296,7 +296,7 @@ func (b *Backend) WithSecret(secret []byte) *Backend {
 }
 
 // WithProvider overrides the quick-tunnel mint provider host (default
-// api.trycloudflare.com); the endpoint https://<host>/tunnel is synthesized
+// tunnel.pizza); the endpoint https://<host>/tunnel is synthesized
 // from it — pass just the host, the scheme and path are assumed. A value that
 // carries a scheme (e.g. http://127.0.0.1:8080/tunnel) is used verbatim, for
 // pointing the mint at a mock or alternate endpoint. Env mirror:
@@ -424,7 +424,7 @@ func (b *Backend) Name() string {
 // overrides (WithID and friends plus their LIBTUNNEL__CLOUDFLARE_* mirrors —
 // a complete credential set stops here); replay the spec LIBTUNNEL_FROM
 // references; then the code-pinned spec (From); and finally mint an anonymous
-// quick tunnel from api.trycloudflare.com.
+// quick tunnel from tunnel.pizza.
 func (b *Backend) Provider() v1.Provider[*Spec] {
 	next := b.provider
 	if next == nil {

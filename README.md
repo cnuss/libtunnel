@@ -321,7 +321,7 @@ credential set (id, hostname, account tag, secret) skips resolution entirely:
 | `LIBTUNNEL__CLOUDFLARE_HOSTNAME` | `WithHostname()` |
 | `LIBTUNNEL__CLOUDFLARE_ACCOUNT_TAG` | `WithAccountTag()` |
 | `LIBTUNNEL__CLOUDFLARE_SECRET` | `WithSecret()` (base64) |
-| `LIBTUNNEL__CLOUDFLARE_PROVIDER` | `WithProvider()` — quick-tunnel provider host, default `api.trycloudflare.com` (endpoint `https://<host>/tunnel` synthesized; a value with a scheme is used verbatim) |
+| `LIBTUNNEL__CLOUDFLARE_PROVIDER` | `WithProvider()` — quick-tunnel provider host, default `tunnel.pizza` (endpoint `https://<host>/tunnel` synthesized; a value with a scheme is used verbatim) |
 | `LIBTUNNEL__CLOUDFLARE_HEADERS` | `WithHeader()` — request headers on the mint call, comma-separated `K=V` (e.g. `X-Opaque=true`); entries beat code per key. No escaping — values can't contain `,` or `=`. Mint-only. |
 | `LIBTUNNEL__CLOUDFLARE_EDGE` | `WithEdge()` — comma-separated `host:port` list to dial for the tunnel edge instead of discovering it by SRV (which yields Cloudflare's edge on port 7844). Replaces the code value wholesale; forces the `http2` edge protocol. For reaching the edge through a relay on an allowed port. |
 
@@ -413,7 +413,7 @@ make e2e    # live tier: real tunnels through the real edge (gated)
 `make e2e` runs `go test -count=1 -v ./e2e`. The `-count=1` defeats the test
 cache, since the harness builds the example binaries at runtime and the cache
 key wouldn't otherwise pick up example source changes. The e2e tier is live
-tunnels only — everything mints from `api.trycloudflare.com` (rate-limited),
+tunnels only — everything mints from `tunnel.pizza` (rate-limited),
 so the whole tier is skipped unless you opt in (offline spec-handoff
 coverage lives in the unit tier and always runs):
 
