@@ -45,6 +45,11 @@ func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	})))
+	// Every mint this suite performs is marked ephemeral: the provider does
+	// not hold an ephemeral tunnel for reclamation once it is reaped, so test
+	// tunnels stay out of the reclaim pool. The env mirror reaches the
+	// re-exec'd children and example subprocesses too.
+	os.Setenv(v1.CloudflareHeadersEnv, "X-Ephemeral=true")
 	os.Exit(m.Run())
 }
 
@@ -119,9 +124,20 @@ var (
 
 func preflight() error {
 	preflightOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// 30s: a mint attempt is bounded at 15s (the endpoint holds the
+		// request while it waits out DNS propagation), so this budget fits a
+		// retry against a briefly saturated mint endpoint instead of dying on
+		// the first hang.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		preflightSpec, preflightErr = cloudflare.QuickTunnel().Spec(ctx)
+		qt := cloudflare.QuickTunnel()
+		// The backend's env-header overlay doesn't reach a directly
+		// constructed provider, so mark the preflight mint ephemeral here —
+		// and hand it the suite's debug logger, or a throttled preflight
+		// fails with nothing but a deadline in the CI log.
+		qt.Headers = http.Header{"X-Ephemeral": []string{"true"}}
+		qt.Log = slog.Default()
+		preflightSpec, preflightErr = qt.Spec(ctx)
 		lastLiveStart = time.Now() // the mint counts toward pacing
 	})
 	return preflightErr
@@ -178,7 +194,7 @@ func waitReady(t *testing.T, conn v1.Tunnel, d time.Duration) {
 	}
 }
 
-// edgeAddrs are trycloudflare.com's anycast edge addresses. The harness dials
+// edgeAddrs are tunneled.pizza's anycast edge addresses. The harness dials
 // them directly instead of resolving the tunnel hostname: the edge routes by
 // TLS SNI, which the transport still sets from the URL's hostname, so DNS is
 // out of the request path entirely. That is deliberate — these scenarios are
@@ -326,7 +342,7 @@ func drain(t *testing.T, conn v1.Tunnel, cancel context.CancelFunc) {
 // startWatchOrigin starts a kube-apiserver `?watch=true` lookalike: GET /watch
 // returns a chunked application/json NDJSON stream that emits one
 // `{"type":"ADDED","object":{"seq":N,"ts":"<RFC3339Nano>","pad":"..."}}` event
-// per interval and flushes each — the exact shape a plain trycloudflare edge
+// per interval and flushes each — the exact shape a plain tunneled.pizza edge
 // buffers. Query params tune the stream: n (event count), ms (interval), pad
 // (filler bytes per event), since (first seq, so a reconnect resumes). The
 // returned counter tracks requests carrying probe=watch, so a test can assert

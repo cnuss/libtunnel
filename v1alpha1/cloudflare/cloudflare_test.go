@@ -37,7 +37,7 @@ import (
 // the tunnel with a descriptive cause instead of registering the zero UUID
 // with the edge. Runs offline — the ID check fires before any network use.
 func TestWithListenerRejectsMalformedSpecID(t *testing.T) {
-	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -107,12 +107,12 @@ func clearSpecEnv(t *testing.T) {
 func TestSpecFieldSettersPatchResolvedSpec(t *testing.T) {
 	clearSpecEnv(t)
 
-	b := From(&Spec{ID: "id", Hostname: "pinned.trycloudflare.com"}).WithName("patched")
+	b := From(&Spec{ID: "id", Hostname: "pinned.tunneled.pizza"}).WithName("patched")
 	spec, err := b.Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Name != "patched" || spec.Hostname != "pinned.trycloudflare.com" {
+	if spec.Name != "patched" || spec.Hostname != "pinned.tunneled.pizza" {
 		t.Errorf("spec = %+v, want Name patched onto the pinned spec", spec)
 	}
 }
@@ -123,7 +123,7 @@ func TestSpecFieldEnvBeatsCode(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.CloudflareNameEnv, "from-env")
 
-	b := From(&Spec{Hostname: "pinned.trycloudflare.com"}).WithName("from-code")
+	b := From(&Spec{Hostname: "pinned.tunneled.pizza"}).WithName("from-code")
 	spec, err := b.Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +139,7 @@ func TestSpecFieldEnvBeatsCode(t *testing.T) {
 func TestCompleteFieldSetShortCircuitsMint(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.CloudflareIDEnv, "3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6")
-	t.Setenv(v1.CloudflareHostnameEnv, "fields.trycloudflare.com")
+	t.Setenv(v1.CloudflareHostnameEnv, "fields.tunneled.pizza")
 	t.Setenv(v1.CloudflareAccountTagEnv, "tag")
 	t.Setenv(v1.CloudflareSecretEnv, "c2VjcmV0")
 	t.Setenv(v1.CloudflareProviderEnv, "http://127.0.0.1:1/nope")
@@ -150,7 +150,7 @@ func TestCompleteFieldSetShortCircuitsMint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spec() = %v; a complete field set must not mint", err)
 	}
-	if spec.Hostname != "fields.trycloudflare.com" || spec.AccountTag != "tag" || string(spec.Secret) != "secret" {
+	if spec.Hostname != "fields.tunneled.pizza" || spec.AccountTag != "tag" || string(spec.Secret) != "secret" {
 		t.Errorf("spec = %+v, want the env field set verbatim", spec)
 	}
 }
@@ -160,7 +160,7 @@ func TestSecretEnvUndecodableErrors(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.CloudflareSecretEnv, "%%%not-base64%%%")
 
-	_, err := From(&Spec{Hostname: "pinned.trycloudflare.com"}).Provider().Spec(context.Background())
+	_, err := From(&Spec{Hostname: "pinned.tunneled.pizza"}).Provider().Spec(context.Background())
 	if err == nil || !strings.Contains(err.Error(), v1.CloudflareSecretEnv) {
 		t.Errorf("Spec err = %v, want a %s decode failure", err, v1.CloudflareSecretEnv)
 	}
@@ -174,7 +174,7 @@ func TestProviderEnvBeatsCode(t *testing.T) {
 	clearSpecEnv(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
 	t.Setenv(v1.CloudflareProviderEnv, srv.URL)
@@ -185,7 +185,7 @@ func TestProviderEnvBeatsCode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Hostname != "minted.trycloudflare.com" {
+	if spec.Hostname != "minted.tunneled.pizza" {
 		t.Errorf("Hostname = %q, want the spec minted from the env endpoint", spec.Hostname)
 	}
 }
@@ -196,7 +196,7 @@ func mintServer(t *testing.T, seen *http.Header) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*seen = r.Header.Clone()
-		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -263,6 +263,87 @@ func TestHeadersEnvBeatsCode(t *testing.T) {
 	}
 }
 
+// TestReclaimHintsSentToMint pins the reclaim hints: spec fields known before
+// minting ride the request as X-Id / X-Name / X-Secret (base64), so a
+// provider that reaps idle tunnels can hand the matching tunnel back.
+func TestReclaimHintsSentToMint(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b := New().WithID("id-1").WithName("pizza-1").WithSecret([]byte("secret")).WithProvider(srv.URL)
+	if _, err := b.Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("X-Id"); got != "id-1" {
+		t.Errorf("X-Id = %q, want %q", got, "id-1")
+	}
+	if got := seen.Get("X-Name"); got != "pizza-1" {
+		t.Errorf("X-Name = %q, want %q", got, "pizza-1")
+	}
+	if got := seen.Get("X-Secret"); got != "c2VjcmV0" {
+		t.Errorf("X-Secret = %q, want %q (base64)", got, "c2VjcmV0")
+	}
+}
+
+// TestReclaimHintsAbsentByDefault pins the quiet default: a mint with no spec
+// fields set carries no reclaim hints.
+func TestReclaimHintsAbsentByDefault(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithProvider(srv.URL).Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"X-Id", "X-Name", "X-Secret"} {
+		if _, ok := seen[k]; ok {
+			t.Errorf("%s = %q, want absent", k, seen.Get(k))
+		}
+	}
+}
+
+// TestReclaimHintEnvBeatsCode pins the mirror precedence inside the hints:
+// LIBTUNNEL__CLOUDFLARE_NAME beats WithName in the X-Name hint, matching the
+// field overlay's precedence.
+func TestReclaimHintEnvBeatsCode(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+	t.Setenv(v1.CloudflareNameEnv, "env-name")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithName("code-name").WithProvider(srv.URL).Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("X-Name"); got != "env-name" {
+		t.Errorf("X-Name = %q, want the env value to beat code", got)
+	}
+}
+
+// TestWithHeaderBeatsReclaimHint pins the layer order: an explicit WithHeader
+// for a hint key replaces the hint.
+func TestWithHeaderBeatsReclaimHint(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b := New().WithID("id-1").WithProvider(srv.URL).WithHeader("X-Id", "explicit")
+	if _, err := b.Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Values("X-Id"); len(got) != 1 || got[0] != "explicit" {
+		t.Errorf("X-Id = %v, want exactly [explicit] (WithHeader beats the hint)", got)
+	}
+}
+
 // TestWithEdgePinsAddresses pins WithEdge: the addresses are carried through to
 // the supervisor's static-edge list, which bypasses SRV discovery (and with it
 // Cloudflare's port 7844) so a relay on an allowed port can be dialed instead.
@@ -308,7 +389,7 @@ func TestEdgeEnvBeatsCode(t *testing.T) {
 // TestProviderHostSynthesizesEndpoint pins the bare-host → https://host/tunnel
 // synthesis and the verbatim passthrough for a scheme-carrying value.
 func TestProviderHostSynthesizesEndpoint(t *testing.T) {
-	if got := providerEndpoint("api.trycloudflare.com"); got != "https://api.trycloudflare.com/tunnel" {
+	if got := providerEndpoint("tunnel.pizza"); got != "https://tunnel.pizza/tunnel" {
 		t.Errorf("providerEndpoint(host) = %q, want the synthesized https/…/tunnel URL", got)
 	}
 	if got := providerEndpoint("http://127.0.0.1:8080/tunnel"); got != "http://127.0.0.1:8080/tunnel" {
@@ -320,7 +401,7 @@ func TestProviderHostSynthesizesEndpoint(t *testing.T) {
 // that can't be honored must fail the tunnel at connect, not be ignored.
 func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
 	t.Setenv(v1.TLSEnv, "banana")
-	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"x.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"x.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -514,7 +595,7 @@ func TestStreamingPassthrough(t *testing.T) {
 const specJSON = `{"success":true,"result":{
 	"id":"00000000-0000-0000-0000-000000000000",
 	"name":"test",
-	"hostname":"test.trycloudflare.com",
+	"hostname":"test.tunneled.pizza",
 	"account_tag":"tag",
 	"secret":"c2VjcmV0"}}`
 
@@ -531,7 +612,7 @@ func TestQuickTunnelSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Hostname != "test.trycloudflare.com" {
+	if spec.Hostname != "test.tunneled.pizza" {
 		t.Errorf("Hostname = %q", spec.Hostname)
 	}
 	if string(spec.Secret) != "secret" {
@@ -558,8 +639,62 @@ func TestQuickTunnelRetriesAfter429(t *testing.T) {
 	if got := calls.Load(); got != 2 {
 		t.Errorf("API called %d times, want 2 (one 429, one success)", got)
 	}
-	if spec.Hostname != "test.trycloudflare.com" {
+	if spec.Hostname != "test.tunneled.pizza" {
 		t.Errorf("Hostname = %q", spec.Hostname)
+	}
+}
+
+// TestQuickTunnelHonorsRetryAfterSeconds pins that a 429's Retry-After wins
+// over the linear ramp: with Retry-After: 2, the retry waits ~2s where the
+// ramp alone would have retried after 1s.
+func TestQuickTunnelHonorsRetryAfterSeconds(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Write([]byte(specJSON))
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 1900*time.Millisecond {
+		t.Errorf("retried after %s, want ~2s (Retry-After honored over the 1s ramp)", elapsed)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("API called %d times, want 2", got)
+	}
+}
+
+// TestQuickTunnelHonorsRetryAfterDate pins the RFC 7231 HTTP-date form of
+// Retry-After: a date ~3s out delays the retry past the 1s ramp.
+func TestQuickTunnelHonorsRetryAfterDate(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", time.Now().Add(3*time.Second).UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Write([]byte(specJSON))
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The date form truncates to whole seconds, so ~3s out is at least ~2s.
+	if elapsed := time.Since(start); elapsed < 1500*time.Millisecond {
+		t.Errorf("retried after %s, want the HTTP-date wait honored over the 1s ramp", elapsed)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("API called %d times, want 2", got)
 	}
 }
 

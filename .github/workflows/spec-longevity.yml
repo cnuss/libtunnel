@@ -3,14 +3,14 @@
 # and runs examples/serve, which connects, waits for readiness, self-fetches its
 # public URL, and exits non-zero on any failure. The run history is the result:
 # the first red run is roughly when Cloudflare reaped the tunnel (or its
-# *.trycloudflare.com DNS).
+# *.tunneled.pizza DNS).
 #
 # Deliberately isolated from the matrix E2E: that tier runs live on one cell per
 # OS concurrently, and a single shared hostname would cross-talk (requests
 # load-balanced across cells serving different bodies). One runner here, one
 # connector, no cross-talk.
 #
-# Setup: mint once with `curl -XPOST https://api.trycloudflare.com/tunnel`, then
+# Setup: mint once with `curl -XPOST https://tunnel.pizza/tunnel`, then
 # store the env envelope as the repo secret TUNNEL_SPEC:
 #   TUNNEL_SPEC={"backend":"cloudflare","spec":{<the .result object>}}
 # Until the secret is set the job skips green (it never mints — minting hourly

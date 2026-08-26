@@ -164,7 +164,7 @@ func New[T v1.Spec](backend v1.Backend[T]) TunnelV1 {
 // resolves env first: adopt a spec from the LIBTUNNEL_SPEC environment
 // variable when a parent process handed one off, replay the spec
 // LIBTUNNEL_FROM references (hostname, file path, or literal JSON — From's
-// resolution), and mint an anonymous *.trycloudflare.com quick tunnel
+// resolution), and mint an anonymous *.tunneled.pizza quick tunnel
 // otherwise. A resolved spec is exported back into the environment so
 // spawned children inherit the same tunnel identity; a spec this process
 // exported itself is never re-adopted — a second in-process tunnel mints its
@@ -185,7 +185,7 @@ func Cloudflare() *cloudflare.Backend {
 // instead of minting or adopting one — the credentials are pinned, so it
 // connects under the same hostname. spec is resolved in order: an existing file
 // at that path; a file of that name in the cache dir; a cached spec for that
-// hostname (so From("foo.trycloudflare.com") replays the cached mint); finally
+// hostname (so From("foo.tunneled.pizza") replays the cached mint); finally
 // the serialized JSON itself. The cache dir is LIBTUNNEL_CACHE_DIR when set,
 // else a per-user location under os.UserCacheDir() — where a mint writes its
 // spec.

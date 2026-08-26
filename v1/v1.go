@@ -110,7 +110,7 @@ const (
 	// JSON []byte encoding); an undecodable value fails spec resolution.
 	CloudflareSecretEnv = "LIBTUNNEL__CLOUDFLARE_SECRET"
 	// CloudflareProviderEnv mirrors WithProvider: the quick-tunnel mint
-	// provider host (default api.trycloudflare.com), from which the endpoint
+	// provider host (default tunnel.pizza), from which the endpoint
 	// https://<host>/tunnel is synthesized — though a value carrying a scheme
 	// (://) is used verbatim. Only the mint path uses it.
 	CloudflareProviderEnv = "LIBTUNNEL__CLOUDFLARE_PROVIDER"

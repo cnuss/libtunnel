@@ -8,7 +8,7 @@
 // certificate, so the client needs no InsecureSkipVerify: the self-signed
 // cert lives only between the in-process connector and the local origin.
 //
-// It needs network access (it mints a tunnel from api.trycloudflare.com); the
+// It needs network access (it mints a tunnel from tunnel.pizza); the
 // e2e harness only runs it when LIBTUNNEL_E2E_LIVE=1.
 package main
 

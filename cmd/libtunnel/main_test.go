@@ -99,7 +99,7 @@ func TestBuildNoOrigin(t *testing.T) {
 // spec is fabricated and never connected (build returns the unstarted tunnel).
 func TestBuildActivatedBySpec(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(v1.SpecEnv, `{"backend":"cloudflare","spec":{"hostname":"handoff.trycloudflare.com"}}`)
+	t.Setenv(v1.SpecEnv, `{"backend":"cloudflare","spec":{"hostname":"handoff.tunneled.pizza"}}`)
 	t.Setenv(v1.LocalURLEnv, "http://127.0.0.1:8080")
 
 	tun, err := build(context.Background())

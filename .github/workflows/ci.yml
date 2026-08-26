@@ -98,7 +98,7 @@ jobs:
         run: make test
 
       # One cell per OS runs the live e2e tier (real quick tunnels from
-      # api.trycloudflare.com) so platform-specific tunnel behavior is
+      # tunnel.pizza) so platform-specific tunnel behavior is
       # exercised on Linux, Windows, and macOS without minting from all 12
       # cells, which would trip the API's rate limits. A `served: error
       # code: 1033` failure here is edge route propagation lag, not code —

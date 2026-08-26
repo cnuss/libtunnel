@@ -23,7 +23,7 @@ import (
 // TestFromSerializeRoundTrip pins the Serialize -> From loop: a serialized spec
 // replays into a tunnel pinned to the same hostname, no mint, no network.
 func TestFromSerializeRoundTrip(t *testing.T) {
-	want := &cloudflare.Spec{ID: "id-1", Hostname: "replay.trycloudflare.com", AccountTag: "tag", Secret: []byte("s")}
+	want := &cloudflare.Spec{ID: "id-1", Hostname: "replay.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
 	tun := libtunnel.From(want.Serialize())
 	if got := tun.Hostname(); got != want.Hostname {
 		t.Errorf("Hostname() = %q, want %q", got, want.Hostname)
@@ -35,8 +35,8 @@ func TestFromSerializeRoundTrip(t *testing.T) {
 
 // TestFromFile pins that From reads a spec file path (the cache-file form).
 func TestFromFile(t *testing.T) {
-	spec := &cloudflare.Spec{Hostname: "file.trycloudflare.com"}
-	path := filepath.Join(t.TempDir(), "file.trycloudflare.com.spec.json")
+	spec := &cloudflare.Spec{Hostname: "file.tunneled.pizza"}
+	path := filepath.Join(t.TempDir(), "file.tunneled.pizza.spec.json")
 	if err := os.WriteFile(path, []byte(spec.Serialize()), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -50,11 +50,11 @@ func TestFromFile(t *testing.T) {
 func TestFromCachedHostname(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(v1.CacheDirEnv, dir)
-	spec := &cloudflare.Spec{Hostname: "cached.trycloudflare.com"}
-	if err := os.WriteFile(filepath.Join(dir, "cached.trycloudflare.com.spec.json"), []byte(spec.Serialize()), 0o600); err != nil {
+	spec := &cloudflare.Spec{Hostname: "cached.tunneled.pizza"}
+	if err := os.WriteFile(filepath.Join(dir, "cached.tunneled.pizza.spec.json"), []byte(spec.Serialize()), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := libtunnel.From("cached.trycloudflare.com").Hostname(); got != spec.Hostname {
+	if got := libtunnel.From("cached.tunneled.pizza").Hostname(); got != spec.Hostname {
 		t.Errorf("From(hostname).Hostname() = %q, want %q", got, spec.Hostname)
 	}
 }
@@ -108,7 +108,7 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 	spec := &cloudflare.Spec{
 		ID:         "00000000-0000-0000-0000-000000000000",
 		Name:       "lib-scenario",
-		Hostname:   "scenario.trycloudflare.com",
+		Hostname:   "scenario.tunneled.pizza",
 		AccountTag: "tag",
 		Secret:     []byte("secret"),
 	}
@@ -123,8 +123,8 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 		t.Fatalf("child failed: %v", err)
 	}
 	for _, want := range []string{
-		"handoff-child hostname: scenario.trycloudflare.com",
-		"handoff-child host=scenario domain=trycloudflare.com port=443",
+		"handoff-child hostname: scenario.tunneled.pizza",
+		"handoff-child host=scenario domain=tunneled.pizza port=443",
 		"handoff-child cacerts: true",
 	} {
 		if !strings.Contains(string(out), want) {
@@ -143,7 +143,7 @@ func TestReExecInheritsSpec(t *testing.T) {
 		return
 	}
 
-	spec := &cloudflare.Spec{Hostname: "reexec.trycloudflare.com"}
+	spec := &cloudflare.Spec{Hostname: "reexec.tunneled.pizza"}
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +155,7 @@ func TestReExecInheritsSpec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("child failed: %v", err)
 	}
-	if want := "reexec-child hostname: reexec.trycloudflare.com"; !strings.Contains(string(out), want) {
+	if want := "reexec-child hostname: reexec.tunneled.pizza"; !strings.Contains(string(out), want) {
 		t.Errorf("child output does not contain %q", want)
 	}
 }
@@ -181,7 +181,7 @@ func TestHandoffChain(t *testing.T) {
 		return
 	}
 
-	spec := &cloudflare.Spec{Hostname: "chain.trycloudflare.com"}
+	spec := &cloudflare.Spec{Hostname: "chain.tunneled.pizza"}
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
@@ -193,8 +193,8 @@ func TestHandoffChain(t *testing.T) {
 		t.Fatalf("chain failed: %v", err)
 	}
 	for _, want := range []string{
-		"chain-child hostname: chain.trycloudflare.com",
-		"chain-grandchild hostname: chain.trycloudflare.com",
+		"chain-child hostname: chain.tunneled.pizza",
+		"chain-grandchild hostname: chain.tunneled.pizza",
 	} {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("chain output does not contain %q", want)
@@ -239,7 +239,7 @@ func TestSpecHostnameWithPort(t *testing.T) {
 		return
 	}
 
-	spec := &cloudflare.Spec{Hostname: "scenario.trycloudflare.com:8443"}
+	spec := &cloudflare.Spec{Hostname: "scenario.tunneled.pizza:8443"}
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +250,7 @@ func TestSpecHostnameWithPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("child failed: %v", err)
 	}
-	if want := "port-child host=scenario domain=trycloudflare.com:8443 port=8443"; !strings.Contains(string(out), want) {
+	if want := "port-child host=scenario domain=tunneled.pizza:8443 port=8443"; !strings.Contains(string(out), want) {
 		t.Errorf("child output does not contain %q", want)
 	}
 }
