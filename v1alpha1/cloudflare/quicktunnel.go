@@ -81,14 +81,16 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 	client := http.Client{
 		Transport: &http.Transport{
-			// Per-attempt bounds, deliberately tight: a saturated mint
-			// endpoint that holds the connection instead of shedding a 429 (a
-			// serverless provider at its concurrency limit) must not eat a
-			// caller's whole budget in one attempt — failing fast and
-			// retrying gives more chances to land on free capacity. A healthy
-			// mint answers well inside these.
+			// Per-attempt bounds. The TLS handshake terminates at the
+			// provider's edge and is quick regardless of load, so it stays
+			// tight — a hung handshake is a dead endpoint, and failing fast
+			// leaves budget for a retry. The response headers are the mint
+			// itself: the endpoint holds the request while it mints and waits
+			// out DNS propagation for the hostname, so the header wait must
+			// cover a full server-side mint and the overall Timeout is the
+			// real per-attempt bound.
 			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
 		},
 		Timeout: 15 * time.Second,
 	}

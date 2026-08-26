@@ -124,9 +124,10 @@ var (
 
 func preflight() error {
 	preflightOnce.Do(func() {
-		// 30s: mint attempts are bounded at ~5s each (see the provider's
-		// per-attempt timeouts), so this budget fits several retries against a
-		// briefly saturated mint endpoint instead of dying on the first hang.
+		// 30s: a mint attempt is bounded at 15s (the endpoint holds the
+		// request while it waits out DNS propagation), so this budget fits a
+		// retry against a briefly saturated mint endpoint instead of dying on
+		// the first hang.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		qt := cloudflare.QuickTunnel()
