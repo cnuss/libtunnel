@@ -419,3 +419,66 @@ func TestEnvProviderNeverAdoptsOwnExport(t *testing.T) {
 		t.Errorf("second tunnel's Hostname = %q, want its own mint", spec.Hostname)
 	}
 }
+
+// TestMintCachesLatestSpec pins the latest.spec.json write and the
+// self-cache guard (#142): a mint through the env chain records the spec
+// under the fixed name for the NEXT process — this process's own LatestSpec
+// skips it, or a second tunnel here would reclaim the first's live tunnel.
+func TestMintCachesLatestSpec(t *testing.T) {
+	t.Setenv(v1.SpecEnv, "")
+	dir := t.TempDir()
+	t.Setenv(v1.CacheDirEnv, dir)
+
+	spec := &cloudflare.Spec{ID: "id-latest", Hostname: "cachedmint.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
+	if _, err := v1alpha1.Env("cloudflare", v1alpha1.Static(spec)).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "latest.spec.json"))
+	if err != nil {
+		t.Fatalf("latest.spec.json not written: %v", err)
+	}
+	if backend, _, err := v1alpha1.DecodeSpec(string(data)); err != nil || backend != "cloudflare" {
+		t.Errorf("latest.spec.json envelope = (%q, %v), want a cloudflare envelope", backend, err)
+	}
+	var got cloudflare.Spec
+	if v1alpha1.LatestSpec("cloudflare", &got) {
+		t.Error("LatestSpec = true for a spec this process cached itself, want the self-cache skip")
+	}
+}
+
+// TestLatestSpecLoadsPreviousProcessSpec pins the read half: a
+// latest.spec.json left behind by another process (written directly here)
+// loads — for the matching backend only.
+func TestLatestSpecLoadsPreviousProcessSpec(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(v1.CacheDirEnv, dir)
+
+	spec := &cloudflare.Spec{ID: "id-prev", Hostname: "previous.tunneled.pizza"}
+	if err := os.WriteFile(filepath.Join(dir, "latest.spec.json"), []byte(spec.Serialize()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var got cloudflare.Spec
+	if !v1alpha1.LatestSpec("cloudflare", &got) {
+		t.Fatal("LatestSpec = false, want the previous process's spec loaded")
+	}
+	if got.ID != spec.ID || got.Hostname != spec.Hostname {
+		t.Errorf("LatestSpec loaded %+v, want %+v", got, *spec)
+	}
+	var foreign cloudflare.Spec
+	if v1alpha1.LatestSpec("other", &foreign) {
+		t.Error("LatestSpec = true for a foreign backend tag, want absent")
+	}
+}
+
+// TestLatestSpecAbsent pins the quiet default: an empty cache reads as
+// absent, never an error — the file is a hint source, not credentials.
+func TestLatestSpecAbsent(t *testing.T) {
+	t.Setenv(v1.CacheDirEnv, t.TempDir())
+
+	var got cloudflare.Spec
+	if v1alpha1.LatestSpec("cloudflare", &got) {
+		t.Error("LatestSpec = true with an empty cache, want false")
+	}
+}

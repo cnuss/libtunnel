@@ -35,6 +35,17 @@ var (
 	selfExported   = map[string]bool{}
 )
 
+// selfCached is the disk-cache analogue of selfExported: hostnames of specs
+// this process cached itself. LatestSpec skips them — without this, a second
+// tunnel minted in the same process would read the first tunnel's fresh
+// latest.spec.json and reclaim its LIVE tunnel, putting two connectors with
+// different origins behind one hostname. Reclaim hints are for a spec left
+// behind by a previous process, never one alive in this one.
+var (
+	selfCachedMu sync.Mutex
+	selfCached   = map[string]bool{}
+)
+
 // LoggerSetter is the optional provider capability the tunnel core probes to
 // thread its logger into providers that can log (retry warnings, rate
 // limits). Provider wrappers must forward SetLogger to what they wrap, or
@@ -108,7 +119,7 @@ func (p envProvider[E, T]) Spec(ctx context.Context) (T, error) {
 	// effort: a marshal/setenv/write failure shouldn't fail the tunnel. Only
 	// the mint path lands here — adopted specs are not re-exported or re-cached.
 	_ = ExportSpec(p.backend, minted)
-	_ = cacheSpec(minted)
+	_ = CacheSpec(minted)
 	return minted, nil
 }
 
@@ -226,16 +237,28 @@ func packagePath() string {
 	return reflect.TypeOf((*v1.Spec)(nil)).Elem().PkgPath()
 }
 
-// cacheSpec writes a freshly minted spec to CacheDir as <hostname>.spec.json
-// (Serialize output, the v1.SpecEnv envelope). Best effort: callers ignore the
-// error — the cache is a convenience, not the source of truth. Only minted
-// specs are cached (see envProvider.Spec); adopted or From-loaded specs are
-// not re-written.
-func cacheSpec[T v1.Spec](spec T) error {
+// latestSpecFile is the fixed-name cache entry tracking the most recently
+// minted spec, written alongside the per-hostname files. It never collides
+// with cacheFileName output: hostnames always carry a domain.
+const latestSpecFile = "latest.spec.json"
+
+// CacheSpec writes a freshly minted spec to CacheDir as <hostname>.spec.json
+// (Serialize output, the v1.SpecEnv envelope) and as latest.spec.json, the
+// fixed-name entry LatestSpec reads. Best effort: callers ignore the error —
+// the cache is a convenience, not the source of truth. Only minted specs are
+// cached (see envProvider.Spec, and the e2e preflight's direct mint); adopted
+// or From-loaded specs are not re-written.
+func CacheSpec[T v1.Spec](spec T) error {
 	host := spec.GetHostname()
 	if host == "" {
 		return nil // nothing to key the file on
 	}
+	// Recorded before the write (and regardless of its outcome): this
+	// process now owns that tunnel, so its own LatestSpec must never hand
+	// the spec back out as a reclaim hint (see selfCached).
+	selfCachedMu.Lock()
+	selfCached[host] = true
+	selfCachedMu.Unlock()
 	dir, err := CacheDir()
 	if err != nil {
 		return err
@@ -243,8 +266,41 @@ func cacheSpec[T v1.Spec](spec T) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	name := cacheFileName(host)
-	return os.WriteFile(filepath.Join(dir, name), []byte(spec.Serialize()), 0o600)
+	data := []byte(spec.Serialize())
+	if err := os.WriteFile(filepath.Join(dir, cacheFileName(host)), data, 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, latestSpecFile), data, 0o600)
+}
+
+// LatestSpec loads the most recently minted spec (CacheDir's
+// latest.spec.json) into the caller-allocated spec, reporting whether one was
+// loaded. It feeds backend-driven reclamation (#142): the fields seed the
+// mint request's reclaim hints and the backend decides whether to hand the
+// tunnel back — never adopt it as credentials. Accordingly every failure —
+// no file, unreadable cache dir, malformed envelope, foreign backend — reads
+// as absent rather than an error, and so does a spec this process cached
+// itself (its tunnel is alive right here — see selfCached).
+func LatestSpec[T v1.Spec](backend string, spec T) bool {
+	dir, err := CacheDir()
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(dir, latestSpecFile))
+	if err != nil {
+		return false
+	}
+	tag, raw, err := DecodeSpec(string(data))
+	if err != nil || tag != backend {
+		return false
+	}
+	if json.Unmarshal(raw, spec) != nil {
+		return false
+	}
+	selfCachedMu.Lock()
+	self := selfCached[spec.GetHostname()]
+	selfCachedMu.Unlock()
+	return !self
 }
 
 // cacheFileName builds a filesystem-safe "<hostname>.spec.json": GetHostname

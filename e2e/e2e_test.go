@@ -57,7 +57,14 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 	// the per-rung probe detail; the examples default to Info for humans.
 	// Both names: v1.LogEnv is what the library reads, LIBTUNNEL_LOG_LEVEL what
 	// serve-tls checks to build its own logger.
-	cmd.Env = append(os.Environ(), v1.LogEnv+"=debug", "LIBTUNNEL_LOG_LEVEL=debug")
+	//
+	// Each example gets its own empty spec cache: a child is a fresh process,
+	// so an inherited cache dir would let its mint read the suite's (or a
+	// previous example's) latest.spec.json and reclaim that tunnel — putting
+	// this example on a hostname whose dead connectors still hold sticky
+	// edge routes. Examples must mint their own tunnels, as they always did.
+	cmd.Env = append(os.Environ(), v1.LogEnv+"=debug", "LIBTUNNEL_LOG_LEVEL=debug",
+		v1.CacheDirEnv+"="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {

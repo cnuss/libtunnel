@@ -282,6 +282,15 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 			t.cancel(fmt.Errorf("backend %q connect: %w", t.engine.Name(), err))
 			return
 		}
+		if t.ctx.Err() != nil {
+			// Canceled while resolving or connecting — a failed spec fetch
+			// cancels inside t.Spec() above and a lenient engine can still
+			// "connect" after it, and a WithContext cancel can land mid-dial.
+			// A dead tunnel must never report ready. (The settle-delay select
+			// used to be this checkpoint, incidentally, until #140 removed
+			// the delay; now the check is explicit.)
+			return
+		}
 
 		t.markHostnameReady(t.Hostname())
 

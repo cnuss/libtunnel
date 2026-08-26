@@ -83,6 +83,9 @@ const (
 	LogEnv = "LIBTUNNEL_LOG"
 	// CacheDirEnv overrides where minted specs are cached and where From and
 	// Hosts look. Unset, a per-user location under os.UserCacheDir() is used.
+	// The cache also holds latest.spec.json — the most recent mint — whose
+	// fields seed the next mint's reclaim hints, so a provider that reaps
+	// idle tunnels can hand the same tunnel back instead of minting fresh.
 	CacheDirEnv = "LIBTUNNEL_CACHE_DIR"
 )
 
