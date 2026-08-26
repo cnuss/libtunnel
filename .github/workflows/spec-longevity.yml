@@ -3,7 +3,7 @@
 # and runs examples/serve, which connects, waits for readiness, self-fetches its
 # public URL, and exits non-zero on any failure. The run history is the result:
 # the first red run is roughly when Cloudflare reaped the tunnel (or its
-# *.trycloudflare.com DNS).
+# *.tunneled.pizza DNS).
 #
 # Deliberately isolated from the matrix E2E: that tier runs live on one cell per
 # OS concurrently, and a single shared hostname would cross-talk (requests

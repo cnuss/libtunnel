@@ -54,7 +54,7 @@ func main() {
 	if url == nil {
 		log.Fatal(conn.Err())
 	}
-	fmt.Println(url) // https://<something>.trycloudflare.com/
+	fmt.Println(url) // https://<something>.tunneled.pizza/
 }
 ```
 
@@ -288,7 +288,7 @@ bad/unknown spec yields a tunnel already canceled with the cause (off `Err()`).
 
 ```go
 // replay the most recently cached tunnel by hostname
-conn := libtunnel.From("foo.trycloudflare.com").WithListener(l)
+conn := libtunnel.From("foo.tunneled.pizza").WithListener(l)
 ```
 
 ## Environment variables

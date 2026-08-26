@@ -26,7 +26,7 @@ func Example() {
 
 	select {
 	case <-conn.TunnelReady():
-		fmt.Println(conn.URL()) // https://<something>.trycloudflare.com/
+		fmt.Println(conn.URL()) // https://<something>.tunneled.pizza/
 	case <-conn.Done():
 		fmt.Println(conn.Err())
 	}
@@ -37,21 +37,21 @@ func Example() {
 // Cloudflare credential chain adopts it at construction — no API to call.
 // Here the environment is populated by hand to stand in for the parent.
 func Example_handoff() {
-	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.trycloudflare.com"}}`)
+	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.tunneled.pizza"}}`)
 	defer os.Unsetenv("LIBTUNNEL_SPEC")
 
 	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Println(t.Hostname())
-	// Output: demo.trycloudflare.com
+	// Output: demo.tunneled.pizza
 }
 
 // Getters resolve lazily from the backend's credential chain — here a spec
 // adopted from the environment, so nothing touches the network.
 func Example_lazy() {
-	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.trycloudflare.com"}}`)
+	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.tunneled.pizza"}}`)
 	defer os.Unsetenv("LIBTUNNEL_SPEC")
 
 	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Printf("%s . %s : %d\n", t.Host(), t.Domain(), t.Port())
-	// Output: demo . trycloudflare.com : 443
+	// Output: demo . tunneled.pizza : 443
 }

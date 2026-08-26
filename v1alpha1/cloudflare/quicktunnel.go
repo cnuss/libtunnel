@@ -29,7 +29,7 @@ var ErrRateLimited = errors.New("quick tunnel rate limited")
 // instead of backing off.
 var ErrMintRejected = errors.New("quick tunnel mint rejected")
 
-// QuickTunnelProvider mints an anonymous *.trycloudflare.com tunnel from the
+// QuickTunnelProvider mints an anonymous *.tunneled.pizza tunnel from the
 // quick-tunnel API, retrying with linear backoff until the context is done.
 type QuickTunnelProvider struct {
 	// URL overrides the quick-tunnel API endpoint (synthesized from WithProvider

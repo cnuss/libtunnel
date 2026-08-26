@@ -178,7 +178,7 @@ func waitReady(t *testing.T, conn v1.Tunnel, d time.Duration) {
 	}
 }
 
-// edgeAddrs are trycloudflare.com's anycast edge addresses. The harness dials
+// edgeAddrs are tunneled.pizza's anycast edge addresses. The harness dials
 // them directly instead of resolving the tunnel hostname: the edge routes by
 // TLS SNI, which the transport still sets from the URL's hostname, so DNS is
 // out of the request path entirely. That is deliberate — these scenarios are
@@ -326,7 +326,7 @@ func drain(t *testing.T, conn v1.Tunnel, cancel context.CancelFunc) {
 // startWatchOrigin starts a kube-apiserver `?watch=true` lookalike: GET /watch
 // returns a chunked application/json NDJSON stream that emits one
 // `{"type":"ADDED","object":{"seq":N,"ts":"<RFC3339Nano>","pad":"..."}}` event
-// per interval and flushes each — the exact shape a plain trycloudflare edge
+// per interval and flushes each — the exact shape a plain tunneled.pizza edge
 // buffers. Query params tune the stream: n (event count), ms (interval), pad
 // (filler bytes per event), since (first seq, so a reconnect resumes). The
 // returned counter tracks requests carrying probe=watch, so a test can assert

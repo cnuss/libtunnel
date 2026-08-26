@@ -37,7 +37,7 @@ import (
 // the tunnel with a descriptive cause instead of registering the zero UUID
 // with the edge. Runs offline — the ID check fires before any network use.
 func TestWithListenerRejectsMalformedSpecID(t *testing.T) {
-	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -107,12 +107,12 @@ func clearSpecEnv(t *testing.T) {
 func TestSpecFieldSettersPatchResolvedSpec(t *testing.T) {
 	clearSpecEnv(t)
 
-	b := From(&Spec{ID: "id", Hostname: "pinned.trycloudflare.com"}).WithName("patched")
+	b := From(&Spec{ID: "id", Hostname: "pinned.tunneled.pizza"}).WithName("patched")
 	spec, err := b.Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Name != "patched" || spec.Hostname != "pinned.trycloudflare.com" {
+	if spec.Name != "patched" || spec.Hostname != "pinned.tunneled.pizza" {
 		t.Errorf("spec = %+v, want Name patched onto the pinned spec", spec)
 	}
 }
@@ -123,7 +123,7 @@ func TestSpecFieldEnvBeatsCode(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.CloudflareNameEnv, "from-env")
 
-	b := From(&Spec{Hostname: "pinned.trycloudflare.com"}).WithName("from-code")
+	b := From(&Spec{Hostname: "pinned.tunneled.pizza"}).WithName("from-code")
 	spec, err := b.Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +139,7 @@ func TestSpecFieldEnvBeatsCode(t *testing.T) {
 func TestCompleteFieldSetShortCircuitsMint(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.CloudflareIDEnv, "3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6")
-	t.Setenv(v1.CloudflareHostnameEnv, "fields.trycloudflare.com")
+	t.Setenv(v1.CloudflareHostnameEnv, "fields.tunneled.pizza")
 	t.Setenv(v1.CloudflareAccountTagEnv, "tag")
 	t.Setenv(v1.CloudflareSecretEnv, "c2VjcmV0")
 	t.Setenv(v1.CloudflareProviderEnv, "http://127.0.0.1:1/nope")
@@ -150,7 +150,7 @@ func TestCompleteFieldSetShortCircuitsMint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spec() = %v; a complete field set must not mint", err)
 	}
-	if spec.Hostname != "fields.trycloudflare.com" || spec.AccountTag != "tag" || string(spec.Secret) != "secret" {
+	if spec.Hostname != "fields.tunneled.pizza" || spec.AccountTag != "tag" || string(spec.Secret) != "secret" {
 		t.Errorf("spec = %+v, want the env field set verbatim", spec)
 	}
 }
@@ -160,7 +160,7 @@ func TestSecretEnvUndecodableErrors(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.CloudflareSecretEnv, "%%%not-base64%%%")
 
-	_, err := From(&Spec{Hostname: "pinned.trycloudflare.com"}).Provider().Spec(context.Background())
+	_, err := From(&Spec{Hostname: "pinned.tunneled.pizza"}).Provider().Spec(context.Background())
 	if err == nil || !strings.Contains(err.Error(), v1.CloudflareSecretEnv) {
 		t.Errorf("Spec err = %v, want a %s decode failure", err, v1.CloudflareSecretEnv)
 	}
@@ -174,7 +174,7 @@ func TestProviderEnvBeatsCode(t *testing.T) {
 	clearSpecEnv(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
 	t.Setenv(v1.CloudflareProviderEnv, srv.URL)
@@ -185,7 +185,7 @@ func TestProviderEnvBeatsCode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Hostname != "minted.trycloudflare.com" {
+	if spec.Hostname != "minted.tunneled.pizza" {
 		t.Errorf("Hostname = %q, want the spec minted from the env endpoint", spec.Hostname)
 	}
 }
@@ -196,7 +196,7 @@ func mintServer(t *testing.T, seen *http.Header) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*seen = r.Header.Clone()
-		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -320,7 +320,7 @@ func TestProviderHostSynthesizesEndpoint(t *testing.T) {
 // that can't be honored must fail the tunnel at connect, not be ignored.
 func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
 	t.Setenv(v1.TLSEnv, "banana")
-	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"x.trycloudflare.com","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"x.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -514,7 +514,7 @@ func TestStreamingPassthrough(t *testing.T) {
 const specJSON = `{"success":true,"result":{
 	"id":"00000000-0000-0000-0000-000000000000",
 	"name":"test",
-	"hostname":"test.trycloudflare.com",
+	"hostname":"test.tunneled.pizza",
 	"account_tag":"tag",
 	"secret":"c2VjcmV0"}}`
 
@@ -531,7 +531,7 @@ func TestQuickTunnelSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Hostname != "test.trycloudflare.com" {
+	if spec.Hostname != "test.tunneled.pizza" {
 		t.Errorf("Hostname = %q", spec.Hostname)
 	}
 	if string(spec.Secret) != "secret" {
@@ -558,7 +558,7 @@ func TestQuickTunnelRetriesAfter429(t *testing.T) {
 	if got := calls.Load(); got != 2 {
 		t.Errorf("API called %d times, want 2 (one 429, one success)", got)
 	}
-	if spec.Hostname != "test.trycloudflare.com" {
+	if spec.Hostname != "test.tunneled.pizza" {
 		t.Errorf("Hostname = %q", spec.Hostname)
 	}
 }
