@@ -124,12 +124,18 @@ var (
 
 func preflight() error {
 	preflightOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// 30s: mint attempts are bounded at ~5s each (see the provider's
+		// per-attempt timeouts), so this budget fits several retries against a
+		// briefly saturated mint endpoint instead of dying on the first hang.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		qt := cloudflare.QuickTunnel()
 		// The backend's env-header overlay doesn't reach a directly
-		// constructed provider, so mark the preflight mint ephemeral here.
+		// constructed provider, so mark the preflight mint ephemeral here —
+		// and hand it the suite's debug logger, or a throttled preflight
+		// fails with nothing but a deadline in the CI log.
 		qt.Headers = http.Header{"X-Ephemeral": []string{"true"}}
+		qt.Log = slog.Default()
 		preflightSpec, preflightErr = qt.Spec(ctx)
 		lastLiveStart = time.Now() // the mint counts toward pacing
 	})

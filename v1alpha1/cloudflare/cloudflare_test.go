@@ -644,6 +644,60 @@ func TestQuickTunnelRetriesAfter429(t *testing.T) {
 	}
 }
 
+// TestQuickTunnelHonorsRetryAfterSeconds pins that a 429's Retry-After wins
+// over the linear ramp: with Retry-After: 2, the retry waits ~2s where the
+// ramp alone would have retried after 1s.
+func TestQuickTunnelHonorsRetryAfterSeconds(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Write([]byte(specJSON))
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 1900*time.Millisecond {
+		t.Errorf("retried after %s, want ~2s (Retry-After honored over the 1s ramp)", elapsed)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("API called %d times, want 2", got)
+	}
+}
+
+// TestQuickTunnelHonorsRetryAfterDate pins the RFC 7231 HTTP-date form of
+// Retry-After: a date ~3s out delays the retry past the 1s ramp.
+func TestQuickTunnelHonorsRetryAfterDate(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", time.Now().Add(3*time.Second).UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Write([]byte(specJSON))
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The date form truncates to whole seconds, so ~3s out is at least ~2s.
+	if elapsed := time.Since(start); elapsed < 1500*time.Millisecond {
+		t.Errorf("retried after %s, want the HTTP-date wait honored over the 1s ramp", elapsed)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("API called %d times, want 2", got)
+	}
+}
+
 func TestQuickTunnelRetriesAfterMalformedBody(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
