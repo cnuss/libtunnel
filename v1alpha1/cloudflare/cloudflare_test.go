@@ -263,6 +263,87 @@ func TestHeadersEnvBeatsCode(t *testing.T) {
 	}
 }
 
+// TestReclaimHintsSentToMint pins the reclaim hints: spec fields known before
+// minting ride the request as X-Id / X-Name / X-Secret (base64), so a
+// provider that reaps idle tunnels can hand the matching tunnel back.
+func TestReclaimHintsSentToMint(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b := New().WithID("id-1").WithName("pizza-1").WithSecret([]byte("secret")).WithProvider(srv.URL)
+	if _, err := b.Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("X-Id"); got != "id-1" {
+		t.Errorf("X-Id = %q, want %q", got, "id-1")
+	}
+	if got := seen.Get("X-Name"); got != "pizza-1" {
+		t.Errorf("X-Name = %q, want %q", got, "pizza-1")
+	}
+	if got := seen.Get("X-Secret"); got != "c2VjcmV0" {
+		t.Errorf("X-Secret = %q, want %q (base64)", got, "c2VjcmV0")
+	}
+}
+
+// TestReclaimHintsAbsentByDefault pins the quiet default: a mint with no spec
+// fields set carries no reclaim hints.
+func TestReclaimHintsAbsentByDefault(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithProvider(srv.URL).Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"X-Id", "X-Name", "X-Secret"} {
+		if _, ok := seen[k]; ok {
+			t.Errorf("%s = %q, want absent", k, seen.Get(k))
+		}
+	}
+}
+
+// TestReclaimHintEnvBeatsCode pins the mirror precedence inside the hints:
+// LIBTUNNEL__CLOUDFLARE_NAME beats WithName in the X-Name hint, matching the
+// field overlay's precedence.
+func TestReclaimHintEnvBeatsCode(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+	t.Setenv(v1.CloudflareNameEnv, "env-name")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithName("code-name").WithProvider(srv.URL).Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("X-Name"); got != "env-name" {
+		t.Errorf("X-Name = %q, want the env value to beat code", got)
+	}
+}
+
+// TestWithHeaderBeatsReclaimHint pins the layer order: an explicit WithHeader
+// for a hint key replaces the hint.
+func TestWithHeaderBeatsReclaimHint(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b := New().WithID("id-1").WithProvider(srv.URL).WithHeader("X-Id", "explicit")
+	if _, err := b.Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Values("X-Id"); len(got) != 1 || got[0] != "explicit" {
+		t.Errorf("X-Id = %v, want exactly [explicit] (WithHeader beats the hint)", got)
+	}
+}
+
 // TestWithEdgePinsAddresses pins WithEdge: the addresses are carried through to
 // the supervisor's static-edge list, which bypasses SRV discovery (and with it
 // Cloudflare's port 7844) so a relay on an allowed port can be dialed instead.

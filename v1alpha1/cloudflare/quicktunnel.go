@@ -37,8 +37,9 @@ type QuickTunnelProvider struct {
 	// Empty means the default.
 	URL string
 	// Headers are added to the mint request (WithHeader / its
-	// LIBTUNNEL__CLOUDFLARE_HEADERS mirror). They are applied over the headers
-	// set here (Content-Type, User-Agent), so a caller-supplied key replaces the
+	// LIBTUNNEL__CLOUDFLARE_HEADERS mirror, plus the backend's reclaim hints —
+	// see mintHeaders). They are applied over the headers set here
+	// (Content-Type, User-Agent), so a caller-supplied key replaces the
 	// default for that key. Nil adds nothing.
 	Headers http.Header
 	// Log receives retry warnings. Nil is silent.

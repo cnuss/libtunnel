@@ -257,10 +257,13 @@ func (b *Backend) Reconnect(ctx context.Context) error {
 // The spec-field setters override individual fields of whatever spec the
 // credential chain resolves — adopt, replay, pin, or mint — and a complete
 // credential set (id, hostname, account tag, secret) short-circuits the
-// resolve entirely. Each is superseded field-by-field by its
-// LIBTUNNEL__CLOUDFLARE_* variable (env beats code). They return the concrete
-// backend, so chain them before the v1.Backend mutators (WithTLS, WithHTTP2),
-// which return the interface.
+// resolve entirely. When the chain does mint, the fields known beforehand
+// also ride the mint request as reclaim hints — X-Id, X-Name, X-Secret
+// (base64) — so a provider that reaps idle tunnels can hand the matching
+// tunnel back instead of minting fresh (see mintHeaders). Each is superseded
+// field-by-field by its LIBTUNNEL__CLOUDFLARE_* variable (env beats code).
+// They return the concrete backend, so chain them before the v1.Backend
+// mutators (WithTLS, WithHTTP2), which return the interface.
 
 // WithID overrides the tunnel ID (a UUID). Env mirror: LIBTUNNEL__CLOUDFLARE_ID.
 func (b *Backend) WithID(id string) *Backend {
@@ -396,8 +399,9 @@ func edgeAddresses(code []string) []string {
 // a less-guessable hostname). Repeatable — successive calls accumulate, and
 // repeating a key adds another value. Env mirror: LIBTUNNEL__CLOUDFLARE_HEADERS,
 // a comma-separated K=V list, whose entries beat code per key. Applied over the
-// headers the mint sets itself (Content-Type, User-Agent), so a caller may
-// override those — overriding User-Agent changes how the endpoint sees the
+// headers the mint sets itself (Content-Type, User-Agent) and over the reclaim
+// hints (X-Id, X-Name, X-Secret — see WithID), so a caller may override any of
+// them — overriding User-Agent changes how the endpoint sees the
 // connector version. Mint-only, following the WithProvider boundary: adopted,
 // replayed, and pinned specs never hit the API, so headers never apply to them.
 func (b *Backend) WithHeader(key, value string) *Backend {
@@ -434,22 +438,60 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 		if host != "" {
 			qt.URL = providerEndpoint(host)
 		}
-		qt.Headers = mintHeaders(b.headers)
+		qt.Headers = mintHeaders(b.fields, b.headers)
 		next = qt
 	}
 	return v1alpha1.Env(b.Name(), overlay{fields: b.fields, next: v1alpha1.Replay(b.Name(), next)})
 }
 
-// mintHeaders resolves the mint request headers: the code headers (WithHeader)
-// overlaid by v1.CloudflareHeadersEnv, a comma-separated K=V list whose entries
-// replace the code value for their key (env beats code). Returns nil when
-// neither is set. Values cannot contain a comma or an equals sign — the env
-// form has no escaping.
-func mintHeaders(code http.Header) http.Header {
+// mintHeaders resolves the mint request headers, three layers, each beating
+// the one before it per key. First the reclaim hints: the spec fields known
+// before minting (WithID / WithName / WithSecret, each superseded by its
+// LIBTUNNEL__CLOUDFLARE_* mirror), sent as X-Id, X-Name, and X-Secret
+// (base64) so a provider that reaps idle tunnels can hand the matching tunnel
+// back instead of minting fresh — optimistic, so whatever is known is sent
+// and absent fields send nothing. Then the code headers (WithHeader), then
+// v1.CloudflareHeadersEnv, a comma-separated K=V list (env beats code).
+// Returns nil when all three are empty. Values cannot contain a comma or an
+// equals sign — the env form has no escaping.
+func mintHeaders(fields Spec, code http.Header) http.Header {
 	var out http.Header
-	if len(code) > 0 {
-		out = code.Clone()
+	set := func(key, value string) {
+		if out == nil {
+			out = http.Header{}
+		}
+		out.Set(key, value)
 	}
+
+	stringEnv(v1.CloudflareIDEnv, &fields.ID)
+	stringEnv(v1.CloudflareNameEnv, &fields.Name)
+	if v := os.Getenv(v1.CloudflareSecretEnv); v != "" {
+		// An undecodable value is ignored rather than surfaced: the overlay
+		// decodes the same variable before any mint runs and fails resolution.
+		if secret, err := base64.StdEncoding.DecodeString(v); err == nil {
+			fields.Secret = secret
+		}
+	}
+	if fields.ID != "" {
+		set("X-Id", fields.ID)
+	}
+	if fields.Name != "" {
+		set("X-Name", fields.Name)
+	}
+	if len(fields.Secret) > 0 {
+		set("X-Secret", base64.StdEncoding.EncodeToString(fields.Secret))
+	}
+
+	for key, values := range code {
+		if out == nil {
+			out = http.Header{}
+		}
+		out.Del(key)
+		for _, v := range values {
+			out.Add(key, v)
+		}
+	}
+
 	raw := os.Getenv(v1.CloudflareHeadersEnv)
 	if raw == "" {
 		return out

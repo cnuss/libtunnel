@@ -45,6 +45,11 @@ func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	})))
+	// Every mint this suite performs is marked ephemeral: the provider does
+	// not hold an ephemeral tunnel for reclamation once it is reaped, so test
+	// tunnels stay out of the reclaim pool. The env mirror reaches the
+	// re-exec'd children and example subprocesses too.
+	os.Setenv(v1.CloudflareHeadersEnv, "X-Ephemeral=true")
 	os.Exit(m.Run())
 }
 
@@ -121,7 +126,11 @@ func preflight() error {
 	preflightOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		preflightSpec, preflightErr = cloudflare.QuickTunnel().Spec(ctx)
+		qt := cloudflare.QuickTunnel()
+		// The backend's env-header overlay doesn't reach a directly
+		// constructed provider, so mark the preflight mint ephemeral here.
+		qt.Headers = http.Header{"X-Ephemeral": []string{"true"}}
+		preflightSpec, preflightErr = qt.Spec(ctx)
 		lastLiveStart = time.Now() // the mint counts toward pacing
 	})
 	return preflightErr
