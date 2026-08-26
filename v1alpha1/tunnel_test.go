@@ -54,6 +54,27 @@ func (e *fakeEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], u *u
 	return nil
 }
 
+// stuckEngine is a fakeEngine whose connect never returns within the test,
+// for the cases that observe a tunnel that is not yet ready. With readiness
+// following edge registration directly (no settle delay to inflate), an
+// engine that never registers is the way to hold readiness open.
+type stuckEngine struct {
+	*fakeEngine
+	hold chan struct{}
+}
+
+func newStuckEngine(t *testing.T, spec *cloudflare.Spec) *stuckEngine {
+	t.Helper()
+	e := &stuckEngine{fakeEngine: newFakeEngine(spec), hold: make(chan struct{})}
+	t.Cleanup(func() { close(e.hold) })
+	return e
+}
+
+func (e *stuckEngine) WithListener(*v1alpha1.TunnelImpl[*cloudflare.Spec], net.Listener) error {
+	<-e.hold
+	return nil
+}
+
 // foreignBackend implements v1.Backend but not Engine.
 type foreignBackend struct{}
 
@@ -207,7 +228,6 @@ func TestEngineReceivesListener(t *testing.T) {
 // prior WithListener binds a loopback listener, adopts it, and hands it to the
 // engine — so http.Serve(tun.Listener(), h) needs no net.Listen of its own.
 func TestListenerMintsWhenNoneProvided(t *testing.T) {
-	stubReady(t)
 	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
 	tun := v1alpha1.New(engine)
 
@@ -232,7 +252,6 @@ func TestListenerMintsWhenNoneProvided(t *testing.T) {
 // with no listener provided, it must mint a loopback listener and start the
 // tunnel — not block on readiness that could never arrive (#82).
 func TestURLMintsListenerWhenNoneProvided(t *testing.T) {
-	stubReady(t)
 	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
 	tun := v1alpha1.New(engine)
 
@@ -254,7 +273,6 @@ func TestURLMintsListenerWhenNoneProvided(t *testing.T) {
 // trigger: waiting on it with no listener provided must start the tunnel and
 // eventually fire, not block forever.
 func TestTunnelReadyStartsTunnelWhenNoneProvided(t *testing.T) {
-	stubReady(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
 
 	select {
@@ -269,7 +287,6 @@ func TestTunnelReadyStartsTunnelWhenNoneProvided(t *testing.T) {
 // TestSecondWithListenerCancels pins the one-provide rule: a second
 // WithListener cancels the tunnel rather than silently dropping the listener.
 func TestSecondWithListenerCancels(t *testing.T) {
-	stubReady(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
 	tun.WithListener(listen(t))
 	tun.WithListener(listen(t))
@@ -287,7 +304,6 @@ func TestSecondWithListenerCancels(t *testing.T) {
 // TestListenerMintThenWithListenerCancels pins that a minted listener also
 // counts as provided: a following WithListener is a double-provide.
 func TestListenerMintThenWithListenerCancels(t *testing.T) {
-	stubReady(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
 	tun.Listener()
 	tun.WithListener(listen(t))
@@ -306,7 +322,6 @@ func TestListenerMintThenWithListenerCancels(t *testing.T) {
 // after WithListener returns a view of the provided listener and never mints or
 // cancels.
 func TestWithListenerThenListenerReturnsProvided(t *testing.T) {
-	stubReady(t)
 	l := listen(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
 	tun.WithListener(l)
@@ -458,7 +473,6 @@ func TestListenerAfterWithLocalURLCancels(t *testing.T) {
 // TunnelReady must not mint a listener (the origin is already provided) and
 // must complete once the engine connects and the hostname resolves.
 func TestWithLocalURLReadiness(t *testing.T) {
-	stubReady(t)
 	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
 	tun := v1alpha1.New(engine)
 	conn := tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
@@ -496,7 +510,6 @@ func TestEnvLocalURLOverridesProvides(t *testing.T) {
 		"StartTriggerMint": func(tun v1.Tunnel, _ net.Listener) { tun.TunnelReady() },
 	} {
 		t.Run(name, func(t *testing.T) {
-			stubReady(t)
 			t.Setenv(v1.LocalURLEnv, "http://127.0.0.1:4321")
 			engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
 			tun := v1alpha1.New(engine)
@@ -578,12 +591,12 @@ func TestWithLoggerWriteOnce(t *testing.T) {
 
 // TestWithContextWriteOnce pins the write-once mutator contract for
 // WithContext: the first context sticks, so URL honors it even when a later
-// WithContext tries to replace it. The readiness probe never fires here, so
-// URL can only return via the first (already canceled) context — if the
-// second context won, URL would hang past the test timeout.
+// WithContext tries to replace it. The engine never connects here (stuck), so
+// readiness never fires and URL can only return via the first (already
+// canceled) context — if the second context won, URL would hang past the
+// test timeout.
 func TestWithContextWriteOnce(t *testing.T) {
-	stubNeverReady(t)
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newStuckEngine(t, &cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -602,27 +615,10 @@ func TestWithContextWriteOnce(t *testing.T) {
 	}
 }
 
-// stubNeverReady holds hostname readiness open for the duration of a test, for
-// the cases that need to observe what happens while a tunnel is not yet ready.
-func stubNeverReady(t *testing.T) {
-	t.Helper()
-	t.Cleanup(v1alpha1.SetSettleDelay(24 * time.Hour))
-}
-
-// stubReady makes hostname readiness immediate so these tests exercise the
-// readiness plumbing (channel close, URL unblock) deterministically without
-// waiting out the production settle delay — the delay itself is pinned by
-// TestHostnameReadyWaitsOutSettle, and the live e2e suite pays it for real.
-func stubReady(t *testing.T) {
-	t.Helper()
-	t.Cleanup(v1alpha1.SetSettleDelay(0))
-}
-
 // TestTunnelReadyAfterEngineConnects pins that TunnelReady closes once the
-// engine connects and the hostname resolves — the fake engine supplies the
-// connection half, stubReady the resolution half.
+// engine connects: readiness follows edge registration directly, the mint
+// provider having already waited out the hostname's DNS propagation.
 func TestTunnelReadyAfterEngineConnects(t *testing.T) {
-	stubReady(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
 
 	conn := tun.WithListener(listen(t))
@@ -634,28 +630,18 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 	}
 }
 
-// TestHostnameReadyWaitsOutSettle pins that readiness is not immediate: the
-// edge publishes the record moments after the connection registers and it
-// spreads across the zone's nameservers over seconds, so HostnameReady holds
-// for the settle delay before closing. Firing at connect would hand the
-// caller a URL whose record may not have reached the nameserver their
-// resolver asks.
-func TestHostnameReadyWaitsOutSettle(t *testing.T) {
-	t.Cleanup(v1alpha1.SetSettleDelay(500 * time.Millisecond))
-
+// TestHostnameReadyAtRegistration pins that readiness follows edge
+// registration with no client-side settle: the mint provider waits out the
+// record's spread before returning credentials, so holding the caller after
+// connect would be a second wait for the same propagation (#140).
+func TestHostnameReadyAtRegistration(t *testing.T) {
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
 	conn := tun.WithListener(listen(t))
 
 	select {
 	case <-conn.HostnameReady():
-		t.Fatal("HostnameReady closed before the settle delay elapsed")
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	select {
-	case <-conn.HostnameReady():
-	case <-time.After(15 * time.Second):
-		t.Fatal("HostnameReady never closed after the settle delay")
+	case <-time.After(2 * time.Second):
+		t.Fatal("HostnameReady not closed promptly after the engine connected — is a settle wait back?")
 	}
 }
 
@@ -663,7 +649,6 @@ func TestHostnameReadyWaitsOutSettle(t *testing.T) {
 // caller context set, URL blocks until TunnelReady (not DNS alone) and then
 // returns the public URL.
 func TestWithContextURLWaitsForTunnelReady(t *testing.T) {
-	stubReady(t)
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})).
 		WithContext(context.Background())
 	conn := tun.WithListener(listen(t))
@@ -718,7 +703,6 @@ func TestWithContextCancelReturnsNilURLAndTearsDown(t *testing.T) {
 // is its only teardown. Canceling it after the tunnel is up must retire the
 // tunnel, not leak it until process exit.
 func TestWithContextCancelTearsDownURLOrigin(t *testing.T) {
-	stubReady(t)
 	ctx, cancel := context.WithCancelCause(context.Background())
 
 	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})).
