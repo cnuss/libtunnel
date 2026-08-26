@@ -32,9 +32,10 @@ var ErrClosed = errors.New("tunnel closed")
 var ErrEdgeUnreachable = errors.New("edge unreachable")
 
 // ErrHostnameUnresolved was the Err result of a tunnel whose hostname never
-// resolved, back when readiness polled DNS and could give up. Readiness is
-// now a fixed settle delay after the edge connection registers and produces
-// no error; the variable remains so callers matching on it keep compiling.
+// resolved, back when readiness polled DNS and could give up. Readiness now
+// follows the edge connection registering — the mint provider waits out DNS
+// propagation before returning credentials — and produces no error; the
+// variable remains so callers matching on it keep compiling.
 var ErrHostnameUnresolved = errors.New("hostname unresolved")
 
 // The environment variables, centralized: every code knob with an
@@ -258,9 +259,10 @@ type Tunnel interface {
 	URL() *url.URL
 
 	// HostnameReady is closed once the hostname is expected to resolve
-	// publicly: a settle delay after the edge connection registers, waiting
-	// out the record's spread across the zone's nameservers. Nothing on this
-	// machine is asked about the hostname before then.
+	// publicly: when the edge connection registers. The record's spread
+	// across the zone's nameservers is waited out by the mint provider before
+	// it returns credentials, so a running tunnel implies a propagated
+	// hostname. Nothing on this machine is asked about the hostname.
 	HostnameReady() <-chan struct{}
 	// TunnelReady is closed when the edge connection is up and the hostname
 	// resolves publicly — the tunnel is reachable end to end. It is never
