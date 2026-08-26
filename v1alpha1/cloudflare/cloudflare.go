@@ -68,7 +68,7 @@ const backendName = "cloudflare"
 
 // haConnections is the number of edge (HA) connections the supervisor keeps.
 // The reconnect lever fires one ReconnectSignal per conn to cycle them all.
-const haConnections = 1
+const haConnections = 2
 
 // edgeUpWatcher tracks the tunnel's edge connections from the Observer sink:
 // Connected events, so a caller can wait for N of them past a barrier, and the
