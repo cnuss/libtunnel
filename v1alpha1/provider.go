@@ -3,13 +3,16 @@ package v1alpha1
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 )
@@ -237,10 +240,128 @@ func packagePath() string {
 	return reflect.TypeOf((*v1.Spec)(nil)).Elem().PkgPath()
 }
 
-// latestSpecFile is the fixed-name cache entry tracking the most recently
-// minted spec, written alongside the per-hostname files. It never collides
-// with cacheFileName output: hostnames always carry a domain.
-const latestSpecFile = "latest.spec.json"
+// The fixed-name hint entries tracking the most recently minted spec, written
+// alongside the per-hostname files. Neither collides with cacheFileName
+// output: hostnames always carry a domain.
+//
+// The project pair lives in the working directory (see projectDir) and is
+// named to fall under the "*.local" line that the common gitignore templates
+// already carry — a spec is credentials, and the one thing worse than an
+// untracked credential file is a tracked one. The cache-dir pair keeps its
+// original names so an existing deployment's hint still reads.
+const (
+	latestSpecFile   = "latest.spec.json"
+	latestOwnerFile  = "latest.spec.owner"
+	projectSpecFile  = "libtunnel.local"
+	projectOwnerFile = "libtunnel.owner.local"
+)
+
+// specOwner records which process holds the tunnel a hint points at, written
+// beside the hint itself. It is the cross-process half of the reclaim guard
+// that selfCached provides in-process (#157).
+type specOwner struct {
+	PID      int    `json:"pid"`
+	Hostname string `json:"hostname"`
+}
+
+// projectDir reports the working directory to scope hints to, and whether
+// project scoping applies at all. It does not when v1.CacheDirEnv is set: an
+// explicit cache dir is a deliberate statement about where specs live (a CI
+// cache, a container mount), and nothing should then be written into the
+// working tree. "Most recent" is otherwise a machine-global fact, which is
+// the wrong scope — what a person means by it is almost always this project,
+// and two projects worked on the same afternoon should not fight over one
+// hint (#158).
+func projectDir() (string, bool) {
+	if os.Getenv(v1.CacheDirEnv) != "" {
+		return "", false
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	return cwd, true
+}
+
+// writeHint writes a hint file and its owner sidecar into dir. Mode 0600 on
+// both: a spec is credentials.
+func writeHint(dir, specFile, ownerFile string, data []byte, host string) error {
+	if err := os.WriteFile(filepath.Join(dir, specFile), data, 0o600); err != nil {
+		return err
+	}
+	owner, err := json.Marshal(specOwner{PID: os.Getpid(), Hostname: host})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, ownerFile), owner, 0o600)
+}
+
+// loadHint reads one hint pair into spec, reporting whether it may be offered
+// as a reclaim hint. Every failure — no file, malformed envelope, foreign
+// backend — reads as absent, as does a spec whose tunnel is still connected:
+// this process's own (selfCached) or another live process's (the owner
+// sidecar).
+func loadHint[T v1.Spec](dir, specFile, ownerFile, backend string, spec T) bool {
+	data, err := os.ReadFile(filepath.Join(dir, specFile))
+	if err != nil {
+		return false
+	}
+	tag, raw, err := DecodeSpec(string(data))
+	if err != nil || tag != backend {
+		return false
+	}
+	if json.Unmarshal(raw, spec) != nil {
+		return false
+	}
+	host := spec.GetHostname()
+	selfCachedMu.Lock()
+	self := selfCached[host]
+	selfCachedMu.Unlock()
+	if self {
+		return false
+	}
+	return !ownedByLiveProcess(filepath.Join(dir, ownerFile), host)
+}
+
+// ownedByLiveProcess reports whether the owner sidecar at path names a
+// running process still holding host. A hint whose owner is alive points at a
+// LIVE tunnel: handing it out would put two connectors with different origins
+// behind one hostname, which is exactly what the in-process selfCached guard
+// prevents and could not see across processes (#157). No sidecar, an
+// unreadable or stale one, or one naming a different hostname reads as
+// unowned — the guard only ever withholds a hint on positive evidence, so its
+// worst case is a fresh mint rather than a collision.
+func ownedByLiveProcess(path, host string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var owner specOwner
+	if json.Unmarshal(data, &owner) != nil || owner.Hostname != host {
+		return false
+	}
+	return pidAlive(owner.PID)
+}
+
+// pidAlive reports whether pid is a running process. Signal 0 is the standard
+// POSIX liveness probe (permission denied means it exists but belongs to
+// someone else); on Windows os.FindProcess itself fails for a process that is
+// gone. Pid reuse makes this a heuristic, but one that fails safe: a reused
+// pid withholds a reclaimable hint and costs a fresh mint, never a collision.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	err = p.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
 
 // CacheSpec writes a freshly minted spec to CacheDir as <hostname>.spec.json
 // (Serialize output, the v1.SpecEnv envelope) and as latest.spec.json, the
@@ -270,7 +391,15 @@ func CacheSpec[T v1.Spec](spec T) error {
 	if err := os.WriteFile(filepath.Join(dir, cacheFileName(host)), data, 0o600); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, latestSpecFile), data, 0o600)
+	// Write-through: the project hint is where this project's identity lives,
+	// the cache-dir one keeps the existing machine-wide behaviour intact.
+	// Best effort on the project side — a read-only working directory (a
+	// container mount, / as the cwd) degrades to the cache dir rather than
+	// failing the mint.
+	if cwd, ok := projectDir(); ok {
+		_ = writeHint(cwd, projectSpecFile, projectOwnerFile, data, host)
+	}
+	return writeHint(dir, latestSpecFile, latestOwnerFile, data, host)
 }
 
 // LatestSpec loads the most recently minted spec (CacheDir's
@@ -282,25 +411,19 @@ func CacheSpec[T v1.Spec](spec T) error {
 // as absent rather than an error, and so does a spec this process cached
 // itself (its tunnel is alive right here — see selfCached).
 func LatestSpec[T v1.Spec](backend string, spec T) bool {
+	// The project's own hint decides when it exists: falling back to the
+	// machine-wide one would reintroduce the cross-project bleed the project
+	// scope exists to stop.
+	if cwd, ok := projectDir(); ok {
+		if _, err := os.Stat(filepath.Join(cwd, projectSpecFile)); err == nil {
+			return loadHint(cwd, projectSpecFile, projectOwnerFile, backend, spec)
+		}
+	}
 	dir, err := CacheDir()
 	if err != nil {
 		return false
 	}
-	data, err := os.ReadFile(filepath.Join(dir, latestSpecFile))
-	if err != nil {
-		return false
-	}
-	tag, raw, err := DecodeSpec(string(data))
-	if err != nil || tag != backend {
-		return false
-	}
-	if json.Unmarshal(raw, spec) != nil {
-		return false
-	}
-	selfCachedMu.Lock()
-	self := selfCached[spec.GetHostname()]
-	selfCachedMu.Unlock()
-	return !self
+	return loadHint(dir, latestSpecFile, latestOwnerFile, backend, spec)
 }
 
 // cacheFileName builds a filesystem-safe "<hostname>.spec.json": GetHostname

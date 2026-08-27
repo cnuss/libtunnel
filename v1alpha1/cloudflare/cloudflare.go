@@ -935,7 +935,7 @@ func newOriginProxy(originURLs []*url.URL, log *slog.Logger, transport http.Roun
 				}
 				origin = originURLs[ix]
 				r.Out.URL.RawQuery = strings.Join(kept, "&")
-				if dest := r.In.Header.Get("Sec-Fetch-Dest"); explicit && (dest == "" || dest == "document") {
+				if explicit && navigation(r.In) {
 					// ModifyResponse below answers an explicit top-level pick
 					// with the sticky cookie; the outbound context carries the
 					// index over.
@@ -1021,6 +1021,23 @@ func bareIndex(rawQuery string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// navigation reports whether a request is a top-level navigation — the only
+// kind whose explicit ?n pick may write the tab-wide sticky cookie.
+// Sec-Fetch-Dest names it outright in a modern browser; an absent header is
+// treated as one so a client that predates the header (curl, an old browser)
+// can still pin an origin. A WebSocket handshake is the exception that
+// forces the check: it carries no Sec-Fetch-Dest at all, so the absent case
+// used to catch every socket, letting whichever socket connected last re-pin
+// every later parameter-less request (#159). An upgrade is never a
+// navigation, whatever else it omits.
+func navigation(r *http.Request) bool {
+	if r.Header.Get("Upgrade") != "" {
+		return false
+	}
+	dest := r.Header.Get("Sec-Fetch-Dest")
+	return dest == "" || dest == "document"
 }
 
 // originCookie is the sticky-routing cookie a multi-origin proxy sets when a

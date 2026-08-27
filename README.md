@@ -125,7 +125,9 @@ type Tunnel interface {
                                              // (http://localhost:1234); mutually
                                              // exclusive with WithListener; u[0]
                                              // is the default, ?n routes to u[n]
-                                             // (sticky cookie, param dropped)
+                                             // (sticky cookie, param dropped;
+                                             // WebSockets need the app's help
+                                             // — see below)
 
     // hook requests in front of the origin proxy; layerable, not write-once
     WithInterceptor(interceptor Interceptor) Tunnel
@@ -157,6 +159,42 @@ func Version() string                            // the libtunnel release this b
 // parent→child handoff — no API: minting exports the LIBTUNNEL_SPEC env var,
 // construction adopts it
 ```
+
+## Multiple origins
+
+`WithLocalURL` takes more than one URL. `u[0]` is the default; a bare numeric
+query parameter picks another, is dropped from the forwarded request, and pins
+what follows:
+
+```go
+conn := libtunnel.New(libtunnel.Cloudflare()).
+    WithLocalURL(api, admin) // https://<host>/ -> api, https://<host>/?1 -> admin
+```
+
+Resolution order per request: an explicit `?n`, then a same-host `Referer`
+carrying one (so a routed page's assets, XHR, and iframes follow their own
+document URL — side-by-side iframes of different origins work in one tab), then
+the sticky `libtunnel-origin` cookie set by an explicit top-level pick, then
+`u[0]`. A document navigation resolved via `Referer` is redirected to carry the
+parameter, so routing survives link clicks.
+
+**WebSockets are the exception.** A handshake carries no `Referer` — it is not
+in the handshake header set — so a socket opened without the parameter falls
+through to the cookie, which is per-browser, not per-tab or per-iframe. A page
+you control can carry the index itself:
+
+```js
+new WebSocket("wss://" + location.host + "/sock" + location.search)
+```
+
+A third-party dev server's socket (HMR, a notebook kernel, a live-reload
+channel) cannot be told to do that, and will reach `u[0]` or wherever the cookie
+last pointed — the page loads, the socket connects to the wrong origin, and the
+app just looks broken. Routing a socket without the app's cooperation needs an
+address the browser inherits on its own (a hostname per origin), which is a
+backend capability rather than something the proxy can synthesize. A handshake
+never writes the sticky cookie, so at least one socket can no longer re-pin
+every later request.
 
 ## Interceptors
 
@@ -298,6 +336,23 @@ provider that reaps idle tunnels hands the same tunnel back instead of minting
 fresh. If the provider refuses the reclaim, the mint retries once without the
 cached hints and the fresh spec overwrites `latest.spec.json`.
 
+Unless `LIBTUNNEL_CACHE_DIR` is set, that hint is also written into the working
+directory as **`libtunnel.local`** (with `libtunnel.owner.local` beside it), so
+a service restarted from the same directory reclaims its own hostname rather
+than racing whatever else was minted on the machine that day — and the project
+you are in can see which tunnel it has been getting. **Both files are
+credentials.** They are written mode `0600`, and their names fall under the
+`*.local` line most gitignore templates already carry — keep them untracked. A
+read-only working directory is not an error; the mint falls back to the cache
+dir. Setting `LIBTUNNEL_CACHE_DIR` says where specs live deliberately, so it
+turns the working-directory hint off entirely.
+
+The owner file records the pid holding the tunnel, so a second process does not
+reclaim a hostname the first one is still serving — otherwise two connectors
+with different origins end up behind one hostname, which is silent and
+intermittent from either side. A dead owner (exit or crash) frees the hint
+immediately.
+
 ```go
 // replay the most recently cached tunnel by hostname
 conn := libtunnel.From("foo.tunneled.pizza").WithListener(l)
@@ -318,7 +373,7 @@ rebuild. (The one exception is noted below.)
 | `LIBTUNNEL_HTTP2` | `WithHTTP2()` | Same rules as `LIBTUNNEL_TLS`. |
 | `LIBTUNNEL_LOG` | `WithLogger()` | `debug`\|`info`\|`warn`\|`error`: the default logger becomes a stderr text logger at that level instead of silent. *The exception:* an explicit `WithLogger` keeps its handler — env carries a level, not a sink. |
 | `LIBTUNNEL_HOSTNAME` | — | Export-only mirror of the minted spec's hostname, for tooling; never adopted. |
-| `LIBTUNNEL_CACHE_DIR` | — | Where minted specs are cached and `From`/`Hosts` look; also holds `latest.spec.json`, which seeds the next mint's reclaim hints. |
+| `LIBTUNNEL_CACHE_DIR` | — | Where minted specs are cached and `From`/`Hosts` look; also holds `latest.spec.json`, which seeds the next mint's reclaim hints. Unset, the hint is also written to `./libtunnel.local` (credentials — keep untracked); set, it is not. |
 
 Backend-scoped variables follow `LIBTUNNEL__<BACKEND>_<FIELD>` (double
 underscore namespaces the backend) and live with their backend package. For
