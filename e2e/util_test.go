@@ -23,7 +23,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -50,19 +49,6 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// roleEnv selects a child role inside a re-exec'd test binary.
-const roleEnv = "LIBTUNNEL_E2E_ROLE"
-
-func role() string { return os.Getenv(roleEnv) }
-
-// reexec builds a command that re-runs this test binary anchored to a single
-// test, with extra environment entries appended to the current environment.
-func reexec(test string, extraEnv ...string) *exec.Cmd {
-	cmd := exec.Command(os.Args[0], "-test.run=^"+test+"$", "-test.v")
-	cmd.Env = append(os.Environ(), extraEnv...)
-	return cmd
-}
-
 // gateLive gates a live scenario and, by default, hands it the ONE shared
 // preflight mint: it skips unless the live tier is enabled, fails fast when the
 // preflight comms check failed, paces the suite, then adopts the preflight spec
@@ -72,34 +58,11 @@ func reexec(test string, extraEnv ...string) *exec.Cmd {
 // whole live tier to a handful of mints.
 //
 // Adopt-by-default REQUIRES serial execution — one connector at a time on the
-// shared hostname — so no live test may call t.Parallel(). Scenarios that own a
-// hostname's whole lifecycle (a distinct hostname, or a connector they kill and
-// resurrect) use gateLiveOwnSpec to mint their own instead.
+// shared hostname — so no live test may call t.Parallel().
 func gateLive(t *testing.T) {
 	t.Helper()
 	gateLiveBare(t)
 	adoptPreflightSpec(t)
-}
-
-// gateLiveOwnSpec is gateLive for the few scenarios that must mint their own
-// identity: it scrubs any inherited LIBTUNNEL_SPEC so the tunnel mints a fresh
-// hostname rather than adopting the shared preflight spec. Used by
-// TestLiveHandoff (kills and resurrects connectors on its own hostname —
-// reusing the shared one risks a sticky 530 after unregister, and the
-// parent-side mint is half its scenario) and TestLiveTwoTunnels (needs two
-// distinct hostnames).
-func gateLiveOwnSpec(t *testing.T) {
-	t.Helper()
-	gateLiveBare(t)
-	t.Setenv(v1.SpecEnv, "")
-	// Own-spec means own cache too: the shared cache dir's latest.spec.json
-	// (the preflight's tunnel, or the previous run's via the CI cache) would
-	// otherwise seed this mint's reclaim hints and hand back the very tunnel
-	// these scenarios must not share. (In-process the library already skips
-	// self-cached specs; this also isolates from the restored cross-run one.)
-	// The dir is scoped to the test, not throwaway: a fresh hostname per run
-	// is how the live tier blew through mint limits (#147).
-	t.Setenv(v1.CacheDirEnv, scopedCacheDir(t, "own-"+t.Name()))
 }
 
 // scopedCacheDir is a persistent spec-cache dir scoped to name under the
@@ -194,8 +157,7 @@ func dependabotRun() bool {
 }
 
 // gateLiveBare is the shared gate — live check, tier check, preflight, pace —
-// behind both gateLive (adopt the shared spec) and gateLiveOwnSpec (mint your
-// own).
+// behind gateLive.
 func gateLiveBare(t *testing.T) {
 	t.Helper()
 	skipUnlessLive(t)
@@ -266,12 +228,6 @@ func paceLive() {
 	}
 	lastLiveStart = time.Now()
 }
-
-// readyPrefix matches the "ready: <url>" line liveServeChild prints. The
-// example children print the same line, but keep their own literal — examples
-// are intentionally self-contained — so a change to either side must be
-// mirrored: a drifted prefix is a silent scanner hang, not an error.
-const readyPrefix = "ready: "
 
 // readyErr waits for TunnelReady with a deadline, returning an error when the
 // tunnel dies first (Done) or never readies within d. waitReady is the

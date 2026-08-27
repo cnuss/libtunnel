@@ -81,8 +81,7 @@ Three tiers, each with a distinct job — don't blur them:
   specs or fakes, however elaborate. Includes fuzz targets, the godoc
   examples in `v1/example_test.go`, and the spec-handoff scenarios at the
   repo root (`lib_test.go` — re-exec'd children adopting fabricated specs,
-  no network). The live end of the handoff is `TestLiveSpecHandoff` in
-  `e2e/`.
+  no network).
 - **`examples/`** — real-world, simple-ish API usage written for humans. An
   example demonstrates; it never asserts. Assertion logic belongs in `e2e/`.
 - **`e2e/`** — **live tunnels only**, skipped under `-short` (`make test`)

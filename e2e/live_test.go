@@ -3,21 +3,18 @@ package e2e_test
 // Live scenario tests: real quick tunnels against the Cloudflare edge, run by
 // `make e2e` (skipped under -short; on CI only the linux/amd64 cell runs
 // them — see the tier-selection block in util_test.go). These are
-// deliberately complicated — origin restarts, process kills, concurrent
-// tunnels — and not meant for human consumption; the examples stay simple.
+// deliberately complicated — origin restarts, streaming relays, launcher
+// subprocesses — and not meant for human consumption; the examples stay
+// simple.
 //
-// The quick-tunnel API and edge provisioning are burst-sensitive, so the tests
-// are stingy with mints: preflight mints ONE spec and every SHARE test adopts it
-// (gateLive), reconnecting a fresh connector to that one hostname in sequence.
-// Only scenarios that own a hostname's whole lifecycle mint their own
-// (gateLiveOwnSpec): TestLiveHandoff (parent mints, children are killed and
-// resurrected) and TestLiveTwoTunnels (two distinct hostnames). The SHARE
-// tests run first and contiguous so the preflight spec stays continuously
-// connected (well inside its ~5min idle TTL); the OWN tests run last, where
-// preflight GC is moot. This all REQUIRES serial execution (no t.Parallel):
-// one connector at a time on the shared hostname. Sticky-route release
-// between sequential SHARE connectors is paced by gateLive and ridden out by
-// the retrying body/warmup polls.
+// The quick-tunnel API and edge provisioning are burst-sensitive, so the
+// tests are stingy with mints: preflight mints ONE spec and every test
+// adopts it (gateLive), reconnecting a fresh connector to that one hostname
+// in sequence — a full run costs no fresh hostnames beyond the preflight's
+// (itself reclaimed across runs via the CI spec cache). This REQUIRES serial
+// execution (no t.Parallel): one connector at a time on the shared hostname.
+// Sticky-route release between sequential connectors is paced by gateLive
+// and ridden out by the retrying body/warmup polls.
 
 import (
 	"bufio"
@@ -348,165 +345,4 @@ func TestLiveLocalURL(t *testing.T) {
 			}
 		}
 	})
-}
-
-// spawnServeChild re-execs anchorTest with the live-serve-child role serving
-// body, waits for the child's ready line, and returns the URL that line
-// carried plus a kill func. The child inherits this process's environment,
-// LIBTUNNEL_SPEC included — that inheritance is the spec handoff under test.
-func spawnServeChild(t *testing.T, anchorTest, body string) (ready string, kill func()) {
-	t.Helper()
-	cmd := reexec(anchorTest, roleEnv+"=live-serve-child", "LIBTUNNEL_E2E_BODY="+body)
-	cmd.Stderr = os.Stderr
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		line := scanner.Text()
-		t.Logf("child[%s]: %s", body, line)
-		if u, ok := strings.CutPrefix(line, readyPrefix); ok {
-			return u, func() { cmd.Process.Kill(); cmd.Wait() }
-		}
-	}
-	cmd.Wait()
-	t.Fatalf("child[%s] exited before the tunnel became ready (scan err: %v)", body, scanner.Err())
-	return "", nil
-}
-
-// TestLiveHandoff is the canonical parent→child spec handoff (promoted from
-// the old examples/subprocess) and its strongest form — resurrection — on ONE
-// mint. The parent mints a spec and never connects: minting exports
-// LIBTUNNEL_SPEC into this process's environment, so spawned children inherit
-// the tunnel identity with no plumbing at all. Generation one provides the
-// listener, connects, and serves — the parent reaches it through the very
-// hostname it minted. It is then killed, and generation two reuses the same
-// spec: the same hostname serves again after its connector died ungracefully.
-// Needs its own spec lifecycle: reusing the shared preflight hostname risks a
-// sticky "530 origin unregistered" long after a new connector registers.
-func TestLiveHandoff(t *testing.T) {
-	if role() == "live-serve-child" {
-		liveServeChild()
-		return
-	}
-	gateLiveOwnSpec(t) // owns its hostname's lifecycle; mints its own spec
-
-	hostname := libtunnel.New(libtunnel.Cloudflare()).Hostname()
-	if hostname == "" {
-		t.Fatal("failed to mint a spec")
-	}
-	t.Logf("minted: %s", hostname)
-	pub := "https://" + hostname + "/"
-
-	ready, kill1 := spawnServeChild(t, "TestLiveHandoff", "generation one")
-	childURL, err := url.Parse(ready)
-	if err != nil {
-		t.Fatalf("child ready line %q is not a URL: %v", ready, err)
-	}
-	if childURL.Hostname() != hostname {
-		t.Errorf("child connected under %q, want the parent's minted hostname %q",
-			childURL.Hostname(), hostname)
-	}
-	eventuallyBody(t, pub, "generation one", 90*time.Second)
-	kill1()
-
-	_, kill2 := spawnServeChild(t, "TestLiveHandoff", "generation two")
-	defer kill2()
-	eventuallyBody(t, pub, "generation two", 90*time.Second)
-}
-
-// liveServeChild adopts LIBTUNNEL_SPEC, serves LIBTUNNEL_E2E_BODY, reports
-// readiness, and blocks until killed.
-func liveServeChild() {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		fmt.Printf("listen: %v\n", err)
-		os.Exit(3)
-	}
-	// Logged: this child is spawned by TestLiveHandoff, whose only view of
-	// a readiness failure is whatever the child wrote before exiting.
-	conn := libtunnel.New(libtunnel.Cloudflare()).
-		WithLogger(slog.Default()).
-		WithListener(l)
-	serveBody(conn.Listener(), os.Getenv("LIBTUNNEL_E2E_BODY"))
-	select {
-	case <-conn.TunnelReady():
-	case <-conn.Done():
-		fmt.Printf("tunnel failed: %v\n", conn.Err())
-		os.Exit(3)
-	case <-time.After(30 * time.Second):
-		fmt.Println("tunnel never became ready")
-		os.Exit(3)
-	}
-	fmt.Printf("%s%s\n", readyPrefix, conn.URL())
-	select {} // serve until the parent kills us
-}
-
-// TestLiveTwoTunnels runs two tunnels in one process concurrently — the only
-// place collisions in cloudflared's global state (the prometheus registerer
-// swap, etc.) could surface. The second tunnel binds an unspecified address,
-// covering the LocalIP outbound-route fallback in the same mints.
-func TestLiveTwoTunnels(t *testing.T) {
-	gateLiveOwnSpec(t) // needs two distinct hostnames; mints its own
-	// Two concurrent mints must not share reclaim hints: one scoped cache dir
-	// would hand both mints the same reclaimable hostname (crosstalk), so this
-	// scenario alone keeps a throwaway dir and pays two fresh mints per run.
-	t.Setenv(v1.CacheDirEnv, t.TempDir())
-
-	cases := []struct {
-		bind string
-		body string
-	}{
-		{"127.0.0.1:0", "tunnel alpha"},
-		{":0", "tunnel beta"},
-	}
-
-	var wg sync.WaitGroup
-	errs := make(chan error, len(cases))
-	for _, tc := range cases {
-		wg.Add(1)
-		go func(bind, body string) {
-			defer wg.Done()
-			l, err := net.Listen("tcp", bind)
-			if err != nil {
-				errs <- err
-				return
-			}
-			defer l.Close()
-			// Logged, and tagged: two tunnels resolve concurrently here, so an
-			// untagged line cannot be attributed to either.
-			tun := libtunnel.New(libtunnel.Cloudflare()).
-				WithLogger(slog.Default().With("tunnel", body))
-			conn := tun.WithListener(l)
-			serveBody(conn.Listener(), body)
-
-			if ip := tun.LocalIP(); ip == nil || ip.IsUnspecified() {
-				errs <- fmt.Errorf("%s: LocalIP() = %v, want a concrete IP", body, ip)
-				return
-			}
-
-			// 60s, not the usual 30s: with the self-export guard both tunnels
-			// always mint for real, and two simultaneous mints can draw a
-			// rate-limit backoff before the connect + DNS wait even starts.
-			if err := readyErr(conn, 60*time.Second); err != nil {
-				errs <- fmt.Errorf("%s: %w", body, err)
-				return
-			}
-			// Retry briefly: TunnelReady proves a public resolver sees the
-			// hostname, but this host's own resolver can lag a few seconds.
-			if err := eventuallyBodyErr(conn.URL().String(), body, 90*time.Second); err != nil {
-				errs <- fmt.Errorf("%s: %w", body, err)
-				return
-			}
-		}(tc.bind, tc.body)
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
-	}
 }
