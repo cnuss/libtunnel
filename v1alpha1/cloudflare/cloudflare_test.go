@@ -599,6 +599,7 @@ func TestMultiOriginRouting(t *testing.T) {
 		cookie   string // inbound sticky cookie value; "" = none
 		referer  string // Referer header; a bare path is prefixed with base
 		dest     string // Sec-Fetch-Dest header; "" = not sent
+		upgrade  bool   // send a WebSocket handshake's Upgrade/Connection pair
 		wantBody string // "<origin name>|<forwarded raw query>"
 		wantSet  string // expected Set-Cookie value; "" = no Set-Cookie
 	}{
@@ -626,6 +627,15 @@ func TestMultiOriginRouting(t *testing.T) {
 		// would fight over it).
 		"iframeExplicitNoSticky":   {path: "/?1", dest: "iframe", wantBody: "B|"},
 		"documentExplicitStickies": {path: "/?1", dest: "document", wantBody: "B|", wantSet: "1"},
+
+		// A WebSocket handshake carries no Sec-Fetch-Dest at all, which the
+		// sticky-cookie branch used to read as "a top-level navigation" (the
+		// empty case is there for curl and pre-2020 browsers). A socket is
+		// not a navigation: it must route on its own ?n but leave the
+		// tab-wide cookie alone, or the last socket to connect re-pins every
+		// later parameter-less request (#159).
+		"websocketExplicitNoSticky": {path: "/sock?1", upgrade: true, wantBody: "B|"},
+		"websocketFollowsCookie":    {path: "/sock", cookie: "1", upgrade: true, wantBody: "B|"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			req, err := http.NewRequest("GET", base+tc.path, nil)
@@ -644,6 +654,10 @@ func TestMultiOriginRouting(t *testing.T) {
 			}
 			if tc.dest != "" {
 				req.Header.Set("Sec-Fetch-Dest", tc.dest)
+			}
+			if tc.upgrade {
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
 			}
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {

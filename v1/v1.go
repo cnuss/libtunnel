@@ -86,6 +86,16 @@ const (
 	// The cache also holds latest.spec.json — the most recent mint — whose
 	// fields seed the next mint's reclaim hints, so a provider that reaps
 	// idle tunnels can hand the same tunnel back instead of minting fresh.
+	//
+	// Unset, a mint also leaves that hint in the working directory as
+	// libtunnel.local (with libtunnel.owner.local beside it), so a service
+	// restarted from the same directory reclaims its own hostname instead of
+	// racing whatever else was minted on the machine that day. Both are mode
+	// 0600 and both are credentials: keep them untracked — the names fall
+	// under the "*.local" line most gitignore templates already carry. A
+	// read-only working directory is not an error; the mint falls back to the
+	// cache dir. Setting this variable is a deliberate statement about where
+	// specs live, so it turns the working-directory hint off entirely.
 	CacheDirEnv = "LIBTUNNEL_CACHE_DIR"
 )
 
@@ -336,6 +346,18 @@ type Tunnel interface {
 	// clicks inside a routed page. Out-of-range indexes fall back to u[0];
 	// parameters with values (?1=foo) are application data, never routing.
 	// Local-side getters (LocalURL, LocalIP, LocalPort) derive from u[0].
+	//
+	// A WebSocket cannot be routed this way unless the page asks for it. A
+	// handshake carries no Referer — it is not in the handshake header set —
+	// so a socket opened without the parameter falls through to the sticky
+	// cookie, which is per-browser rather than per-tab or per-iframe. A page
+	// you control can carry the index itself (new WebSocket("/sock" +
+	// location.search)); a third-party dev server's socket (HMR, a notebook
+	// kernel, a live-reload channel) cannot be told to, and reaches u[0] or
+	// wherever the cookie last pointed. Routing a socket without the app's
+	// cooperation needs an address the browser inherits on its own — a
+	// hostname per origin — which is a backend capability, not something
+	// this proxy can synthesize. A handshake never writes the cookie.
 	//
 	// The origin is provided exactly once — see WithListener, including the
 	// LIBTUNNEL_LOCAL_URL environment override, which supersedes these
