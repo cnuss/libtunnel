@@ -195,6 +195,9 @@ func preflight() error {
 		// provider reads latest.spec.json for reclaim hints, so a CI-cache
 		// restore turns this mint into a reclaim of the previous run's
 		// tunnel.
+		// URL is left unset so the provider resolves its endpoint from
+		// v1.CloudflareProviderEnv — the variable each CI provider cell sets,
+		// and the same one the tunnels under test read.
 		qt := cloudflare.QuickTunnel()
 		qt.Log = slog.Default()
 		preflightSpec, preflightErr = qt.Spec(ctx)
@@ -265,13 +268,19 @@ func waitReady(t *testing.T, conn v1.Tunnel, d time.Duration) {
 // early lookup.
 var edgeAddrs = []string{"104.16.230.132:443", "104.16.231.132:443"}
 
-// dialEdge dials one of edgeAddrs for any :443 destination, falling back to a
-// normal resolve-and-dial (covering both a non-edge URL and the day the
-// anycast addresses move).
+// edgeZone is the hostname suffix edgeAddrs serve. A tunnel minted from
+// another provider (api.trycloudflare.com) lands on a hostname these
+// addresses were never measured against, so it resolves normally rather than
+// riding an assumption about which anycast set answers for it.
+const edgeZone = ".tunneled.pizza"
+
+// dialEdge dials one of edgeAddrs for a :443 destination in edgeZone, falling
+// back to a normal resolve-and-dial (covering another provider's hostname, a
+// non-edge URL, and the day the anycast addresses move).
 func dialEdge(ctx context.Context, network, addr string) (net.Conn, error) {
 	var d net.Dialer
 	var edgeErr error
-	if _, port, err := net.SplitHostPort(addr); err == nil && port == "443" {
+	if host, port, err := net.SplitHostPort(addr); err == nil && port == "443" && strings.HasSuffix(host, edgeZone) {
 		for _, edge := range edgeAddrs {
 			conn, err := d.DialContext(ctx, network, edge)
 			if err == nil {

@@ -124,6 +124,16 @@ Easy to get wrong from the diff alone:
   tunnel) over the full live suite. A `served: error code: 1033`
   from a fresh tunnel is edge route propagation lag (more likely with
   several tunnels minted at once) — rerun before suspecting the code.
+- **Two mint providers run live.** The matrix carries a `provider` dimension
+  (`LIBTUNNEL__CLOUDFLARE_PROVIDER`): the six standard cells use
+  `tunnel.pizza`, and one extra linux/amd64 cell runs the whole live suite
+  against `api.trycloudflare.com`, so a change is exercised against both
+  endpoints in every PR. That cell's check context carries the provider name,
+  which keeps it out of branch protection's required list on purpose — a bad
+  day at a third-party endpoint shouldn't block a merge. Its mints are always
+  fresh: the reclaim hints `latest.spec.json` seeds are a `tunnel.pizza`
+  extension. The spec cache key includes the provider, so one provider's
+  credentials are never offered to another.
 - **cloudflared registers prometheus collectors globally.** The Cloudflare
   engine swaps `prometheus.DefaultRegisterer` to a noop (under a mutex) for
   the construction window so host applications' metrics stay clean. Don't

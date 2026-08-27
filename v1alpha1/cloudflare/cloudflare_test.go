@@ -974,6 +974,46 @@ func TestQuickTunnelSuccess(t *testing.T) {
 	}
 }
 
+// TestQuickTunnelHonorsProviderEnv pins the env mirror on the direct provider
+// path: v1.CloudflareProviderEnv names the mint host for a QuickTunnelProvider
+// constructed on its own, exactly as it does for one the Backend builds — the
+// endpoint is synthesized from the host, and a value carrying a scheme is used
+// verbatim. An explicitly set URL is the test seam and still wins.
+func TestQuickTunnelHonorsProviderEnv(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path != "/tunnel" {
+			t.Errorf("path = %q, want /tunnel (synthesized from the host)", r.URL.Path)
+		}
+		w.Write([]byte(specJSON))
+	}))
+	defer srv.Close()
+
+	// The env value carries a scheme, so it is used verbatim — minus the
+	// path, which the provider appends.
+	t.Setenv(v1.CloudflareProviderEnv, srv.URL+"/tunnel")
+	if _, err := QuickTunnel().Spec(context.Background()); err != nil {
+		t.Fatalf("Spec with %s set: %v", v1.CloudflareProviderEnv, err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("env endpoint called %d times, want 1", got)
+	}
+
+	// An explicit URL is the seam callers and tests set directly; it wins
+	// over the environment.
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(specJSON))
+	}))
+	defer other.Close()
+	if _, err := (&QuickTunnelProvider{URL: other.URL}).Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("env endpoint called %d times after an explicit URL, want 1", got)
+	}
+}
+
 func TestQuickTunnelRetriesAfter429(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
