@@ -134,30 +134,38 @@ jobs:
       # The spec cache persists the minting cells' specs across runs: a
       # restored cache dir seeds each mint's reclaim hints — the shared
       # latest.spec.json for the preflight, and the scoped subdirs the suite
-      # keeps per own-spec scenario and per example (#147) — so the run
-      # reclaims the previous run's tunnels instead of minting fresh (#142).
-      # Keyed per cell (a shared spec would put concurrent connectors with
-      # different origins on one hostname — crosstalk) and per ref (a PR run
-      # and a main push overlap in time; sharing a spec across them has the
-      # same problem, so each ref works its own tunnel). The key is static:
-      # run 1 saves, later runs exact-hit and skip the save, which is fine
-      # while the specs never change — tunnel.pizza reclaims reaped tunnels
-      # indefinitely, so the same specs keep working. The trade: cache
-      # entries are immutable, so if a reclaim is ever refused (fresh mint,
-      # new spec) the entry cannot self-update — `gh cache delete` the key to
-      # heal it. The os list mirrors the e2e package's minting cells — the
-      # only cells with a spec worth keeping.
+      # keeps per example (#147) — so the run reclaims the previous run's
+      # tunnels instead of minting fresh (#142).
       #
-      # The key carries the provider as well as the cell: a spec is only a
-      # reclaim hint for the provider that minted it, and seeding one
-      # provider's mint with another's id/name/secret would both fail to
-      # reclaim and hand a third party credentials it has no business seeing.
+      # Keyed per cell (a shared spec would put concurrent connectors with
+      # different origins on one hostname — crosstalk), per ref (a PR run and
+      # a main push overlap in time; sharing a spec across them has the same
+      # problem, so each ref works its own tunnel), per provider (a spec is a
+      # reclaim hint only for the provider that minted it, and offering one
+      # provider's id/name/secret to another both fails to reclaim and hands
+      # a third party credentials it has no business seeing), and per run.
+      #
+      # The run id is what keeps the entry fresh. A cache entry is immutable
+      # and actions/cache skips the save on an exact hit, so a static key is
+      # written once and frozen: the spec inside ages, the provider stops
+      # honoring it as a reclaim hint, and every later run mints fresh with
+      # no way to self-heal. That was the observed steady state (#155) — a
+      # day-old entry restored on every run while all three hostnames came
+      # back new. Appending the run id makes each run save its own entry, and
+      # restore-keys falls back to the newest one sharing the prefix, so the
+      # spec offered for reclaim is minutes old instead of days. The entries
+      # are ~1 KB and GitHub evicts them by age and total size on its own.
+      #
+      # The os list mirrors the e2e package's minting cells — the only cells
+      # with a spec worth keeping.
       - name: spec cache
         if: contains(fromJSON('["ubuntu-24.04", "windows-2025", "macos-26"]'), matrix.os)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/libtunnel-cache
-          key: libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-${{ matrix.provider }}
+          key: libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-${{ matrix.provider }}-${{ github.run_id }}
+          restore-keys: |
+            libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-${{ matrix.provider }}-
 
       - name: e2e
         env:
