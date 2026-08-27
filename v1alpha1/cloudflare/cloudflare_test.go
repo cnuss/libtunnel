@@ -550,23 +550,128 @@ func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
 	}
 }
 
-// mustProxy interposes the reverse-proxy shim in front of srv and returns the
-// http:// base URL a client dials.
-func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server) string {
+// mustProxy interposes the reverse-proxy shim in front of the origin servers
+// (multiple origins get the ?n routing behavior) and returns the http:// base
+// URL a client dials.
+func mustProxy(t *testing.T, ctx context.Context, srvs ...*httptest.Server) string {
 	t.Helper()
-	origin, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse origin url: %v", err)
+	origins := make([]*url.URL, len(srvs))
+	for i, srv := range srvs {
+		origin, err := url.Parse(srv.URL)
+		if err != nil {
+			t.Fatalf("parse origin url: %v", err)
+		}
+		origins[i] = origin
 	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ps := &http.Server{Handler: newOriginProxy(origin, logger, originTransport(origin))}
+	ps := &http.Server{Handler: newOriginProxy(origins, logger, originTransport(origins))}
 	context.AfterFunc(ctx, func() { ps.Close() })
 	go ps.Serve(l)
 	return "http://" + l.Addr().String()
+}
+
+// TestMultiOriginRouting pins the multi-URL routing contract on the reverse
+// proxy: a bare numeric query param (?n, empty value) routes the request to
+// origins[n] and sets the sticky cookie; the sticky cookie routes param-less
+// requests; the routing param never reaches the origin; anything out of
+// range, non-numeric, or carrying a value falls through to origins[0].
+func TestMultiOriginRouting(t *testing.T) {
+	newEcho := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "%s|%s", name, r.URL.RawQuery)
+		}))
+	}
+	a, b := newEcho("A"), newEcho("B")
+	defer a.Close()
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	base := mustProxy(t, ctx, a, b)
+
+	for name, tc := range map[string]struct {
+		path     string
+		cookie   string // inbound sticky cookie value; "" = none
+		wantBody string // "<origin name>|<forwarded raw query>"
+		wantSet  string // expected Set-Cookie value; "" = no Set-Cookie
+	}{
+		"naked":                  {path: "/", wantBody: "A|"},
+		"explicitSecond":         {path: "/?1", wantBody: "B|", wantSet: "1"},
+		"explicitKeepsOthers":    {path: "/?1&x=y", wantBody: "B|x=y", wantSet: "1"},
+		"valuedParamNotRouting":  {path: "/?1=foo", wantBody: "A|1=foo"},
+		"nonNumericNotRouting":   {path: "/?abc", wantBody: "A|abc"},
+		"stickyCookie":           {path: "/", cookie: "1", wantBody: "B|"},
+		"explicitBeatsCookie":    {path: "/?0", cookie: "1", wantBody: "A|", wantSet: "0"},
+		"outOfRangeFallsBack":    {path: "/?9", wantBody: "A|", wantSet: "0"},
+		"garbageCookieFallsBack": {path: "/", cookie: "x", wantBody: "A|"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", base+tc.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.cookie != "" {
+				req.AddCookie(&http.Cookie{Name: originCookie, Value: tc.cookie})
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != tc.wantBody {
+				t.Errorf("body = %q, want %q", body, tc.wantBody)
+			}
+			gotSet := ""
+			for _, c := range resp.Cookies() {
+				if c.Name == originCookie {
+					gotSet = c.Value
+				}
+			}
+			if gotSet != tc.wantSet {
+				t.Errorf("Set-Cookie %s = %q, want %q", originCookie, gotSet, tc.wantSet)
+			}
+		})
+	}
+}
+
+// TestSingleOriginIgnoresRoutingParams pins the single-URL fast path: no
+// query inspection, no cookie — a bare numeric param is application data and
+// forwards verbatim, exactly the pre-multi-URL behavior.
+func TestSingleOriginIgnoresRoutingParams(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "solo|%s", r.URL.RawQuery)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	base := mustProxy(t, ctx, srv)
+
+	resp, err := http.Get(base + "/?1&x=y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "solo|1&x=y" {
+		t.Errorf("body = %q, want %q (query forwarded verbatim)", body, "solo|1&x=y")
+	}
+	for _, c := range resp.Cookies() {
+		if c.Name == originCookie {
+			t.Errorf("unexpected Set-Cookie %s=%s on a single-origin proxy", c.Name, c.Value)
+		}
+	}
 }
 
 func qint(r *http.Request, key string, def int) int {

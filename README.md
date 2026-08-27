@@ -13,9 +13,11 @@ backend — Cloudflare quick tunnels first, driven entirely in-process (no
 
 The API is pure-lazy: every getter resolves on first use, and the edge
 connection starts on first demand — `WithListener` provides the origin
-listener explicitly, `WithLocalURL` points at an already-running local origin
-instead (the `cloudflared tunnel --url` shape), and `Listener`, `URL`, and
-`TunnelReady` mint a loopback listener if no origin was provided.
+listener explicitly, `WithLocalURL` points at one or more already-running
+local origins instead (the `cloudflared tunnel --url` shape; extra origins are
+reachable per request via a bare `?n` query parameter with a sticky cookie),
+and `Listener`, `URL`, and `TunnelReady` mint a loopback listener if no origin
+was provided.
 Configuration is write-once: each `With*` mutator takes effect at most once
 and is a no-op after its value is fixed, whether by an earlier call or by the
 tunnel's first use of the default.
@@ -118,9 +120,11 @@ type Tunnel interface {
     WithLogger(log *slog.Logger) Tunnel      // default: silent
     WithContext(ctx context.Context) Tunnel  // URL waits end-to-end, honors ctx
     WithListener(l net.Listener) Tunnel      // bring your own listener
-    WithLocalURL(u *url.URL) Tunnel          // attach to a running local origin
+    WithLocalURL(u ...*url.URL) Tunnel       // attach to running local origins
                                              // (http://localhost:1234); mutually
-                                             // exclusive with WithListener
+                                             // exclusive with WithListener; u[0]
+                                             // is the default, ?n routes to u[n]
+                                             // (sticky cookie, param dropped)
 
     // hook requests in front of the origin proxy; layerable, not write-once
     WithInterceptor(interceptor Interceptor) Tunnel

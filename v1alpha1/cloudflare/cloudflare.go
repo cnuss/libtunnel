@@ -19,6 +19,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -627,20 +628,20 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 	if b.tls {
 		scheme = "https"
 	}
-	return b.connect(t, fmt.Sprintf("%s://%s", scheme, l.Addr().String()))
+	return b.connect(t, []*url.URL{{Scheme: scheme, Host: l.Addr().String()}})
 }
 
-// WithLocalURL dials the Cloudflare edge and proxies it onto an
-// already-running local origin. The URL arrives validated and reduced to
-// scheme+host by the core, so its scheme — not WithTLS — declares how the
-// origin is dialed.
-func (b *Backend) WithLocalURL(t *v1alpha1.TunnelImpl[*Spec], u *url.URL) error {
-	return b.connect(t, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
+// WithLocalURL dials the Cloudflare edge and proxies it onto already-running
+// local origins. The URLs arrive validated and reduced to scheme+host by the
+// core, so each scheme — not WithTLS — declares how that origin is dialed.
+func (b *Backend) WithLocalURL(t *v1alpha1.TunnelImpl[*Spec], urls []*url.URL) error {
+	return b.connect(t, urls)
 }
 
 // connect is the shared engine body behind WithListener and WithLocalURL:
-// service is the cloudflared ingress service URL the edge proxies to.
-func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
+// originURLs are the local services the edge proxies to — originURLs[0] the
+// default, the rest reachable via ?n routing (see newOriginProxy).
+func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) error {
 	if b.envErr != nil {
 		return b.envErr
 	}
@@ -650,15 +651,11 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	// listens on a plain TCP socket), so the ingress service is rewritten to
 	// http regardless of the origin's scheme — a leftover https would make
 	// cloudflared TLS-dial the plaintext proxy → 502.
-	origin, err := url.Parse(service)
-	if err != nil {
-		return fmt.Errorf("reverse proxy: %w", err)
-	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("reverse proxy: %w", err)
 	}
-	transport := originTransport(origin)
+	transport := originTransport(originURLs)
 	// Wire runtime state onto the backend: reconnected feeds the supervisor's
 	// external-control channel (see NewSupervisor below), edgeUp counts Connected
 	// events via the Observer sink, reconnectCtx is the tunnel context, and
@@ -668,7 +665,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edgeUp = newEdgeUpWatcher()
 	b.reconnectCtx = t.Context()
-	b.proxy = newOriginProxy(origin, t.Logger(), transport)
+	b.proxy = newOriginProxy(originURLs, t.Logger(), transport)
 	b.listener = l
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Intercept(v1alpha1.NewInterceptCtx(b, w, r))(w, r)
@@ -676,8 +673,8 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], service string) error {
 	srv := &http.Server{Handler: handler}
 	context.AfterFunc(t.Context(), func() { srv.Close() })
 	go srv.Serve(l)
-	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origin", origin.Redacted())
-	service = (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
+	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origins", originURLs)
+	service := (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
 	ctx := t.Context()
 	log := zerologger(t.Logger())
 	spec := t.Spec()
@@ -886,15 +883,59 @@ const edgeBlockedHint = "your machine/network is getting its egress UDP to port 
 	"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/ " +
 	"(WithEdge relays the edge through a port that is allowed)"
 
-// newOriginProxy builds the reverse proxy that always fronts the origin (see
-// connect, which serves it on a plaintext listener cloudflared dials). When the
+// newOriginProxy builds the reverse proxy that always fronts the origins (see
+// connect, which serves it on a plaintext listener cloudflared dials). When an
 // origin scheme is https the Transport dials it over TLS with InsecureSkipVerify,
 // matching the engine's always-off origin verification. Every response is
 // relayed verbatim — status, headers, body untouched.
-func newOriginProxy(origin *url.URL, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
-	return &httputil.ReverseProxy{
+//
+// With more than one origin the proxy routes per request: a bare numeric query
+// parameter (?n, empty value) picks originURLs[n], is dropped from the
+// forwarded query, and answers with the sticky originCookie so parameter-less
+// follow-ups (assets, XHR) stay on the same origin; without a parameter an
+// in-range cookie picks the origin. Anything out of range falls back to
+// originURLs[0]. A single origin skips all of it — the pre-routing proxy.
+func newOriginProxy(originURLs []*url.URL, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
+	p := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
+			origin := originURLs[0]
+			if len(originURLs) > 1 {
+				// A segment Atoi accepts is exactly a bare numeric parameter:
+				// valued ones ("1=foo") carry '=' and fail the parse. The first
+				// wins; every routing segment is dropped from the forward.
+				ix, explicit := 0, false
+				kept := make([]string, 0, 4)
+				for seg := range strings.SplitSeq(r.In.URL.RawQuery, "&") {
+					if n, err := strconv.Atoi(seg); err == nil {
+						if !explicit {
+							ix, explicit = n, true
+						}
+						continue
+					}
+					if seg != "" {
+						kept = append(kept, seg)
+					}
+				}
+				if !explicit {
+					if c, err := r.In.Cookie(originCookie); err == nil {
+						if n, err := strconv.Atoi(c.Value); err == nil {
+							ix = n
+						}
+					}
+				}
+				if ix < 0 || ix >= len(originURLs) {
+					ix = 0
+				}
+				origin = originURLs[ix]
+				r.Out.URL.RawQuery = strings.Join(kept, "&")
+				if explicit {
+					// ModifyResponse below answers an explicit pick with the
+					// sticky cookie; the outbound context carries the index over.
+					r.Out = r.Out.WithContext(context.WithValue(r.Out.Context(), stickyCookieKey{}, ix))
+				}
+				log.Debug("routing to origin", "ix", ix, "url", r.In.URL.String())
+			}
 			r.SetURL(origin)
 			// Preserve the inbound Host: the origin (e.g. an apiserver) may key
 			// on it, and the stdlib default would rewrite it to the origin host.
@@ -902,13 +943,34 @@ func newOriginProxy(origin *url.URL, log *slog.Logger, transport http.RoundTripp
 		},
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelDebug),
 	}
+	if len(originURLs) > 1 {
+		p.ModifyResponse = func(resp *http.Response) error {
+			if ix, ok := resp.Request.Context().Value(stickyCookieKey{}).(int); ok {
+				cookie := &http.Cookie{Name: originCookie, Value: strconv.Itoa(ix), Path: "/"}
+				resp.Header.Add("Set-Cookie", cookie.String())
+			}
+			return nil
+		}
+	}
+	return p
 }
 
-// originTransport dials the origin, adding TLS (InsecureSkipVerify, matching the
-// engine's always-off origin verification) when the origin scheme is https.
-func originTransport(origin *url.URL) http.RoundTripper {
-	if origin.Scheme == "https" {
-		return &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+// originCookie is the sticky-routing cookie a multi-origin proxy sets when a
+// request carries an explicit ?n routing parameter (see newOriginProxy).
+const originCookie = "libtunnel-origin"
+
+// stickyCookieKey carries an explicit routing pick from Rewrite to
+// ModifyResponse on the outbound request context.
+type stickyCookieKey struct{}
+
+// originTransport dials the origins, adding TLS (InsecureSkipVerify, matching
+// the engine's always-off origin verification) when any origin scheme is https
+// (the TLS config only engages on https dials, so http origins share it).
+func originTransport(originURLs []*url.URL) http.RoundTripper {
+	for _, u := range originURLs {
+		if u.Scheme == "https" {
+			return &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		}
 	}
 	return http.DefaultTransport
 }

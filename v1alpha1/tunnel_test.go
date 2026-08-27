@@ -26,7 +26,7 @@ import (
 // immediately.
 type fakeEngine struct {
 	got         chan net.Listener
-	gotURL      chan *url.URL
+	gotURL      chan []*url.URL
 	spec        *cloudflare.Spec
 	proxy       *httputil.ReverseProxy
 	listener    net.Listener
@@ -34,7 +34,7 @@ type fakeEngine struct {
 }
 
 func newFakeEngine(spec *cloudflare.Spec) *fakeEngine {
-	return &fakeEngine{got: make(chan net.Listener, 1), gotURL: make(chan *url.URL, 1), spec: spec}
+	return &fakeEngine{got: make(chan net.Listener, 1), gotURL: make(chan []*url.URL, 1), spec: spec}
 }
 
 func (e *fakeEngine) Name() string                                { return "fake" }
@@ -49,8 +49,8 @@ func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l ne
 	e.got <- l
 	return nil
 }
-func (e *fakeEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], u *url.URL) error {
-	e.gotURL <- u
+func (e *fakeEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], urls []*url.URL) error {
+	e.gotURL <- urls
 	return nil
 }
 
@@ -354,8 +354,8 @@ func TestWithLocalURLGettersDeriveFromURL(t *testing.T) {
 
 	select {
 	case got := <-engine.gotURL:
-		if got.String() != "http://127.0.0.1:1234/" {
-			t.Errorf("engine received %v, want http://127.0.0.1:1234/", got)
+		if len(got) != 1 || got[0].String() != "http://127.0.0.1:1234/" {
+			t.Errorf("engine received %v, want [http://127.0.0.1:1234/]", got)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("engine never received the origin URL")
@@ -364,6 +364,71 @@ func TestWithLocalURLGettersDeriveFromURL(t *testing.T) {
 	case l := <-engine.got:
 		t.Errorf("engine received listener %v for a URL origin", l.Addr())
 	default:
+	}
+}
+
+// TestWithLocalURLMultipleGettersUseFirst pins the multi-URL contract: the
+// local getters derive from the first URL (the default origin), and the
+// engine receives every URL, normalized, in argument order.
+func TestWithLocalURLMultipleGettersUseFirst(t *testing.T) {
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	conn := v1alpha1.New(engine).WithLocalURL(
+		&url.URL{Scheme: "http", Host: "127.0.0.1:1234"},
+		&url.URL{Scheme: "https", Host: "127.0.0.1:5678"},
+	)
+
+	if got := conn.LocalPort(); got != 1234 {
+		t.Errorf("LocalPort() = %d, want 1234 (the first URL's port)", got)
+	}
+	if got := conn.LocalURL(); got.String() != "http://127.0.0.1:1234/" {
+		t.Errorf("LocalURL() = %v, want http://127.0.0.1:1234/ (the first URL)", got)
+	}
+
+	select {
+	case got := <-engine.gotURL:
+		want := []string{"http://127.0.0.1:1234/", "https://127.0.0.1:5678/"}
+		if len(got) != len(want) {
+			t.Fatalf("engine received %d URLs, want %d", len(got), len(want))
+		}
+		for i, u := range got {
+			if u.String() != want[i] {
+				t.Errorf("engine URL[%d] = %v, want %v", i, u, want[i])
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine never received the origin URLs")
+	}
+}
+
+// TestWithLocalURLZeroURLsCancels pins eager validation of the variadic form:
+// no URLs is not an origin.
+func TestWithLocalURLZeroURLsCancels(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun.WithLocalURL()
+
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "at least one URL") {
+			t.Errorf("Err() = %v, want the zero-URL validation failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed for a zero-URL WithLocalURL")
+	}
+}
+
+// TestWithLocalURLInvalidSecondCancels pins that every URL is validated, not
+// only the first.
+func TestWithLocalURLInvalidSecondCancels(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"}, nil)
+
+	select {
+	case <-tun.Done():
+		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "http(s) URL") {
+			t.Errorf("Err() = %v, want the URL validation failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed for an invalid second origin URL")
 	}
 }
 
@@ -518,8 +583,8 @@ func TestEnvLocalURLOverridesProvides(t *testing.T) {
 
 			select {
 			case got := <-engine.gotURL:
-				if got.String() != "http://127.0.0.1:4321/" {
-					t.Errorf("engine received %v, want the env override http://127.0.0.1:4321/", got)
+				if len(got) != 1 || got[0].String() != "http://127.0.0.1:4321/" {
+					t.Errorf("engine received %v, want the env override [http://127.0.0.1:4321/]", got)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("engine never received the env origin URL")
@@ -802,7 +867,7 @@ func (failingEngine) Reconnect(context.Context) error               { return nil
 func (failingEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }
-func (failingEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], u *url.URL) error {
+func (failingEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], urls []*url.URL) error {
 	return nil
 }
 

@@ -16,9 +16,10 @@
 //
 // Everything is lazy: New returns immediately, and the edge connection starts
 // on first demand — WithListener provides the origin listener explicitly,
-// WithLocalURL points at an already-running local origin instead (the
-// cloudflared `tunnel --url` shape), and Listener, URL, and TunnelReady mint
-// a loopback listener if no origin was provided.
+// WithLocalURL points at one or more already-running local origins instead
+// (the cloudflared `tunnel --url` shape; extra origins are reachable per
+// request via a bare ?n query parameter with a sticky cookie), and Listener,
+// URL, and TunnelReady mint a loopback listener if no origin was provided.
 //
 //	l, _ := net.Listen("tcp", "127.0.0.1:0")
 //	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)

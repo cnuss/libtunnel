@@ -315,20 +315,32 @@ type Tunnel interface {
 	// WithLocalURL provides the local origin as the URL of an already-running
 	// local service (e.g. http://localhost:1234) and lazily starts the edge
 	// connection — the cloudflared `tunnel --url` shape. Only the scheme and
-	// host are used: the scheme (http or https) declares how the origin is
-	// dialed, superseding the backend's WithTLS (which applies to listener
-	// origins only), and anything else (path, query, user info) is dropped. A
-	// nil URL, a scheme other than http/https, or an empty host cancels the
-	// tunnel.
+	// host of each URL are used: the scheme (http or https) declares how that
+	// origin is dialed, superseding the backend's WithTLS (which applies to
+	// listener origins only), and anything else (path, query, user info) is
+	// dropped. No URLs, a nil URL, a scheme other than http/https, or an
+	// empty host cancels the tunnel.
+	//
+	// One URL is the plain single-origin tunnel. More than one URL shares the
+	// tunnel hostname across origins, routed per request by a bare numeric
+	// query parameter: a request whose query carries ?n with no value (e.g.
+	// https://host/?1, or https://host/path?1&x=y) is proxied to u[n], the
+	// routing parameter is dropped from the forwarded request, and a sticky
+	// cookie pins subsequent parameter-less requests (assets, XHR) to the
+	// same origin — switching back is an explicit ?0. Requests with no
+	// routing parameter and no cookie, or with an out-of-range index, go to
+	// u[0]. Parameters with values (?1=foo) are application data, never
+	// routing. Local-side getters (LocalURL, LocalIP, LocalPort) derive from
+	// u[0].
 	//
 	// The origin is provided exactly once — see WithListener, including the
-	// LIBTUNNEL_LOCAL_URL environment override, which supersedes this
-	// argument too. A URL origin has no tunnel-owned listener: Listener must
-	// not be called (it cancels the tunnel), and Close is not the teardown
-	// path. To shut a URL-origin tunnel down, set a context with WithContext
-	// and cancel it; otherwise it runs until the process exits or the tunnel
-	// fails.
-	WithLocalURL(u *url.URL) Tunnel
+	// LIBTUNNEL_LOCAL_URL environment override, which supersedes these
+	// arguments too (with a single URL). A URL origin has no tunnel-owned
+	// listener: Listener must not be called (it cancels the tunnel), and
+	// Close is not the teardown path. To shut a URL-origin tunnel down, set a
+	// context with WithContext and cancel it; otherwise it runs until the
+	// process exits or the tunnel fails.
+	WithLocalURL(u ...*url.URL) Tunnel
 
 	// WithInterceptor registers an Interceptor (a Match predicate paired with an
 	// InterceptFn) in front of the in-process reverse proxy that fronts the
