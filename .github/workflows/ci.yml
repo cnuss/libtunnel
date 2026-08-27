@@ -21,6 +21,14 @@ concurrency:
 
 jobs:
   ci:
+    # Name a cell by os+go alone on the default provider, so the six required
+    # check contexts keep the names branch protection already lists; a
+    # non-default provider cell appends its provider and is therefore a
+    # distinct, unrequired context — visible in the PR's checks, but a bad day
+    # at a third-party mint endpoint doesn't block a merge. (The truthy branch
+    # of the ternary must be the non-empty string: an empty string is falsy in
+    # GitHub expressions and would fall through to the other side.)
+    name: ci (${{ matrix.os }}, ${{ matrix.go }}${{ matrix.provider != 'tunnel.pizza' && format(', {0}', matrix.provider) || '' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -46,6 +54,24 @@ jobs:
         # the matrix; re-add `min` here — and to the branch-protection
         # required contexts — if floor coverage earns its cost back.
         go: [stable]
+        # The quick-tunnel mint provider, fed to the library through
+        # LIBTUNNEL__CLOUDFLARE_PROVIDER below. Only the live tiers read it,
+        # so the second provider is an `include` cell rather than a second
+        # column: a full cross-product would re-run five identical offline
+        # cells for no signal. It sits in the base matrix as a single value
+        # so every cell names it (check contexts stay uniform), and the
+        # include adds the one cell that exercises Cloudflare's own endpoint
+        # end to end.
+        provider: [tunnel.pizza]
+        include:
+          # Same platform as the scenario-tier cell (linux/amd64), so this
+          # runs the whole live suite — scenarios and examples — against
+          # api.trycloudflare.com. Its mints are fresh every run: the reclaim
+          # hints latest.spec.json seeds are a tunnel.pizza extension that
+          # Cloudflare's endpoint ignores.
+          - os: ubuntu-24.04
+            go: stable
+            provider: api.trycloudflare.com
     defaults:
       run:
         # bash on Windows runners comes from git-for-windows (MSYS) and matches
@@ -121,16 +147,22 @@ jobs:
       # new spec) the entry cannot self-update — `gh cache delete` the key to
       # heal it. The os list mirrors the e2e package's minting cells — the
       # only cells with a spec worth keeping.
+      #
+      # The key carries the provider as well as the cell: a spec is only a
+      # reclaim hint for the provider that minted it, and seeding one
+      # provider's mint with another's id/name/secret would both fail to
+      # reclaim and hand a third party credentials it has no business seeing.
       - name: spec cache
         if: contains(fromJSON('["ubuntu-24.04", "windows-2025", "macos-26"]'), matrix.os)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/libtunnel-cache
-          key: libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}
+          key: libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-${{ matrix.provider }}
 
       - name: e2e
         env:
           LIBTUNNEL_CACHE_DIR: ${{ runner.temp }}/libtunnel-cache
+          LIBTUNNEL__CLOUDFLARE_PROVIDER: ${{ matrix.provider }}
         run: make e2e
 
   # Race detector lane. Separate from the matrix because the detector needs

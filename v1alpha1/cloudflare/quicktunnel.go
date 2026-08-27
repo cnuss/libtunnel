@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -38,7 +39,10 @@ var ErrMintRejected = errors.New("quick tunnel mint rejected")
 type QuickTunnelProvider struct {
 	// URL overrides the quick-tunnel API endpoint (synthesized from WithProvider
 	// / its LIBTUNNEL__CLOUDFLARE_PROVIDER mirror, or set directly in tests).
-	// Empty means the default.
+	// Empty falls back to that environment mirror, then to the default —
+	// unlike every other knob, a URL set here beats the environment, because
+	// it is the seam a caller uses to point this provider at a specific
+	// endpoint (a mock, an alternate API) rather than a configuration knob.
 	URL string
 	// Headers are added to the mint request (WithHeader / its
 	// LIBTUNNEL__CLOUDFLARE_HEADERS mirror, plus the backend's reclaim hints —
@@ -86,7 +90,17 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 
+	// A provider built directly (not through Backend.Provider, which applies
+	// the same variable) still honors the environment mirror — the knob is
+	// documented on v1.CloudflareProviderEnv without qualification, so a
+	// direct QuickTunnel that ignored it would be a silent exception to
+	// "every code knob has an env mirror".
 	endpoint := p.URL
+	if endpoint == "" {
+		if host := os.Getenv(v1.CloudflareProviderEnv); host != "" {
+			endpoint = providerEndpoint(host)
+		}
+	}
 	if endpoint == "" {
 		endpoint = quickTunnelURL
 	}
