@@ -34,8 +34,19 @@ updates:
       - dependency-type: direct
     patterns: ["*"]
     multi-ecosystem-group: deps
+    # Batch security updates (which run outside the version-update stream and
+    # ignore `allow`) into one PR per ecosystem — cross-ecosystem security
+    # grouping isn't supported.
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
 
   - package-ecosystem: github-actions
     directory: "/"
     patterns: ["*"]
     multi-ecosystem-group: deps
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
