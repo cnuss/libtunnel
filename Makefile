@@ -1,4 +1,4 @@
-.PHONY: all check fmt fmt-check vet build windows test e2e run binary dist
+.PHONY: all check fmt fmt-check vet build windows test race e2e run binary dist
 
 # The library is pure Go. Forcing CGO off keeps every build identical across
 # hosts and sidesteps broken toolchains (e.g. windows-11-arm runners ship an
@@ -51,6 +51,13 @@ windows:
 # keeps the e2e package's live cases skipped — the live tier is `make e2e`.
 test:
 	go test -short ./...
+
+# The offline tiers under the race detector — the same lane CI runs, runnable
+# locally to reproduce a CI race find. The recipe-line CGO_ENABLED=1 overrides
+# the global export: the detector links through cgo. -short keeps the e2e
+# package's live cases skipped, exactly like `make test`.
+race:
+	CGO_ENABLED=1 go test -race -short ./...
 
 # End-to-end: the harness builds and drives every example binary. -count=1 disables
 # go test caching, since the harness builds the example binaries at runtime and the

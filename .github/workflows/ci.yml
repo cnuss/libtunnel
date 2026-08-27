@@ -149,13 +149,10 @@ jobs:
           cache: true
 
       - name: race tests
-        # Run go directly (not make, which exports CGO_ENABLED=0) with CGO on
-        # so the race detector links. -short keeps the e2e package's live
-        # cases skipped — this lane is about data races in shared package
-        # state, not tunnel behavior.
-        env:
-          CGO_ENABLED: "1"
-        run: go test -race -short ./...
+        # The make target owns the lane's definition (CGO on for the
+        # detector, -short to keep the e2e live cases skipped), so a CI race
+        # find reproduces locally with the same command.
+        run: make race
 
   release:
     needs: [ci, race]

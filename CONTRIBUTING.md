@@ -63,6 +63,7 @@ Requires Go 1.26 or later (cloudflared's floor).
 git clone https://github.com/cnuss/libtunnel.git
 cd libtunnel
 make test   # library unit + fuzz tests (fast, in-package; -short skips live)
+make race   # offline tiers under the race detector (the CI race lane, locally)
 make e2e    # live tier: real tunnels (no -short); on CI, narrowed per platform
 ```
 
