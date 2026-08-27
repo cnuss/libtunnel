@@ -422,20 +422,17 @@ make run serve-tls
 ## Testing
 
 ```sh
-make test   # library unit + fuzz tests (fast, in-package)
-make e2e    # live tier: real tunnels through the real edge (gated)
+make test   # library unit + fuzz tests (fast, in-package; -short skips live)
+make e2e    # live tier: real tunnels through the real edge
 ```
 
 `make e2e` runs `go test -count=1 -v ./e2e`. The `-count=1` defeats the test
 cache, since the harness builds the example binaries at runtime and the cache
 key wouldn't otherwise pick up example source changes. The e2e tier is live
-tunnels only — everything mints from `tunnel.pizza` (rate-limited),
-so the whole tier is skipped unless you opt in (offline spec-handoff
-coverage lives in the unit tier and always runs):
-
-```sh
-LIBTUNNEL_E2E_LIVE=1 make e2e
-```
+tunnels only — everything mints from `tunnel.pizza` (rate-limited), so the
+live cases skip under `-short` (which `make test` passes; offline
+spec-handoff coverage lives in the unit tier and always runs), and on CI each
+platform runs at most one live tier (see `e2e/util_test.go`).
 
 ## Contributing
 

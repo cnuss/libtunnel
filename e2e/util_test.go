@@ -24,6 +24,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,11 +84,10 @@ func gateLive(t *testing.T) {
 // gateLiveOwnSpec is gateLive for the few scenarios that must mint their own
 // identity: it scrubs any inherited LIBTUNNEL_SPEC so the tunnel mints a fresh
 // hostname rather than adopting the shared preflight spec. Used by
-// TestLiveResurrection (kills and resurrects a connector on its own hostname —
-// reusing the shared one risks a sticky 530 after unregister),
-// TestLiveSpecHandoff (the parent-side mint is half its scenario, and its
-// child gets killed too), and TestLiveTwoTunnels (needs two distinct
-// hostnames).
+// TestLiveHandoff (kills and resurrects connectors on its own hostname —
+// reusing the shared one risks a sticky 530 after unregister, and the
+// parent-side mint is half its scenario) and TestLiveTwoTunnels (needs two
+// distinct hostnames).
 func gateLiveOwnSpec(t *testing.T) {
 	t.Helper()
 	gateLiveBare(t)
@@ -96,15 +97,110 @@ func gateLiveOwnSpec(t *testing.T) {
 	// otherwise seed this mint's reclaim hints and hand back the very tunnel
 	// these scenarios must not share. (In-process the library already skips
 	// self-cached specs; this also isolates from the restored cross-run one.)
-	t.Setenv(v1.CacheDirEnv, t.TempDir())
+	// The dir is scoped to the test, not throwaway: a fresh hostname per run
+	// is how the live tier blew through mint limits (#147).
+	t.Setenv(v1.CacheDirEnv, scopedCacheDir(t, "own-"+t.Name()))
 }
 
-// gateLiveBare is the shared gate — enable check, preflight, pace — behind both
-// gateLive (adopt the shared spec) and gateLiveOwnSpec (mint your own).
+// scopedCacheDir is a persistent spec-cache dir scoped to name under the
+// suite's cache base: isolated from the shared latest.spec.json (so its user
+// never adopts the preflight tunnel) but stable across runs — via the CI
+// spec cache — so its own previous mint seeds reclaim hints and the hostname
+// is reused instead of leaked. Falls back to a throwaway dir when no cache
+// base is configured or the subdir can't be made.
+func scopedCacheDir(t *testing.T, name string) string {
+	base := os.Getenv(v1.CacheDirEnv)
+	if base == "" {
+		return t.TempDir()
+	}
+	dir := filepath.Join(base, name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Logf("scoped cache dir %s: %v (using a throwaway)", dir, err)
+		return t.TempDir()
+	}
+	return dir
+}
+
+// Tier selection (#147): no env opt-in — the -short flag draws the line. The
+// unit lane (`make test`, and CI's race lane) passes -short and stays
+// offline; `make e2e` runs without it and goes live. On CI (the standard
+// CI=true env) the tests below narrow further by platform, keeping every
+// scrap of tier logic out of the workflow: the full scenario tier runs on
+// one cell — linux/amd64 — and the examples tier on one variant of each OS
+// family, so every family still mints a real tunnel without every cell
+// running the whole suite; the other cells skip all live work. Off CI
+// nothing is narrowed, so a developer's `make e2e` runs everything.
+
+func onCI() bool { return os.Getenv("CI") == "true" }
+
+// scenarioCell reports whether this platform runs the live scenario tier.
+func scenarioCell() bool {
+	return !onCI() || (runtime.GOOS == "linux" && runtime.GOARCH == "amd64")
+}
+
+// exampleCell reports whether this platform runs the live examples tier —
+// one variant per OS family (the CI spec-cache step keys off the same
+// three cells).
+func exampleCell() bool {
+	if !onCI() {
+		return true
+	}
+	switch runtime.GOOS + "/" + runtime.GOARCH {
+	case "linux/amd64", "windows/amd64", "darwin/arm64":
+		return true
+	}
+	return false
+}
+
+// skipUnlessLive holds the gates every live case shares: -short (the unit
+// lane must stay offline) and Dependabot PRs (dependency bumps can't change
+// tunnel behavior, and their mints burn the provider's concurrency budget —
+// and flake on its incidents — for nothing).
+func skipUnlessLive(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("live case (mints a real quick tunnel); run without -short (make e2e)")
+	}
+	if dependabotRun() {
+		t.Skip("Dependabot PR: dependency bumps can't change tunnel behavior; skipping live mints")
+	}
+}
+
+// dependabotRun reports whether this CI run belongs to a Dependabot PR. The
+// event payload is the only place the PR author lives — GITHUB_ACTOR reports
+// whoever clicked rerun, so gating on it would let a human rerun go live —
+// and on push events the payload has no pull_request, so pushes always run
+// live.
+func dependabotRun() bool {
+	path := os.Getenv("GITHUB_EVENT_PATH")
+	if path == "" {
+		return false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var ev struct {
+		PullRequest struct {
+			User struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		} `json:"pull_request"`
+	}
+	if json.Unmarshal(raw, &ev) != nil {
+		return false
+	}
+	return ev.PullRequest.User.Login == "dependabot[bot]"
+}
+
+// gateLiveBare is the shared gate — live check, tier check, preflight, pace —
+// behind both gateLive (adopt the shared spec) and gateLiveOwnSpec (mint your
+// own).
 func gateLiveBare(t *testing.T) {
 	t.Helper()
-	if os.Getenv("LIBTUNNEL_E2E_LIVE") != "1" {
-		t.Skip("live scenario (mints a real quick tunnel); set LIBTUNNEL_E2E_LIVE=1 to run")
+	skipUnlessLive(t)
+	if !scenarioCell() {
+		t.Skip("live scenario tier runs on one CI cell (linux/amd64); this cell runs at most the examples tier (#147)")
 	}
 	if err := preflight(); err != nil {
 		t.Fatalf("live preflight failed (skipping the expensive part): %v", err)
@@ -351,13 +447,19 @@ func drain(t *testing.T, conn v1.Tunnel, cancel context.CancelFunc) {
 // `{"type":"ADDED","object":{"seq":N,"ts":"<RFC3339Nano>","pad":"..."}}` event
 // per interval and flushes each — the exact shape a plain tunneled.pizza edge
 // buffers. Query params tune the stream: n (event count), ms (interval), pad
-// (filler bytes per event), since (first seq, so a reconnect resumes). The
-// returned counter tracks requests carrying probe=watch, so a test can assert
-// the session shim shielded the origin to exactly one request across reconnects.
+// (filler bytes per event), since (first seq, so a reconnect resumes). GET
+// /body answers a fixed string, so the one tunnel TestLiveLocalURL puts in
+// front of this origin covers the plain round trip too. The returned counter
+// tracks requests carrying probe=watch, so a test can assert the session shim
+// shielded the origin to exactly one request across reconnects.
 func startWatchOrigin(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 	hits := new(atomic.Int64)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/body" {
+			fmt.Fprint(w, "hello via local URL")
+			return
+		}
 		if r.URL.Path != "/watch" {
 			http.NotFound(w, r)
 			return
