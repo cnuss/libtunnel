@@ -10,11 +10,21 @@
 #     - dependency-name: example.com/some/dep
 #       update-types: [version-update:semver-minor, version-update:semver-patch]
 version: 2
+
+# One weekly PR spanning both ecosystems (gomod + github-actions), instead of
+# one PR per ecosystem. The group owns the schedule; each update block joins
+# via multi-ecosystem-group. Note: the old per-ecosystem gomod group kept
+# majors as individual PRs (update-types: [minor, patch]); multi-ecosystem
+# groups document no update-types filter, so majors may now ride the grouped
+# PR — watch the first run and split the config back if that bites.
+multi-ecosystem-groups:
+  deps:
+    schedule:
+      interval: weekly
+
 updates:
   - package-ecosystem: gomod
     directory: "/"
-    schedule:
-      interval: weekly
     # Only bump direct dependencies. The indirect graph floats with the direct
     # dep that requires it, so bumping indirect modules on their own is churn
     # that drifts them out of step with their requirer. Security updates still
@@ -22,20 +32,21 @@ updates:
     # unaffected.
     allow:
       - dependency-type: direct
-    # Batch routine bumps into one PR; majors stay individual so each
-    # compatibility-affecting change (and the module floor it implies) is
-    # reviewed on its own. Go has no dev/prod dependency split, so the only
-    # meaningful grouping axis is update-type.
+    patterns: ["*"]
+    multi-ecosystem-group: deps
+    # Batch security updates (which run outside the version-update stream and
+    # ignore `allow`) into one PR per ecosystem — cross-ecosystem security
+    # grouping isn't supported.
     groups:
-      go-deps:
+      security:
+        applies-to: security-updates
         patterns: ["*"]
-        update-types: [minor, patch]
 
   - package-ecosystem: github-actions
     directory: "/"
-    schedule:
-      interval: weekly
-    # Action pins are low-risk to batch; group everything into one PR.
+    patterns: ["*"]
+    multi-ecosystem-group: deps
     groups:
-      github-actions:
+      security:
+        applies-to: security-updates
         patterns: ["*"]

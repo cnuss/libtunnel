@@ -165,28 +165,38 @@ func (t *TunnelImpl[T]) Intercept(ctx v1.InterceptCtx) http.HandlerFunc {
 	return ctx.Handler()
 }
 
-// WithLocalURL provides the local origin as the URL of an already-running
-// local service and lazily starts the edge connection — the cloudflared
-// `tunnel --url` shape. Only the scheme and host are kept: the scheme (http
-// or https) declares how the origin is dialed, superseding the backend's
-// WithTLS, and path/query/user info are dropped. A nil URL, a scheme other
-// than http/https, or an empty host cancels the tunnel.
+// WithLocalURL provides the local origin as the URL(s) of already-running
+// local services and lazily starts the edge connection — the cloudflared
+// `tunnel --url` shape. Only the scheme and host of each URL are kept: the
+// scheme (http or https) declares how that origin is dialed, superseding the
+// backend's WithTLS, and path/query/user info are dropped. No URLs, a nil
+// URL, a scheme other than http/https, or an empty host cancels the tunnel.
+// urls[0] is the default origin; more than one URL adds per-request ?n
+// routing in the engine's reverse proxy (see v1.Tunnel.WithLocalURL).
 //
 // The origin is provided exactly once, shared with WithListener and the
 // start-trigger mint (see WithListener).
-func (t *TunnelImpl[T]) WithLocalURL(u *url.URL) v1.Tunnel {
+func (t *TunnelImpl[T]) WithLocalURL(urls ...*url.URL) v1.Tunnel {
 	provided := false
 	t.originOnce.Do(func() {
 		provided = true
 		if t.provideFromEnv() {
 			return
 		}
-		normalized, err := normalizeLocalURL(u)
-		if err != nil {
-			t.cancel(fmt.Errorf("WithLocalURL: %w", err))
+		if len(urls) == 0 {
+			t.cancel(fmt.Errorf("WithLocalURL: at least one URL is required"))
 			return
 		}
-		t.provideURL(normalized)
+		normalized := make([]*url.URL, len(urls))
+		for i, u := range urls {
+			n, err := normalizeLocalURL(u)
+			if err != nil {
+				t.cancel(fmt.Errorf("WithLocalURL: %w", err))
+				return
+			}
+			normalized[i] = n
+		}
+		t.provideURLs(normalized)
 	})
 	if !provided {
 		t.cancel(fmt.Errorf("WithLocalURL: origin already provided"))
@@ -223,7 +233,7 @@ func (t *TunnelImpl[T]) provideFromEnv() bool {
 		return true
 	}
 	t.Logger().Info("local origin overridden from the environment", "var", v1.LocalURLEnv, "url", parsed.String())
-	t.provideURL(parsed)
+	t.provideURLs([]*url.URL{parsed})
 	return true
 }
 
@@ -248,15 +258,16 @@ func (t *TunnelImpl[T]) provide(l net.Listener, minted bool) {
 	t.start(func() error { return t.engine.WithListener(t, l) })
 }
 
-// provideURL adopts u (already validated and reduced to scheme+host+"/") as
-// the local origin and starts the edge connection — provide's counterpart for
-// URL origins. It runs inside the caller's originOnce.Do, so exactly once.
-func (t *TunnelImpl[T]) provideURL(u *url.URL) {
-	t.Logger().Info("configuring tunnel with local origin URL", "url", u.String())
-	t.localURL = u
+// provideURLs adopts urls (each already validated and reduced to
+// scheme+host+"/", at least one) as the local origin and starts the edge
+// connection — provide's counterpart for URL origins. It runs inside the
+// caller's originOnce.Do, so exactly once.
+func (t *TunnelImpl[T]) provideURLs(urls []*url.URL) {
+	t.Logger().Info("configuring tunnel with local origin URLs", "urls", urls)
+	t.localURLs = urls
 	close(t.originProvided)
 
-	t.start(func() error { return t.engine.WithLocalURL(t, u) })
+	t.start(func() error { return t.engine.WithLocalURL(t, urls) })
 }
 
 // start runs the connect sequence in the background: mint the spec, dial the
@@ -337,17 +348,20 @@ func (t *TunnelImpl[T]) ensureOrigin() {
 	})
 }
 
-// originURL blocks until an origin is provided and returns the URL it was
-// provided as — nil for a listener origin, or for a tunnel canceled first.
-// The local-side getters branch on it before touching the listener.
+// originURL blocks until an origin is provided and returns the default (first)
+// URL it was provided as — nil for a listener origin, or for a tunnel canceled
+// first. The local-side getters branch on it before touching the listener.
 func (t *TunnelImpl[T]) originURL() *url.URL {
-	// The localURL field is only safe to read once originProvided is closed
+	// The localURLs field is only safe to read once originProvided is closed
 	// (the close is the happens-before edge for the write), so a cancellation
 	// wake returns nil instead of reading the field.
 	if !await(t.ctx, t.originProvided) {
 		return nil
 	}
-	return t.localURL
+	if len(t.localURLs) == 0 {
+		return nil
+	}
+	return t.localURLs[0]
 }
 
 // boundListener blocks until a listener is provided (via WithListener or a

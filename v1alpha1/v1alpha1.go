@@ -49,10 +49,12 @@ type Engine[T v1.Spec] interface {
 	// nil and the hostname resolves publicly.
 	WithListener(t *TunnelImpl[T], l net.Listener) error
 	// WithLocalURL is WithListener's counterpart for URL origins: the core
-	// hands down the validated origin URL (scheme http/https, host set, path
-	// "/") when the tunnel's WithLocalURL fires. Same contract — invoked
-	// once, in its own goroutine, blocking until the edge connection is up.
-	WithLocalURL(t *TunnelImpl[T], u *url.URL) error
+	// hands down the validated origin URLs (each scheme http/https, host set,
+	// path "/", at least one) when the tunnel's WithLocalURL fires. urls[0]
+	// is the default origin; more than one URL asks the engine for per-request
+	// routing (see v1.Tunnel.WithLocalURL). Same contract — invoked once, in
+	// its own goroutine, blocking until the edge connection is up.
+	WithLocalURL(t *TunnelImpl[T], urls []*url.URL) error
 }
 
 // New returns an unstarted tunnel for the given backend, which also supplies
@@ -126,12 +128,12 @@ type TunnelImpl[T v1.Spec] struct {
 
 	// originOnce guards the one-time origin provide: the first WithListener,
 	// WithLocalURL, or start-trigger mint wins and sets exactly one of
-	// listener / localURL; a later provide of either kind is a double-provide
+	// listener / localURLs; a later provide of either kind is a double-provide
 	// and cancels the tunnel. The originProvided close is the happens-before
 	// edge for reading both fields.
 	originOnce     sync.Once
 	listener       net.Listener
-	localURL       *url.URL
+	localURLs      []*url.URL
 	originProvided chan struct{}
 
 	// userCtxOnce fixes userCtx: the first WithContext wins; a URL read
