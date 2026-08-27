@@ -980,7 +980,12 @@ func originRedirect(n int, next http.Handler) http.Handler {
 		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
 			(dest == "document" || dest == "iframe" || dest == "frame") {
 			if _, explicit := bareIndex(r.URL.RawQuery); !explicit {
-				if ix, ok := refererIndex(r); ok {
+				// A path opening "//" (or "/\", which browsers normalize to
+				// it) would echo into Location as a scheme-relative absolute
+				// URL — an open redirect off the tunnel host. Those
+				// navigations proxy un-canonicalized.
+				if ix, ok := refererIndex(r); ok &&
+					!strings.HasPrefix(r.URL.Path, "//") && !strings.HasPrefix(r.URL.Path, "/\\") {
 					u := *r.URL
 					if u.RawQuery != "" {
 						u.RawQuery += "&"

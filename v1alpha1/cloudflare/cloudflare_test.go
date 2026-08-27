@@ -710,6 +710,12 @@ func TestMultiOriginRedirect(t *testing.T) {
 		"noDestNoRedirect":     {method: "GET", path: "/page2?x=y", referer: "/?1", dest: "", wantStatus: 200, wantBody: "B|x=y"},
 		"postNoRedirect":       {method: "POST", path: "/submit", referer: "/?1", dest: "document", wantStatus: 200, wantBody: "B|"},
 		"noRefererNoRedirect":  {method: "GET", path: "/page2", referer: "", dest: "document", wantStatus: 200, wantBody: "A|"},
+
+		// A path opening "//" (or the backslash variant browsers normalize to
+		// it) would echo into Location as a scheme-relative absolute URL — an
+		// open redirect. Those navigations proxy un-canonicalized instead.
+		"schemeRelativeNoRedirect": {method: "GET", path: "//evil.example/x", referer: "/?1", dest: "document", wantStatus: 200, wantBody: "B|"},
+		"backslashNoRedirect":      {method: "GET", path: "/\\evil.example/x", referer: "/?1", dest: "document", wantStatus: 200, wantBody: "B|"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			req, err := http.NewRequest(tc.method, base+tc.path, nil)
