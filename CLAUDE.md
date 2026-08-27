@@ -51,12 +51,9 @@ REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 
     gh api -X PUT repos/$REPO/branches/main/protection --input - <<'JSON'
     {"required_status_checks":{"strict":true,"contexts":[
-       "ci (ubuntu-24.04, min)","ci (ubuntu-24.04, stable)",
-       "ci (windows-2025, min)","ci (windows-2025, stable)",
-       "ci (ubuntu-24.04-arm, min)","ci (ubuntu-24.04-arm, stable)",
-       "ci (windows-11-arm, min)","ci (windows-11-arm, stable)",
-       "ci (macos-26-intel, min)","ci (macos-26-intel, stable)",
-       "ci (macos-26, min)","ci (macos-26, stable)"]},
+       "ci (ubuntu-24.04, stable)","ci (windows-2025, stable)",
+       "ci (ubuntu-24.04-arm, stable)","ci (windows-11-arm, stable)",
+       "ci (macos-26-intel, stable)","ci (macos-26, stable)"]},
      "enforce_admins":true,"required_pull_request_reviews":null,"restrictions":null,
      "allow_force_pushes":false,"allow_deletions":false}
     JSON

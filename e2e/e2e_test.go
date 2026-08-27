@@ -58,13 +58,15 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 	// Both names: v1.LogEnv is what the library reads, LIBTUNNEL_LOG_LEVEL what
 	// serve-tls checks to build its own logger.
 	//
-	// Each example gets its own empty spec cache: a child is a fresh process,
-	// so an inherited cache dir would let its mint read the suite's (or a
-	// previous example's) latest.spec.json and reclaim that tunnel — putting
-	// this example on a hostname whose dead connectors still hold sticky
-	// edge routes. Examples must mint their own tunnels, as they always did.
+	// Each example gets its own spec cache: a child is a fresh process, so an
+	// inherited cache dir would let its mint read the suite's (or another
+	// example's) latest.spec.json and reclaim that tunnel — putting this
+	// example on a hostname whose dead connectors still hold sticky edge
+	// routes. Scoped, not throwaway (#147): the example's own previous mint
+	// persists via the CI spec cache, so the next run reclaims the same
+	// hostname instead of leaking a fresh one.
 	cmd.Env = append(os.Environ(), v1.LogEnv+"=debug", "LIBTUNNEL_LOG_LEVEL=debug",
-		v1.CacheDirEnv+"="+t.TempDir())
+		v1.CacheDirEnv+"="+scopedCacheDir(t, "example-"+r.name))
 	out, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {
@@ -101,7 +103,7 @@ func TestExamples(t *testing.T) {
 	cases := []struct {
 		name   string
 		want   string
-		live   bool                           // mints a real tunnel; gated behind LIBTUNNEL_E2E_LIVE=1
+		live   bool                           // mints a real tunnel; skipped under -short (see skipUnlessLive)
 		verify func(t *testing.T, out string) // optional deeper assertions on the same run
 	}{
 		{"serve", "served: hello from libtunnel", true, nil},
@@ -111,8 +113,9 @@ func TestExamples(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.live {
-				if os.Getenv("LIBTUNNEL_E2E_LIVE") != "1" {
-					t.Skip("live example (mints a real quick tunnel); set LIBTUNNEL_E2E_LIVE=1 to run")
+				skipUnlessLive(t)
+				if !exampleCell() {
+					t.Skip("live examples tier runs on one CI cell per OS family (#147)")
 				}
 				// No t.Parallel, and paced: live cases mint real tunnels,
 				// and burst minting invites 429s and edge-propagation races.

@@ -62,8 +62,8 @@ Requires Go 1.26 or later (cloudflared's floor).
 ```sh
 git clone https://github.com/cnuss/libtunnel.git
 cd libtunnel
-make test   # library unit + fuzz tests (fast, in-package)
-make e2e    # live tier: real tunnels; skipped unless LIBTUNNEL_E2E_LIVE=1
+make test   # library unit + fuzz tests (fast, in-package; -short skips live)
+make e2e    # live tier: real tunnels (no -short); on CI, narrowed per platform
 ```
 
 Run a specific example locally:
@@ -81,11 +81,10 @@ Three tiers, each with a distinct job — don't blur them:
   specs or fakes, however elaborate. Includes fuzz targets, the godoc
   examples in `v1/example_test.go`, and the spec-handoff scenarios at the
   repo root (`lib_test.go` — re-exec'd children adopting fabricated specs,
-  no network). The live end of the handoff is `TestLiveSpecHandoff` in
-  `e2e/`.
+  no network).
 - **`examples/`** — real-world, simple-ish API usage written for humans. An
   example demonstrates; it never asserts. Assertion logic belongs in `e2e/`.
-- **`e2e/`** — **live tunnels only**, gated behind `LIBTUNNEL_E2E_LIVE=1`
+- **`e2e/`** — **live tunnels only**, skipped under `-short` (`make test`)
   and not meant for human consumption. The harness builds and runs the
   example binaries against the real edge and asserts on their output, plus
   live scenario tests (shared-tunnel subtests, TLS origin, resurrection,
@@ -114,12 +113,14 @@ Easy to get wrong from the diff alone:
   example names (`Example_handoff` etc.). See [`v1/example_test.go`](./v1/example_test.go).
 - **e2e builds binaries at runtime**, so the test cache can't see example
   source changes — `make e2e` passes `-count=1` to force a rebuild.
-- **Live examples are gated.** `serve` and `serve-tls` mint real tunnels from
-  `tunnel.pizza`, which rate-limits — minting from all 12 CI matrix
-  cells would trip 429s, so one stable-Go cell per OS (ubuntu-24.04,
-  windows-2025, macos-26) sets `LIBTUNNEL_E2E_LIVE=1` and the rest skip the
-  live tier. For local verification, prefer `make run serve` (one tunnel)
-  over the full live suite. A `served: error code: 1033`
+- **Live cases are gated in the tests, not the workflow.** `serve` and
+  `serve-tls` mint real tunnels from `tunnel.pizza`, which rate-limits —
+  minting from every CI matrix cell would trip 429s, so the e2e package
+  narrows itself on CI (#147): the full scenario tier runs on linux/amd64
+  only, the examples tier on one variant per OS family, and everything live
+  skips under `-short` and on Dependabot PRs (see the tier-selection block in
+  `e2e/util_test.go`). For local verification, prefer `make run serve` (one
+  tunnel) over the full live suite. A `served: error code: 1033`
   from a fresh tunnel is edge route propagation lag (more likely with
   several tunnels minted at once) — rerun before suspecting the code.
 - **cloudflared registers prometheus collectors globally.** The Cloudflare
@@ -144,7 +145,7 @@ example is copy-pasteable on its own).
 Print a single recognizable line so the e2e harness can assert on it, then add
 a row to the `cases` table in `e2e/e2e_test.go` (name + expected substring) and
 to the README's example table. Mark the case `live: true` if it mints a real
-tunnel — those only run under `LIBTUNNEL_E2E_LIVE=1`.
+tunnel — those skip under `-short` and off their CI cells.
 
 ## Branch / PR flow
 
