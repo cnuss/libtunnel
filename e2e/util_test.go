@@ -65,23 +65,30 @@ func gateLive(t *testing.T) {
 	adoptPreflightSpec(t)
 }
 
-// scopedCacheDir is a persistent spec-cache dir scoped to name under the
-// suite's cache base: isolated from the shared latest.spec.json (so its user
-// never adopts the preflight tunnel) but stable across runs — via the CI
-// spec cache — so its own previous mint seeds reclaim hints and the hostname
-// is reused instead of leaked. Falls back to a throwaway dir when no cache
-// base is configured or the subdir can't be made.
-func scopedCacheDir(t *testing.T, name string) string {
-	base := os.Getenv(v1.CacheDirEnv)
-	if base == "" {
-		return t.TempDir()
-	}
-	dir := filepath.Join(base, name)
+// hintsDir is where per-process working directories live: a subdirectory of
+// the suite's own (this package's source dir, since that is a test binary's
+// working directory). It is named to fall under the "*.local" gitignore line
+// the hint files themselves use, because that is exactly what it holds.
+const hintsDir = "hints.local"
+
+// workDir returns a persistent working directory scoped to name, for a child
+// process that should keep its own project hint (#158) rather than share the
+// suite's. Persistent, not throwaway: CI caches this tree, so the child's
+// previous mint seeds its reclaim hints and it reuses its hostname instead of
+// leaking a fresh one every run. Falls back to a throwaway when the directory
+// cannot be made — a read-only checkout costs mints, not a failed run.
+func workDir(t *testing.T, name string) string {
+	dir := filepath.Join(hintsDir, name)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Logf("scoped cache dir %s: %v (using a throwaway)", dir, err)
+		t.Logf("work dir %s: %v (using a throwaway)", dir, err)
 		return t.TempDir()
 	}
-	return dir
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Logf("work dir %s: %v (using a throwaway)", dir, err)
+		return t.TempDir()
+	}
+	return abs
 }
 
 // Tier selection (#147): no env opt-in — the -short flag draws the line. The

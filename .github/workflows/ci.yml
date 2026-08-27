@@ -131,11 +131,15 @@ jobs:
       # `served: error code: 1033` failure here is edge route propagation
       # lag, not code — rerun the job.
       #
-      # The spec cache persists the minting cells' specs across runs: a
-      # restored cache dir seeds each mint's reclaim hints — the shared
-      # latest.spec.json for the preflight, and the scoped subdirs the suite
-      # keeps per example (#147) — so the run reclaims the previous run's
-      # tunnels instead of minting fresh (#142).
+      # The spec cache persists the minting cells' hints across runs, so a run
+      # reclaims the previous run's tunnels instead of minting fresh (#142).
+      # The paths are the project-scoped hints libtunnel writes into the
+      # working directory (#158) — e2e/libtunnel.local for the suite itself
+      # (a test binary's working directory is its package's source dir) and
+      # e2e/hints.local for the per-example child directories. Note what is
+      # NOT set below: LIBTUNNEL_CACHE_DIR would be a deliberate statement
+      # that specs live elsewhere and would switch the project hint off, so
+      # CI would then be caching a mechanism it no longer used.
       #
       # Keyed per cell (a shared spec would put concurrent connectors with
       # different origins on one hostname — crosstalk), per ref (a PR run and
@@ -162,14 +166,16 @@ jobs:
         if: contains(fromJSON('["ubuntu-24.04", "windows-2025", "macos-26"]'), matrix.os)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/libtunnel-cache
+          path: |
+            e2e/libtunnel.local
+            e2e/libtunnel.owner.local
+            e2e/hints.local
           key: libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-${{ matrix.provider }}-${{ github.run_id }}
           restore-keys: |
             libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-${{ matrix.provider }}-
 
       - name: e2e
         env:
-          LIBTUNNEL_CACHE_DIR: ${{ runner.temp }}/libtunnel-cache
           LIBTUNNEL__CLOUDFLARE_PROVIDER: ${{ matrix.provider }}
         run: make e2e
 

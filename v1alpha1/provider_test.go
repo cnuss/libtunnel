@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -582,8 +583,13 @@ func TestCacheSpecWritesProjectHint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("project hint not written: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		t.Errorf("project hint mode = %v, want no group/other access", perm)
+	// Windows has no Unix permission bits: Go synthesizes 0666 for any
+	// writable file whatever mode the write asked for, so the assertion only
+	// means something where the mode is real.
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("project hint mode = %v, want no group/other access", perm)
+		}
 	}
 }
 
