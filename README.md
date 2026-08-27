@@ -15,7 +15,8 @@ The API is pure-lazy: every getter resolves on first use, and the edge
 connection starts on first demand — `WithListener` provides the origin
 listener explicitly, `WithLocalURL` points at one or more already-running
 local origins instead (the `cloudflared tunnel --url` shape; extra origins are
-reachable per request via a bare `?n` query parameter with a sticky cookie),
+reachable per request via a bare `?n` query parameter — assets and iframes
+follow their document URL via Referer, top-level visits stick via cookie),
 and `Listener`, `URL`, and `TunnelReady` mint a loopback listener if no origin
 was provided.
 Configuration is write-once: each `With*` mutator takes effect at most once

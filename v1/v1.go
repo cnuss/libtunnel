@@ -324,14 +324,18 @@ type Tunnel interface {
 	// One URL is the plain single-origin tunnel. More than one URL shares the
 	// tunnel hostname across origins, routed per request by a bare numeric
 	// query parameter: a request whose query carries ?n with no value (e.g.
-	// https://host/?1, or https://host/path?1&x=y) is proxied to u[n], the
-	// routing parameter is dropped from the forwarded request, and a sticky
-	// cookie pins subsequent parameter-less requests (assets, XHR) to the
-	// same origin — switching back is an explicit ?0. Requests with no
-	// routing parameter and no cookie, or with an out-of-range index, go to
-	// u[0]. Parameters with values (?1=foo) are application data, never
-	// routing. Local-side getters (LocalURL, LocalIP, LocalPort) derive from
-	// u[0].
+	// https://host/?1, or https://host/path?1&x=y) is proxied to u[n] and
+	// the routing parameter is dropped from the forwarded request. A
+	// parameter-less request follows, in order: a same-host Referer carrying
+	// the parameter (a routed page's assets, XHR, and iframes follow their
+	// document URL — side-by-side iframes of different origins work in one
+	// tab), then the sticky cookie set by an explicit top-level pick (so an
+	// address-bar follow-up stays put — switching back is an explicit ?0),
+	// then u[0]. A document navigation that resolves via Referer is
+	// redirected to carry the parameter explicitly, so routing survives link
+	// clicks inside a routed page. Out-of-range indexes fall back to u[0];
+	// parameters with values (?1=foo) are application data, never routing.
+	// Local-side getters (LocalURL, LocalIP, LocalPort) derive from u[0].
 	//
 	// The origin is provided exactly once — see WithListener, including the
 	// LIBTUNNEL_LOCAL_URL environment override, which supersedes these

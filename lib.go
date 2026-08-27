@@ -18,7 +18,8 @@
 // on first demand — WithListener provides the origin listener explicitly,
 // WithLocalURL points at one or more already-running local origins instead
 // (the cloudflared `tunnel --url` shape; extra origins are reachable per
-// request via a bare ?n query parameter with a sticky cookie), and Listener,
+// request via a bare ?n query parameter — assets and iframes follow their
+// document URL via Referer, top-level visits stick via cookie), and Listener,
 // URL, and TunnelReady mint a loopback listener if no origin was provided.
 //
 //	l, _ := net.Listen("tcp", "127.0.0.1:0")

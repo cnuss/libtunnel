@@ -667,9 +667,9 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	b.reconnectCtx = t.Context()
 	b.proxy = newOriginProxy(originURLs, t.Logger(), transport)
 	b.listener = l
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := originRedirect(len(originURLs), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Intercept(v1alpha1.NewInterceptCtx(b, w, r))(w, r)
-	})
+	}))
 	srv := &http.Server{Handler: handler}
 	context.AfterFunc(t.Context(), func() { srv.Close() })
 	go srv.Serve(l)
@@ -889,12 +889,16 @@ const edgeBlockedHint = "your machine/network is getting its egress UDP to port 
 // matching the engine's always-off origin verification. Every response is
 // relayed verbatim — status, headers, body untouched.
 //
-// With more than one origin the proxy routes per request: a bare numeric query
-// parameter (?n, empty value) picks originURLs[n], is dropped from the
-// forwarded query, and answers with the sticky originCookie so parameter-less
-// follow-ups (assets, XHR) stay on the same origin; without a parameter an
-// in-range cookie picks the origin. Anything out of range falls back to
-// originURLs[0]. A single origin skips all of it — the pre-routing proxy.
+// With more than one origin the proxy routes per request, resolving the index
+// as: a bare numeric query parameter (?n, empty value, dropped from the
+// forwarded query), else a same-host Referer carrying one (an iframe's or
+// page's subresources follow their document URL — per-tab, no shared state),
+// else the sticky originCookie, else originURLs[0]. An explicit parameter on
+// a top-level navigation answers with the sticky cookie so parameter-less
+// follow-ups (an address-bar visit, a bookmark) stay on the same origin — an
+// iframe's pick does not, or side-by-side iframes would fight over the shared
+// jar. Anything out of range falls back to originURLs[0]. A single origin
+// skips all of it — the pre-routing proxy.
 func newOriginProxy(originURLs []*url.URL, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
 	p := &httputil.ReverseProxy{
 		Transport: transport,
@@ -918,7 +922,9 @@ func newOriginProxy(originURLs []*url.URL, log *slog.Logger, transport http.Roun
 					}
 				}
 				if !explicit {
-					if c, err := r.In.Cookie(originCookie); err == nil {
+					if n, ok := refererIndex(r.In); ok {
+						ix = n
+					} else if c, err := r.In.Cookie(originCookie); err == nil {
 						if n, err := strconv.Atoi(c.Value); err == nil {
 							ix = n
 						}
@@ -929,9 +935,10 @@ func newOriginProxy(originURLs []*url.URL, log *slog.Logger, transport http.Roun
 				}
 				origin = originURLs[ix]
 				r.Out.URL.RawQuery = strings.Join(kept, "&")
-				if explicit {
-					// ModifyResponse below answers an explicit pick with the
-					// sticky cookie; the outbound context carries the index over.
+				if dest := r.In.Header.Get("Sec-Fetch-Dest"); explicit && (dest == "" || dest == "document") {
+					// ModifyResponse below answers an explicit top-level pick
+					// with the sticky cookie; the outbound context carries the
+					// index over.
 					r.Out = r.Out.WithContext(context.WithValue(r.Out.Context(), stickyCookieKey{}, ix))
 				}
 				log.Debug("routing to origin", "ix", ix, "url", r.In.URL.String())
@@ -953,6 +960,62 @@ func newOriginProxy(originURLs []*url.URL, log *slog.Logger, transport http.Roun
 		}
 	}
 	return p
+}
+
+// originRedirect canonicalizes referer-routed navigations onto an explicit ?n
+// URL, defending referer routing against decay: a GET/HEAD document or iframe
+// navigation with no routing parameter of its own but a same-host referer
+// that carries one (a link click inside a routed page) is answered 307 to the
+// same URL plus that parameter. The new document's URL then re-pins the
+// origin, so its own subresources — whose Referer is the new URL — keep
+// routing instead of falling back to the default. Redirected navigations
+// bypass the interceptor pipeline; everything else passes through. A single
+// origin passes everything through.
+func originRedirect(n int, next http.Handler) http.Handler {
+	if n < 2 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dest := r.Header.Get("Sec-Fetch-Dest")
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			(dest == "document" || dest == "iframe" || dest == "frame") {
+			if _, explicit := bareIndex(r.URL.RawQuery); !explicit {
+				if ix, ok := refererIndex(r); ok {
+					u := *r.URL
+					if u.RawQuery != "" {
+						u.RawQuery += "&"
+					}
+					u.RawQuery += strconv.Itoa(ix)
+					http.Redirect(w, r, u.RequestURI(), http.StatusTemporaryRedirect)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// refererIndex resolves the routing index from a same-host Referer header:
+// the document URL of the page (or iframe) the request originates from, whose
+// query carries the bare ?n parameter. A cross-host referer never routes.
+func refererIndex(r *http.Request) (int, bool) {
+	ref, err := url.Parse(r.Header.Get("Referer"))
+	if err != nil || ref.Host != r.Host {
+		return 0, false
+	}
+	return bareIndex(ref.RawQuery)
+}
+
+// bareIndex scans a raw query for the first bare numeric segment — the ?n
+// routing directive. Valued parameters ("1=foo") carry '=' and fail the
+// parse: application data, never routing.
+func bareIndex(rawQuery string) (int, bool) {
+	for seg := range strings.SplitSeq(rawQuery, "&") {
+		if n, err := strconv.Atoi(seg); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // originCookie is the sticky-routing cookie a multi-origin proxy sets when a

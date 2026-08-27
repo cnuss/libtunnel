@@ -568,7 +568,8 @@ func mustProxy(t *testing.T, ctx context.Context, srvs ...*httptest.Server) stri
 		t.Fatalf("listen: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ps := &http.Server{Handler: newOriginProxy(origins, logger, originTransport(origins))}
+	handler := originRedirect(len(origins), newOriginProxy(origins, logger, originTransport(origins)))
+	ps := &http.Server{Handler: handler}
 	context.AfterFunc(ctx, func() { ps.Close() })
 	go ps.Serve(l)
 	return "http://" + l.Addr().String()
@@ -596,6 +597,8 @@ func TestMultiOriginRouting(t *testing.T) {
 	for name, tc := range map[string]struct {
 		path     string
 		cookie   string // inbound sticky cookie value; "" = none
+		referer  string // Referer header; a bare path is prefixed with base
+		dest     string // Sec-Fetch-Dest header; "" = not sent
 		wantBody string // "<origin name>|<forwarded raw query>"
 		wantSet  string // expected Set-Cookie value; "" = no Set-Cookie
 	}{
@@ -608,6 +611,21 @@ func TestMultiOriginRouting(t *testing.T) {
 		"explicitBeatsCookie":    {path: "/?0", cookie: "1", wantBody: "A|", wantSet: "0"},
 		"outOfRangeFallsBack":    {path: "/?9", wantBody: "A|", wantSet: "0"},
 		"garbageCookieFallsBack": {path: "/", cookie: "x", wantBody: "A|"},
+
+		// Referer routing: a same-host referer whose query carries the bare
+		// parameter routes the request — an iframe's (or page's) subresources
+		// follow their document URL without touching the shared cookie.
+		"refererRoutesSubresource": {path: "/asset.js", referer: "/?1", wantBody: "B|"},
+		"refererBeatsCookie":       {path: "/", cookie: "0", referer: "/?1", wantBody: "B|"},
+		"paramBeatsReferer":        {path: "/?0", referer: "/?1", wantBody: "A|", wantSet: "0"},
+		"crossHostRefererIgnored":  {path: "/", referer: "https://evil.example/?1", wantBody: "A|"},
+		"valuedRefererNotRouting":  {path: "/", referer: "/?1=foo", wantBody: "A|"},
+
+		// The sticky cookie is a top-level concern: an explicit pick inside an
+		// iframe must not churn the tab-wide jar (two side-by-side iframes
+		// would fight over it).
+		"iframeExplicitNoSticky":   {path: "/?1", dest: "iframe", wantBody: "B|"},
+		"documentExplicitStickies": {path: "/?1", dest: "document", wantBody: "B|", wantSet: "1"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			req, err := http.NewRequest("GET", base+tc.path, nil)
@@ -616,6 +634,16 @@ func TestMultiOriginRouting(t *testing.T) {
 			}
 			if tc.cookie != "" {
 				req.AddCookie(&http.Cookie{Name: originCookie, Value: tc.cookie})
+			}
+			if tc.referer != "" {
+				ref := tc.referer
+				if !strings.HasPrefix(ref, "http") {
+					ref = base + ref
+				}
+				req.Header.Set("Referer", ref)
+			}
+			if tc.dest != "" {
+				req.Header.Set("Sec-Fetch-Dest", tc.dest)
 			}
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
@@ -642,6 +670,83 @@ func TestMultiOriginRouting(t *testing.T) {
 	}
 }
 
+// TestMultiOriginRedirect pins the canonicalizing redirect that defends
+// referer routing against decay: a GET document/iframe navigation with no
+// routing parameter of its own but a same-host referer that carries one is
+// answered 307 to the same URL plus that parameter — the new document's URL
+// re-pins the origin, so its own subresources keep routing. Everything else
+// passes through to the proxy.
+func TestMultiOriginRedirect(t *testing.T) {
+	newEcho := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "%s|%s", name, r.URL.RawQuery)
+		}))
+	}
+	a, b := newEcho("A"), newEcho("B")
+	defer a.Close()
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	base := mustProxy(t, ctx, a, b)
+
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	for name, tc := range map[string]struct {
+		method       string
+		path         string
+		referer      string // bare path, prefixed with base
+		dest         string
+		wantStatus   int
+		wantLocation string // when redirected
+		wantBody     string // when proxied
+	}{
+		"iframeNavRedirects":   {method: "GET", path: "/page2?x=y", referer: "/?1", dest: "iframe", wantStatus: 307, wantLocation: "/page2?x=y&1"},
+		"documentNavRedirects": {method: "GET", path: "/page2", referer: "/?1", dest: "document", wantStatus: 307, wantLocation: "/page2?1"},
+		"zeroIndexRedirects":   {method: "GET", path: "/page2", referer: "/?0", dest: "iframe", wantStatus: 307, wantLocation: "/page2?0"},
+		"explicitNoRedirect":   {method: "GET", path: "/page2?x=y&1", referer: "/?0", dest: "document", wantStatus: 200, wantBody: "B|x=y"},
+		"noDestNoRedirect":     {method: "GET", path: "/page2?x=y", referer: "/?1", dest: "", wantStatus: 200, wantBody: "B|x=y"},
+		"postNoRedirect":       {method: "POST", path: "/submit", referer: "/?1", dest: "document", wantStatus: 200, wantBody: "B|"},
+		"noRefererNoRedirect":  {method: "GET", path: "/page2", referer: "", dest: "document", wantStatus: 200, wantBody: "A|"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, err := http.NewRequest(tc.method, base+tc.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.referer != "" {
+				req.Header.Set("Referer", base+tc.referer)
+			}
+			if tc.dest != "" {
+				req.Header.Set("Sec-Fetch-Dest", tc.dest)
+			}
+			resp, err := noFollow.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			if tc.wantLocation != "" {
+				if got := resp.Header.Get("Location"); got != tc.wantLocation {
+					t.Errorf("Location = %q, want %q", got, tc.wantLocation)
+				}
+				return
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != tc.wantBody {
+				t.Errorf("body = %q, want %q", body, tc.wantBody)
+			}
+		})
+	}
+}
+
 // TestSingleOriginIgnoresRoutingParams pins the single-URL fast path: no
 // query inspection, no cookie — a bare numeric param is application data and
 // forwards verbatim, exactly the pre-multi-URL behavior.
@@ -655,7 +760,15 @@ func TestSingleOriginIgnoresRoutingParams(t *testing.T) {
 	defer cancel()
 	base := mustProxy(t, ctx, srv)
 
-	resp, err := http.Get(base + "/?1&x=y")
+	// A navigation-shaped request (referer + Sec-Fetch-Dest) must not trigger
+	// the canonicalizing redirect either — single origin has no routing at all.
+	req, err := http.NewRequest("GET", base+"/?1&x=y", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Referer", base+"/?1")
+	req.Header.Set("Sec-Fetch-Dest", "iframe")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
