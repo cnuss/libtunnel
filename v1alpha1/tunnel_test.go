@@ -1137,3 +1137,51 @@ func TestInterceptCtxExposesLevers(t *testing.T) {
 		t.Error("InterceptCtx.Reconnect did not reach the engine")
 	}
 }
+
+// TestWithContextAlreadyCanceledCancelsSynchronously pins the fix for #153: a
+// context that is already done when WithContext receives it cancels the tunnel
+// before WithContext returns, rather than whenever a watcher goroutine happens
+// to be scheduled. The ordering is what start's post-connect guard depends on
+// to keep a dead tunnel from ever reporting ready — and, through that, what
+// keeps URL from handing a URL to a caller who gave up before asking.
+func TestWithContextAlreadyCanceledCancelsSynchronously(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})).
+		WithContext(ctx)
+
+	select {
+	case <-tun.Done():
+	default:
+		t.Fatal("Done() not closed when WithContext returned; a dead context must take effect immediately")
+	}
+	if err := tun.Err(); !errors.Is(err, context.Canceled) {
+		t.Errorf("Err() = %v, want context.Canceled", err)
+	}
+}
+
+// TestWithContextAlreadyCanceledNeverReportsReady is the consequence that
+// matters (#153): with the cancel applied before the tunnel starts, the engine
+// may still "connect" — a fake one does so instantly — but the tunnel must
+// never mark itself ready, so URL has no readiness to race against.
+func TestWithContextAlreadyCanceledNeverReportsReady(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})).
+		WithContext(ctx)
+	conn := tun.WithListener(listen(t))
+
+	// The start goroutine runs Spec, connect, and its guard; give it room to
+	// finish before asserting that it left tunnelReady alone.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-conn.TunnelReady():
+		t.Error("tunnel reported ready despite a context canceled before it started")
+	default:
+	}
+	if u := conn.URL(); u != nil {
+		t.Errorf("URL() = %v, want nil", u)
+	}
+}

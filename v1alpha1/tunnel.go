@@ -41,6 +41,19 @@ func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 	if ctx != nil {
 		t.userCtxOnce.Do(func() {
 			t.userCtx = ctx
+			// A context that is already done takes effect right here, before
+			// the tunnel can start. Left to the watcher below it would land
+			// whenever that goroutine happened to be scheduled, which lets
+			// start's post-connect guard — the checkpoint that keeps a dead
+			// tunnel from ever reporting ready — run first and close
+			// tunnelReady; URL's three-way select then picks uniformly among
+			// ready cases and can hand a URL to a caller who gave up before
+			// asking (#153). Applying it synchronously orders the cancel
+			// before the start, so the guard holds.
+			if ctx.Err() != nil {
+				t.cancel(context.Cause(ctx))
+				return
+			}
 			// Propagate cancellation into the engine context so the caller's
 			// context is a real shutdown handle, not just a cap on URL's wait.
 			// The watcher retires when either context ends, so it never leaks.
