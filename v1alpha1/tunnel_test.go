@@ -1185,3 +1185,103 @@ func TestWithContextAlreadyCanceledNeverReportsReady(t *testing.T) {
 		t.Errorf("URL() = %v, want nil", u)
 	}
 }
+
+// TestWithLocalURLWebSocketMarker pins the +ws origin designation (#159): the
+// suffix rides on the scheme so it cannot drift out of sync with the origin
+// list the way a separate index knob would, the origin is still dialed by its
+// base scheme, and the designated index is what the engine reads to route a
+// handshake that carries no routing parameter of its own.
+func TestWithLocalURLWebSocketMarker(t *testing.T) {
+	for name, scheme := range map[string]string{
+		"httpWs":   "http+ws",
+		"httpWss":  "http+wss",
+		"httpsWs":  "https+ws",
+		"httpsWss": "https+wss",
+	} {
+		t.Run(name, func(t *testing.T) {
+			engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+			tun := v1alpha1.New(engine)
+			tun.WithLocalURL(
+				&url.URL{Scheme: "http", Host: "127.0.0.1:4000"},
+				&url.URL{Scheme: scheme, Host: "127.0.0.1:5173"},
+			)
+
+			// The ws/wss half is a designation, not a transport: the origin is
+			// dialed exactly as its base scheme says.
+			wantBase := "http"
+			if strings.HasPrefix(scheme, "https") {
+				wantBase = "https"
+			}
+			select {
+			case got := <-engine.gotURL:
+				if len(got) != 2 {
+					t.Fatalf("engine received %d URLs, want 2", len(got))
+				}
+				if got[1].Scheme != wantBase {
+					t.Errorf("designated origin scheme = %q, want the base %q", got[1].Scheme, wantBase)
+				}
+				if got[1].Host != "127.0.0.1:5173" {
+					t.Errorf("designated origin host = %q, want 127.0.0.1:5173", got[1].Host)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("engine never received the origin URLs")
+			}
+
+			if ix, ok := tun.WebSocketOrigin(); !ok || ix != 1 {
+				t.Errorf("WebSocketOrigin() = (%d, %t), want (1, true)", ix, ok)
+			}
+		})
+	}
+}
+
+// TestWithLocalURLNoWebSocketMarker pins the default: nothing designated, so
+// the engine keeps guessing exactly as it does today.
+func TestWithLocalURLNoWebSocketMarker(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun.WithLocalURL(
+		&url.URL{Scheme: "http", Host: "127.0.0.1:4000"},
+		&url.URL{Scheme: "http", Host: "127.0.0.1:5173"},
+	)
+	if ix, ok := tun.WebSocketOrigin(); ok {
+		t.Errorf("WebSocketOrigin() = (%d, true), want no designation", ix)
+	}
+}
+
+// TestWithLocalURLTwoWebSocketMarkersCancel pins the parse-time rejection: two
+// socket-owning origins are unroutable however they are spelled, so the
+// failure names both instead of leaving somebody to debug a half-working
+// second app.
+func TestWithLocalURLTwoWebSocketMarkersCancel(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun.WithLocalURL(
+		&url.URL{Scheme: "http+ws", Host: "127.0.0.1:4000"},
+		&url.URL{Scheme: "https+wss", Host: "127.0.0.1:5173"},
+	)
+
+	select {
+	case <-tun.Done():
+		err := tun.Err()
+		if err == nil || !strings.Contains(err.Error(), "127.0.0.1:4000") || !strings.Contains(err.Error(), "127.0.0.1:5173") {
+			t.Errorf("Err() = %v, want both designated origins named", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never closed for two +ws origins")
+	}
+}
+
+// TestWithLocalURLSingleWebSocketMarkerInert pins the single-origin case: with
+// nothing to route between, the marker designates nothing and is accepted
+// rather than treated as a mistake.
+func TestWithLocalURLSingleWebSocketMarkerInert(t *testing.T) {
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	conn := v1alpha1.New(engine).WithLocalURL(&url.URL{Scheme: "http+ws", Host: "127.0.0.1:5173"})
+
+	select {
+	case <-conn.Done():
+		t.Fatalf("tunnel canceled for a lone +ws origin: %v", conn.Err())
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := conn.LocalURL(); got.String() != "http://127.0.0.1:5173/" {
+		t.Errorf("LocalURL() = %v, want the base scheme kept", got)
+	}
+}

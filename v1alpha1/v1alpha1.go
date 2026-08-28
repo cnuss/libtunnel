@@ -75,6 +75,7 @@ func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		originProvided: make(chan struct{}),
 		tunnelReady:    make(chan struct{}),
 		hostnameReady:  make(chan struct{}),
+		wsOrigin:       -1,
 	}
 	// Auto-assigned interceptor Priorities count down from the top of the range.
 	t.autoPriority.Store(math.MaxUint16)
@@ -135,6 +136,10 @@ type TunnelImpl[T v1.Spec] struct {
 	listener       net.Listener
 	localURLs      []*url.URL
 	originProvided chan struct{}
+	// wsOrigin is the index of the origin declared to own WebSockets (the
+	// +ws scheme suffix, #159), or -1 for none. Written under originOnce
+	// beside localURLs, so originProvided is its happens-before edge too.
+	wsOrigin int
 
 	// userCtxOnce fixes userCtx: the first WithContext wins; a URL read
 	// before any WithContext fixes it to nil (unset). Nil means URL waits on
