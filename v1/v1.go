@@ -347,17 +347,27 @@ type Tunnel interface {
 	// parameters with values (?1=foo) are application data, never routing.
 	// Local-side getters (LocalURL, LocalIP, LocalPort) derive from u[0].
 	//
-	// A WebSocket cannot be routed this way unless the page asks for it. A
-	// handshake carries no Referer — it is not in the handshake header set —
-	// so a socket opened without the parameter falls through to the sticky
-	// cookie, which is per-browser rather than per-tab or per-iframe. A page
-	// you control can carry the index itself (new WebSocket("/sock" +
-	// location.search)); a third-party dev server's socket (HMR, a notebook
-	// kernel, a live-reload channel) cannot be told to, and reaches u[0] or
-	// wherever the cookie last pointed. Routing a socket without the app's
-	// cooperation needs an address the browser inherits on its own — a
-	// hostname per origin — which is a backend capability, not something
-	// this proxy can synthesize. A handshake never writes the cookie.
+	// A WebSocket handshake carries no Referer — it is not in the handshake
+	// header set — and no per-tab signal of any kind, so it cannot be routed
+	// from headers alone. A page you control can carry the index itself (new
+	// WebSocket("/sock" + location.search)); a third-party dev server's
+	// socket (HMR, a notebook kernel, a live-reload channel) cannot be told
+	// to. For that case, declare which origin owns WebSockets by marking its
+	// scheme — http+ws, http+wss, https+ws, https+wss:
+	//
+	//	tun.WithLocalURL(api, mustParse("http+ws://localhost:5173"))
+	//
+	// The ws/wss half is ignored: the suffix induces the designation, and the
+	// origin is dialed by its base scheme exactly as an unmarked one is. The
+	// marker rides on the URL rather than a separate index so it cannot drift
+	// out of sync with the origin list. At most one origin may carry it (two
+	// socket-owning origins are unroutable however they are spelled, so that
+	// fails at parse time with both named), it is inert with a single origin,
+	// and it applies only to handshakes. Precedence for a handshake: an
+	// explicit ?n, then the marked origin, then the sticky cookie, then u[0]
+	// — so a page carrying its own index, and every tile of a multiview
+	// panel, is unaffected. A handshake never writes the cookie, and one that
+	// cannot be routed at all is logged at warn rather than failing silently.
 	//
 	// The origin is provided exactly once — see WithListener, including the
 	// LIBTUNNEL_LOCAL_URL environment override, which supersedes these

@@ -201,13 +201,31 @@ func (t *TunnelImpl[T]) WithLocalURL(urls ...*url.URL) v1.Tunnel {
 			return
 		}
 		normalized := make([]*url.URL, len(urls))
+		wsOrigin := -1
 		for i, u := range urls {
-			n, err := normalizeLocalURL(u)
+			n, ws, err := normalizeLocalURL(u)
 			if err != nil {
 				t.cancel(fmt.Errorf("WithLocalURL: %w", err))
 				return
 			}
+			if ws {
+				if wsOrigin >= 0 {
+					// Two socket-owning origins are unroutable however they
+					// are spelled, so say so at parse time with both named
+					// rather than leave somebody debugging a half-working
+					// second app.
+					t.cancel(fmt.Errorf("WithLocalURL: only one origin may be marked +ws, got %s and %s",
+						normalized[wsOrigin].Host, n.Host))
+					return
+				}
+				wsOrigin = i
+			}
 			normalized[i] = n
+		}
+		// A lone origin routes nothing, so the marker designates nothing: inert
+		// rather than an error, since the same URL list is valid either way.
+		if len(normalized) > 1 {
+			t.wsOrigin = wsOrigin
 		}
 		t.provideURLs(normalized)
 	})
@@ -220,11 +238,44 @@ func (t *TunnelImpl[T]) WithLocalURL(urls ...*url.URL) v1.Tunnel {
 // normalizeLocalURL validates a local origin URL and reduces it to
 // scheme+host+"/" — the form provideURL and the engines consume. Shared by
 // WithLocalURL and the v1.LocalURLEnv override.
-func normalizeLocalURL(u *url.URL) (*url.URL, error) {
-	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("origin must be an http(s) URL with a host, got %v", u)
+func normalizeLocalURL(u *url.URL) (*url.URL, bool, error) {
+	if u == nil {
+		return nil, false, fmt.Errorf("origin must be an http(s) URL with a host, got %v", u)
 	}
-	return &url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}, nil
+	scheme, ws := splitWebSocketMarker(u.Scheme)
+	if (scheme != "http" && scheme != "https") || u.Host == "" {
+		return nil, false, fmt.Errorf("origin must be an http(s) URL with a host, got %v", u)
+	}
+	return &url.URL{Scheme: scheme, Host: u.Host, Path: "/"}, ws, nil
+}
+
+// splitWebSocketMarker separates the +ws / +wss suffix that declares an origin
+// as the one owning WebSockets (#159) from the scheme that dials it, reporting
+// whether the marker was present. The ws/wss half is deliberately ignored: the
+// suffix induces a designation, it does not describe transport, so the origin
+// is dialed by its base scheme exactly as an unmarked one is. The marker rides
+// on the scheme rather than sitting in a separate index knob so it cannot
+// drift out of sync with the origin list — reordering the origins moves the
+// designation with them.
+func splitWebSocketMarker(scheme string) (base string, marked bool) {
+	switch {
+	case strings.HasSuffix(scheme, "+wss"):
+		return strings.TrimSuffix(scheme, "+wss"), true
+	case strings.HasSuffix(scheme, "+ws"):
+		return strings.TrimSuffix(scheme, "+ws"), true
+	}
+	return scheme, false
+}
+
+// WebSocketOrigin reports the index of the origin declared to own WebSockets
+// and whether one was declared. It blocks until the origin is provided, like
+// the other origin-derived getters. Exposed for Engine implementations, which
+// route a handshake carrying no routing parameter of its own to it.
+func (t *TunnelImpl[T]) WebSocketOrigin() (int, bool) {
+	if !await(t.ctx, t.originProvided) {
+		return -1, false
+	}
+	return t.wsOrigin, t.wsOrigin >= 0
 }
 
 // provideFromEnv applies the v1.LocalURLEnv override: set, it provides the
@@ -239,7 +290,9 @@ func (t *TunnelImpl[T]) provideFromEnv() bool {
 	}
 	parsed, err := url.Parse(env)
 	if err == nil {
-		parsed, err = normalizeLocalURL(parsed)
+		// The env override is a single origin, so any +ws marker on it is
+		// inert — there is nothing to route between.
+		parsed, _, err = normalizeLocalURL(parsed)
 	}
 	if err != nil {
 		t.cancel(fmt.Errorf("%s: %w", v1.LocalURLEnv, err))

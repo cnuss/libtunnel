@@ -188,13 +188,34 @@ new WebSocket("wss://" + location.host + "/sock" + location.search)
 ```
 
 A third-party dev server's socket (HMR, a notebook kernel, a live-reload
-channel) cannot be told to do that, and will reach `u[0]` or wherever the cookie
-last pointed — the page loads, the socket connects to the wrong origin, and the
-app just looks broken. Routing a socket without the app's cooperation needs an
+channel) cannot be told to do that. For those, declare which origin owns
+WebSockets by marking its scheme — `http+ws`, `http+wss`, `https+ws`,
+`https+wss`:
+
+```go
+vite, _ := url.Parse("http+ws://localhost:5173")
+conn := libtunnel.New(libtunnel.Cloudflare()).WithLocalURL(api, vite)
+```
+
+The `ws`/`wss` half is ignored — the suffix induces the designation, and the
+origin is dialed by its base scheme exactly as an unmarked one is. The marker
+rides on the URL rather than a separate index knob so it cannot drift out of
+sync with the origin list: reorder the origins and the designation moves with
+them. At most one origin may carry it (two socket-owning origins are
+unroutable however they are spelled, so that fails at parse time with both
+named), and it is inert with a single origin.
+
+Precedence for a handshake is `?n` → the marked origin → cookie → `u[0]`: an
+explicit index still wins, so a page carrying its own — and every tile of a
+multiview panel — is unaffected, while an operator-stated fact beats the
+per-browser cookie guess. A handshake never writes the cookie, and a socket
+that cannot be routed at all is logged at warn naming its own fix, rather than
+silently connecting to the wrong origin and leaving the tunnel as the last
+thing anybody suspects.
+
+What this does not fix: two socket-using apps behind one tunnel. That needs an
 address the browser inherits on its own (a hostname per origin), which is a
-backend capability rather than something the proxy can synthesize. A handshake
-never writes the sticky cookie, so at least one socket can no longer re-pin
-every later request.
+backend capability rather than something the proxy can synthesize.
 
 ## Interceptors
 

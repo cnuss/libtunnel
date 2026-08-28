@@ -568,7 +568,7 @@ func mustProxy(t *testing.T, ctx context.Context, srvs ...*httptest.Server) stri
 		t.Fatalf("listen: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := originRedirect(len(origins), newOriginProxy(origins, logger, originTransport(origins)))
+	handler := originRedirect(len(origins), newOriginProxy(origins, -1, logger, originTransport(origins)))
 	ps := &http.Server{Handler: handler}
 	context.AfterFunc(ctx, func() { ps.Close() })
 	go ps.Serve(l)
@@ -1307,4 +1307,132 @@ func TestReconnectTunnelShutdown(t *testing.T) {
 	if err := b.Reconnect(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Reconnect after tunnel shutdown: err = %v, want context.Canceled", err)
 	}
+}
+
+// TestWebSocketOriginRouting pins the +ws designation in the proxy (#159): a
+// handshake carries no Referer and no per-tab signal of any kind, so without a
+// declaration it can only be guessed at. With one, an operator-stated fact
+// beats the per-browser cookie guess — but never an explicit ?n, so a page
+// that carries its own index (and every iframe in a multiview panel) is
+// unaffected. Non-upgrade traffic ignores the designation entirely.
+func TestWebSocketOriginRouting(t *testing.T) {
+	newEcho := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "%s|%s", name, r.URL.RawQuery)
+		}))
+	}
+	a, b := newEcho("A"), newEcho("B")
+	defer a.Close()
+	defer b.Close()
+
+	origins := []*url.URL{mustURL(t, a.URL), mustURL(t, b.URL)}
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// origins[1] owns WebSockets.
+	ps := &http.Server{Handler: originRedirect(len(origins), newOriginProxy(origins, 1, logger, originTransport(origins)))}
+	context.AfterFunc(ctx, func() { ps.Close() })
+	go ps.Serve(l)
+	base := "http://" + l.Addr().String()
+
+	for name, tc := range map[string]struct {
+		path     string
+		cookie   string
+		upgrade  bool
+		wantBody string
+	}{
+		"unroutableSocketGoesToDeclaredOrigin": {path: "/hmr", upgrade: true, wantBody: "B|"},
+		"declarationBeatsCookie":               {path: "/hmr", cookie: "0", upgrade: true, wantBody: "B|"},
+		"explicitIndexBeatsDeclaration":        {path: "/sock?0", upgrade: true, wantBody: "A|"},
+		"plainRequestIgnoresDeclaration":       {path: "/page", wantBody: "A|"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", base+tc.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.cookie != "" {
+				req.AddCookie(&http.Cookie{Name: originCookie, Value: tc.cookie})
+			}
+			if tc.upgrade {
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != tc.wantBody {
+				t.Errorf("body = %q, want %q", body, tc.wantBody)
+			}
+		})
+	}
+}
+
+// TestUnroutableWebSocketWarns pins the diagnosis (#159): with no declaration
+// and nothing to route on, the handshake still falls back to origin 0 — a
+// client explicit enough to be broken by a refusal is working by luck today —
+// but it says so, naming the socket and the fallback. Silence is the worst
+// available failure here: the page loads, the socket connects, the app
+// half-works, and the tunnel is the last thing anybody suspects.
+func TestUnroutableWebSocketWarns(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "origin")
+	}))
+	defer srv.Close()
+	origins := []*url.URL{mustURL(t, srv.URL), mustURL(t, srv.URL)}
+
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ps := &http.Server{Handler: originRedirect(len(origins), newOriginProxy(origins, -1, logger, originTransport(origins)))}
+	context.AfterFunc(ctx, func() { ps.Close() })
+	go ps.Serve(l)
+
+	req, err := http.NewRequest("GET", "http://"+l.Addr().String()+"/hmr", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	got := logs.String()
+	if !strings.Contains(got, "/hmr") {
+		t.Errorf("warning does not name the socket: %q", got)
+	}
+	if !strings.Contains(got, "+ws") {
+		t.Errorf("warning does not name its own fix (+ws): %q", got)
+	}
+}
+
+// mustURL parses a test origin URL.
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }

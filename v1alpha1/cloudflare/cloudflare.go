@@ -665,7 +665,8 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edgeUp = newEdgeUpWatcher()
 	b.reconnectCtx = t.Context()
-	b.proxy = newOriginProxy(originURLs, t.Logger(), transport)
+	wsOrigin, _ := t.WebSocketOrigin()
+	b.proxy = newOriginProxy(originURLs, wsOrigin, t.Logger(), transport)
 	b.listener = l
 	handler := originRedirect(len(originURLs), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Intercept(v1alpha1.NewInterceptCtx(b, w, r))(w, r)
@@ -891,15 +892,21 @@ const edgeBlockedHint = "your machine/network is getting its egress UDP to port 
 //
 // With more than one origin the proxy routes per request, resolving the index
 // as: a bare numeric query parameter (?n, empty value, dropped from the
-// forwarded query), else a same-host Referer carrying one (an iframe's or
-// page's subresources follow their document URL — per-tab, no shared state),
-// else the sticky originCookie, else originURLs[0]. An explicit parameter on
+// forwarded query), else — for a WebSocket handshake — the origin declared to
+// own WebSockets (wsOrigin, the +ws scheme marker, -1 for none), else a
+// same-host Referer carrying one (an iframe's or page's subresources follow
+// their document URL — per-tab, no shared state), else the sticky
+// originCookie, else originURLs[0]. The declaration sits above the cookie
+// deliberately: the cookie is a per-browser guess, the declaration an
+// operator-stated fact, and a fact beats a guess. It sits below an explicit
+// parameter so a page carrying its own index — and every tile of a multiview
+// panel — is unaffected. An explicit parameter on
 // a top-level navigation answers with the sticky cookie so parameter-less
 // follow-ups (an address-bar visit, a bookmark) stay on the same origin — an
 // iframe's pick does not, or side-by-side iframes would fight over the shared
 // jar. Anything out of range falls back to originURLs[0]. A single origin
 // skips all of it — the pre-routing proxy.
-func newOriginProxy(originURLs []*url.URL, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
+func newOriginProxy(originURLs []*url.URL, wsOrigin int, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
 	p := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -921,12 +928,34 @@ func newOriginProxy(originURLs []*url.URL, log *slog.Logger, transport http.Roun
 						kept = append(kept, seg)
 					}
 				}
+				upgrade := r.In.Header.Get("Upgrade") != ""
 				if !explicit {
-					if n, ok := refererIndex(r.In); ok {
+					switch n, ok := refererIndex(r.In); {
+					case upgrade && wsOrigin >= 0:
+						// A handshake carries no Referer and no per-tab signal
+						// of any kind, so the declaration is the only thing
+						// that can route it.
+						ix = wsOrigin
+					case ok:
 						ix = n
-					} else if c, err := r.In.Cookie(originCookie); err == nil {
-						if n, err := strconv.Atoi(c.Value); err == nil {
-							ix = n
+					default:
+						cookie, err := r.In.Cookie(originCookie)
+						if err == nil {
+							if n, err := strconv.Atoi(cookie.Value); err == nil {
+								ix = n
+							}
+						}
+						if upgrade && err != nil {
+							// Nothing to route on: no parameter, no
+							// declaration, no cookie. It still goes to origin
+							// 0 — a client explicit enough to be broken by a
+							// refusal is working by luck today — but silence
+							// here is the worst available failure: the page
+							// loads, the socket connects to the wrong origin,
+							// the app half-works, and the tunnel is the last
+							// thing anybody suspects (#159).
+							log.Warn("websocket could not be routed and fell back to the default origin; mark the origin that owns websockets with the +ws scheme suffix (http+ws://host)",
+								"url", r.In.URL.String(), "origin", originURLs[0].Redacted())
 						}
 					}
 				}
