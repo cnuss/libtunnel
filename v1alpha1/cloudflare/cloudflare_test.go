@@ -1167,10 +1167,7 @@ func TestQuickTunnelSurfacesRateLimit(t *testing.T) {
 	var buf strings.Builder
 	log := slog.New(slog.NewTextHandler(&buf, nil))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	defer cancel()
-
-	_, err := (&QuickTunnelProvider{URL: srv.URL, Log: log}).Spec(ctx)
+	_, err := (&QuickTunnelProvider{URL: srv.URL, Log: log}).Spec(context.Background())
 	if !errors.Is(err, v1.ErrRateLimited) {
 		t.Errorf("err = %v, want errors.Is(_, v1.ErrRateLimited)", err)
 	}
@@ -1435,4 +1432,102 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return u
+}
+
+// shortBudgets swaps the retry budgets for millisecond ones so a test can
+// drive a loop to expiry without sleeping through the real 45 seconds. The
+// seam is the package var, following the URL seam these tests already use.
+func shortBudgets(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := budget
+	budget = func(err error) time.Duration {
+		if prev(err) == 0 {
+			return 0
+		}
+		return d
+	}
+	t.Cleanup(func() { budget = prev })
+}
+
+// TestQuickTunnelUnreachableExpiresBudget pins the fix for #162 on the
+// retryable side: a provider that never recovers stops looking like a slow
+// one, and says so through a class with the cause still in the chain.
+func TestQuickTunnelUnreachableExpiresBudget(t *testing.T) {
+	shortBudgets(t, 100*time.Millisecond)
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"success":false,"errors":[{"code":1,"message":"boom"}]}`)
+	}))
+	defer srv.Close()
+
+	// context.Background(): the budget is the only way out, which is the
+	// case the issue reported as unfixable from outside the library.
+	_, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background())
+	if !errors.Is(err, v1.ErrProviderUnreachable) {
+		t.Fatalf("err = %v, want errors.Is(_, v1.ErrProviderUnreachable)", err)
+	}
+	if !errors.Is(err, v1.ErrFailed) {
+		t.Errorf("err = %v, want errors.Is(_, v1.ErrFailed)", err)
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("err = %v, want the last cause still in the message", err)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Errorf("API called %d times, want at least 2 (the budget must allow a retry)", got)
+	}
+}
+
+// TestQuickTunnelCertificateFailsImmediately pins the non-retryable side: the
+// x509 failure from the issue report returns on the first attempt rather than
+// burning a budget on a condition no retry can change.
+func TestQuickTunnelCertificateFailsImmediately(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, specJSON)
+	}))
+	defer srv.Close()
+
+	// The provider builds its own client, which has no reason to trust
+	// httptest's throwaway CA — exactly a container with no CA bundle.
+	_, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background())
+	if !errors.Is(err, v1.ErrCertificate) {
+		t.Fatalf("err = %v, want errors.Is(_, v1.ErrCertificate)", err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Errorf("handler reached %d times, want 0 (the handshake must fail first)", got)
+	}
+}
+
+// TestQuickTunnelLongResetFailsImmediately pins that a throttle outlasting its
+// own budget is reported rather than slept on: the caller can act on the reset
+// now, where waiting it out would just relocate the hang.
+func TestQuickTunnelLongResetFailsImmediately(t *testing.T) {
+	shortBudgets(t, 100*time.Millisecond)
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	_, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background())
+	if !errors.Is(err, v1.ErrRateLimited) {
+		t.Fatalf("err = %v, want errors.Is(_, v1.ErrRateLimited)", err)
+	}
+	if !strings.Contains(err.Error(), "resets in") {
+		t.Errorf("err = %v, want the advertised reset in the message", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("returned after %s, want immediately (the 120s reset must not be waited out)", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("API called %d times, want 1", got)
+	}
 }
