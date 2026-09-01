@@ -612,6 +612,24 @@ var caCerts = sync.OnceValue(func() []*x509.Certificate {
 	return append(certificates, cloudflareRoots...)
 })
 
+// caCertPool is the trust set for the connections libtunnel makes on its own
+// behalf. The host's store when it has one, plus the roots compiled into the
+// binary — so a scratch, busybox or distroless-without-certs image mints and
+// connects without anyone installing ca-certificates first.
+//
+// A host with no store is not an error: SystemCertPool yields an empty pool
+// there, and the embedded roots go on top either way, which is the point.
+var caCertPool = sync.OnceValue(func() *x509.CertPool {
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	for _, c := range caCerts() {
+		pool.AddCert(c)
+	}
+	return pool
+})
+
 // CACerts returns the Mozilla CA bundle plus the Cloudflare origin roots —
 // the trust set cloudflared uses for its edge TLS connections.
 func (b *Backend) CACerts() []*x509.Certificate {
@@ -775,10 +793,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			},
 			ProtocolSelector: protocolSelector,
 			EdgeTLSConfigs: func() map[connection.Protocol]*tls.Config {
-				pool := x509.NewCertPool()
-				for _, c := range t.CACerts() {
-					pool.AddCert(c)
-				}
+				pool := caCertPool()
 				out := make(map[connection.Protocol]*tls.Config, len(connection.ProtocolList))
 				for _, p := range connection.ProtocolList {
 					s := p.TLSSettings()
