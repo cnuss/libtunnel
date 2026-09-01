@@ -37,7 +37,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime/debug"
-	"time"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
@@ -161,10 +160,6 @@ var (
 	ErrRateLimited         = v1.ErrRateLimited         // throttled past its budget
 	ErrClosed              = v1.ErrClosed              // shut down deliberately; terminal, not a failure
 )
-
-// Budget reports how long a failure class is retried for before it becomes the
-// verdict, re-exported from v1. Zero never retries.
-func Budget(err error) time.Duration { return v1.Budget(err) }
 
 // New returns an unstarted tunnel on the given backend, which also supplies
 // the credential chain. T is the backend's spec type, inferred from the

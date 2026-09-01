@@ -185,11 +185,9 @@ case errors.Is(conn.Err(), libtunnel.ErrFailed):
 | `ErrRateLimited` | throttled past its budget, or past its advertised reset | 45s |
 | `ErrClosed` | shut down deliberately — terminal, but not a failure | n/a |
 
-`libtunnel.Budget(err)` reports how long a class is retried for; zero means it
-never is. Every class except `ErrClosed` answers
-`errors.Is(err, libtunnel.ErrFailed)`. Retries are bounded by class rather than
-by the caller's context, so a mint that can never succeed fails with a reason
-instead of hanging.
+Every class except `ErrClosed` answers `errors.Is(err, libtunnel.ErrFailed)`.
+Retries are bounded by class rather than by the caller's context, so a mint
+that can never succeed fails with a reason instead of hanging.
 
 ## Multiple origins
 
