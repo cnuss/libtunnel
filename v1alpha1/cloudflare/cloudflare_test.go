@@ -1207,7 +1207,8 @@ func TestEdgeUpWatcher(t *testing.T) {
 	}
 }
 
-// TestEdgeUpWatcherCountsAttempts pins the count edgeTimeout reports: every
+// TestEdgeUpWatcherCountsAttempts pins the count the ErrEdgeUnreachable
+// bound reports: every
 // Reconnecting the supervisor sends before the edge is up is one failed attempt
 // to reach it, and Connected events are not attempts.
 func TestEdgeUpWatcherCountsAttempts(t *testing.T) {
@@ -1232,7 +1233,7 @@ func TestEdgeUpWatcherCountsAttempts(t *testing.T) {
 // tunnel's default logger discards.
 func TestEdgeUnreachableWrapsSentinel(t *testing.T) {
 	err := fmt.Errorf("%w: no connection after %d attempts in %s: %s",
-		v1.ErrEdgeUnreachable, 3, edgeTimeout, edgeBlockedHint)
+		v1.ErrEdgeUnreachable, 3, v1.Budget(v1.ErrEdgeUnreachable), edgeBlockedHint)
 
 	if !errors.Is(err, v1.ErrEdgeUnreachable) {
 		t.Errorf("errors.Is(err, ErrEdgeUnreachable) = false, want true")
