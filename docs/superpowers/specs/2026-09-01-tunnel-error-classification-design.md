@@ -145,22 +145,45 @@ before its sentinel becomes the verdict.
 
 ```go
 // Budget is how long a retryable class may keep failing before its sentinel
-// becomes the verdict. Each class carries its own clock — it runs only while
-// the loop is failing that way, so a mint that hits a rate limit and then a
-// flaky resolver is not charged twice for one slow start. Non-retryable
-// classes return 0.
+// becomes the verdict. Each class carries its own clock, started at the first
+// failure of that class and read as wall time since — not as accumulated
+// backoff, which undercounts badly when the failure mode is a hang rather
+// than a refusal. A mint that hits a rate limit and then a flaky resolver is
+// not charged twice for one slow start. Non-retryable classes return 0.
 func Budget(sentinel error) time.Duration
 ```
 
-- `ErrRateLimited` — **2 minutes**. A provider advertising a reset longer than
-  this is reported now rather than waited out: the caller can act on "rate
-  limited, resets in 5m" immediately, and `quicktunnel.go:185-196` already
-  parses that duration, so it goes straight into the message.
-- `ErrUnreachable` — **30 seconds**. The mint-side twin of `edgeTimeout`
-  (`cloudflare.go:876`), and deliberately the same number: a container that
-  starts before its resolver is ready recovers inside it; a typo'd provider
-  host never does, and stops looking like a slow one.
-- Everything else — 0.
+**`ErrUnreachable` — 45 seconds**, derived from the per-attempt bound already
+in `quicktunnel.go:108-122`. The mint client carries `Timeout: 15 * time.Second`,
+sized, per its own comment, so the header wait "must cover a full server-side
+mint" while the endpoint waits out DNS propagation for the hostname. A hung
+endpoint therefore burns 15s per attempt, so any budget under 30s cannot tell
+a dead endpoint from one bad attempt. Three full attempts — 45s — is the
+smallest bound that can.
+
+For fast-failing errors (connection refused, SERVFAIL) the loop's `sleep += 1s`
+ramp governs instead, and 45s buys about nine attempts, at 0s, 1s, 3s, 6s,
+10s, 15s, 21s, 28s and 36s — comfortably outlasting a container resolver that
+comes up late.
+
+Explicitly **not** `edgeTimeout`'s 30s. That number is justified by something
+that does not transfer: `edgeProtocol` pins the edge to TCP, so there is no
+quic→http2 fallback in flight for a short bound to cut off
+(`cloudflare.go:868-875`). The mint path's constraint is its own 15s
+per-attempt timeout, and it lands somewhere else.
+
+**`ErrRateLimited` — 45 seconds**, the same number for an admittedly weaker
+reason. The advertised reset does the real work here: `quicktunnel.go:176-196`
+already parses `Retry-After` in both its seconds and HTTP-date forms, so a
+server that names its reset is either waited out, when it fits the budget, or
+reported immediately with the duration in the message. The budget only
+governs the headerless 429 — the two branches at `quicktunnel.go:192-196` that
+return no duration — where there is nothing to key on but the ramp. We have no
+data on how long those last, so matching the unreachable budget is a
+defensible default rather than a derived one. *Assumption to revisit* if
+headerless 429s turn out to be common and short-lived.
+
+Everything else — 0.
 
 Package consts, no env knob, mirroring how `edgeTimeout` is expressed.
 `Budget` itself is a plain function over them, so it is directly testable.
@@ -182,12 +205,24 @@ sentinel, retry := v1alpha1.Classify(err)
 if !retry {
     return nil, fmt.Errorf("%w: %w", sentinel, err)
 }
-spent[sentinel] += wait
-if spent[sentinel] > v1alpha1.Budget(sentinel) {
+if _, seen := since[sentinel]; !seen {
+    since[sentinel] = time.Now()
+}
+if spent := time.Since(since[sentinel]); spent > budget(sentinel) {
     return nil, fmt.Errorf("%w: no spec after %d attempts in %s: %w",
-        sentinel, attempts, spent[sentinel], err)
+        sentinel, attempts, spent.Round(time.Second), err)
 }
 ```
+
+The clock is wall time since the class was first seen, not a sum of the
+backoff waits. Summing the waits would undercount a hang by an order of
+magnitude — three 15s timeouts cost 45s of real time but only 1s+2s+3s of
+ramp — which is exactly the failure mode the budget exists to catch.
+
+A 429 that advertises a reset longer than `budget(ErrRateLimited)` also
+short-circuits on arrival rather than being slept on, so the caller gets
+"rate limited, resets in 5m" now, with the duration `quicktunnel.go:185-190`
+already parsed.
 
 The exhaustion message follows `cloudflare.go:854` — attempts, elapsed, cause
 — which follows retryablehttp's `"giving up after %d attempt(s): %w"`.
@@ -219,7 +254,7 @@ spends a budget while it waits.
   alpha revisions; `v1.ErrRejected` and `v1.ErrRateLimited` replace them, in
   the stable package.
 - The behavior change callers will actually notice: a mint that used to hang
-  now fails, in at most 30s (or 2m against a rate limit) rather than never.
+  now fails, in at most 45s per failure class, rather than never.
 
 ## Testing
 
@@ -238,14 +273,15 @@ Real failures, not fabricated ones.
   persistent 500 returns `ErrUnreachable` after its budget with the cause
   still wrapped, and that the reclaim path still drops hints and retries once.
   The expiry cases override the package's `budget` seam to milliseconds rather
-  than sleeping through the real 30s and 2m.
+  than sleeping through the real 45s.
 - **`v1/v1_test.go`** — the `Is` hierarchy: every failure sentinel answers
   `ErrFailed`; `ErrClosed` does not.
 
 ## Out of scope
 
 The issue's fourth bullet — observing the first failure before the verdict,
-via a callback or pollable state. Budgets cap the silent window at 30s / 2m
-instead of indefinite, which is the actual complaint in the report. A
+via a callback or pollable state. Budgets cap the silent window at 45s per
+failure class instead of indefinite, which is the actual complaint in the
+report. A
 progress callback is a separate API surface and earns its own issue if it is
 still wanted afterwards.
