@@ -18,25 +18,113 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 )
 
-// ErrClosed is the Err result of a tunnel shut down deliberately — by
-// closing the listener returned from Tunnel.Listener.
-var ErrClosed = errors.New("tunnel closed")
+// ErrFailed marks a tunnel that will not come up. Retrying will not help; the
+// class wrapping it says what an operator can do about it. Every failure class
+// below answers errors.Is(err, ErrFailed) — ErrClosed does not, because a
+// deliberate shutdown is terminal without being a failure.
+var ErrFailed = errors.New("tunnel failed")
 
-// ErrEdgeUnreachable is the Err result of a tunnel that never reached its
-// backend's edge. The engine retries the edge indefinitely, so without a bound
-// a blocked network is indistinguishable from a slow one and the tunnel hangs
-// until the caller's context expires; the bound turns it into an error a caller
-// can act on (errors.Is) and a message that names the likely cause.
-var ErrEdgeUnreachable = errors.New("edge unreachable")
+// class is a terminal tunnel state: the umbrella it answers to (nil for a
+// state that is not a failure), the reason it ended, and how long that class
+// may keep failing before it becomes the verdict.
+//
+// The budget lives here rather than in a lookup beside the classifier so that
+// "is this worth retrying" cannot disagree with "what kind of failure is
+// this". It is one fact — Budget(class) > 0 — not two tables that have to be
+// kept in step.
+type class struct {
+	parent error
+	reason string
+	budget time.Duration
+}
 
-// ErrHostnameUnresolved was the Err result of a tunnel whose hostname never
-// resolved, back when readiness polled DNS and could give up. Readiness now
-// follows the edge connection registering — the mint provider waits out DNS
-// propagation before returning credentials — and produces no error; the
-// variable remains so callers matching on it keep compiling.
-var ErrHostnameUnresolved = errors.New("hostname unresolved")
+func (c *class) Error() string {
+	if c.parent == nil {
+		return c.reason
+	}
+	return c.parent.Error() + ": " + c.reason
+}
+
+// Is puts the class under its umbrella. errors.Is reaches the class itself by
+// identity; this answers for everything above it.
+func (c *class) Is(target error) bool { return c.parent != nil && errors.Is(c.parent, target) }
+
+var (
+	// ErrCertificate is the Err result of a tunnel whose provider's
+	// certificate could not be verified — a missing trust store (a scratch
+	// container with no CA bundle), a wrong system clock, or an intercepting
+	// proxy. None of those change on a retry, so the budget is zero.
+	ErrCertificate error = &class{ErrFailed, "certificate verification", 0}
+
+	// ErrRejected is the Err result of a mint the provider definitively
+	// refused, or of a request libtunnel could not construct at all: an API
+	// URL with a scheme no transport handles, a header that cannot go on the
+	// wire, a hostname no resolver will ever answer. All configuration, none
+	// of it retryable.
+	ErrRejected error = &class{ErrFailed, "rejected by the provider", 0}
+
+	// ErrProviderUnreachable is the Err result of a mint endpoint that never
+	// answered: it refuses, times out, or keeps returning 5xx for the budget.
+	//
+	// Forty-five seconds is three full mint attempts. The mint request
+	// carries a 15s Timeout, sized so the header wait covers a server-side
+	// mint that waits out DNS propagation, so a hung endpoint burns 15s an
+	// attempt — and any bound under 30s could not tell a dead endpoint from
+	// one bad attempt. For failures that return immediately the provider's
+	// linear ramp governs instead, and 45s buys about nine attempts, which
+	// outlasts a container resolver that comes up late.
+	ErrProviderUnreachable error = &class{ErrFailed, "provider unreachable", 45 * time.Second}
+
+	// ErrEdgeUnreachable is the Err result of a tunnel that never reached its
+	// backend's edge. The engine retries the edge indefinitely, so without a
+	// bound a blocked network is indistinguishable from a slow one and the
+	// tunnel hangs until the caller's context expires; the bound turns it into
+	// an error a caller can act on and a message that names the likely cause.
+	//
+	// Thirty seconds is a bound on one transport, not a race against a
+	// fallback to another: the Cloudflare engine pins the edge to TCP, so
+	// there is no quic->http2 recovery in flight that a short bound could cut
+	// off. An earlier version of this had to outlast that fallback and did
+	// not, failing a CI runner after four QUIC attempts while http2 was still
+	// ahead of it. With the transport fixed, a TCP connect and registration
+	// that has not happened in thirty seconds is not going to.
+	//
+	// The bound covers the first connection only. A connection dropped later
+	// is the engine's to retry indefinitely, which is the right policy for a
+	// tunnel that has already proven the network works.
+	ErrEdgeUnreachable error = &class{ErrFailed, "edge unreachable", 30 * time.Second}
+
+	// ErrRateLimited is the Err result of a mint the provider throttled for
+	// longer than the budget, or throttled with an advertised reset longer
+	// than the budget — which is reported immediately rather than waited out,
+	// so a caller can act on "resets in 5m" instead of blocking on it.
+	//
+	// The budget matches ErrProviderUnreachable for want of better evidence:
+	// it only governs a 429 that carries no reset at all, since one that names
+	// its reset is decided by that number instead.
+	ErrRateLimited error = &class{ErrFailed, "rate limited", 45 * time.Second}
+
+	// ErrClosed is the Err result of a tunnel shut down deliberately — by
+	// closing the listener returned from Tunnel.Listener. It is terminal but
+	// it is not a failure, so it has no umbrella: the message is a bare
+	// "tunnel closed" and errors.Is(err, ErrFailed) is false.
+	ErrClosed error = &class{nil, "tunnel closed", 0}
+)
+
+// Budget reports how long the failure class err belongs to may keep failing
+// before it becomes the verdict — and so also whether it is worth retrying at
+// all. Zero never retries, which covers both a permanent class and anything
+// that is not a failure class in the first place.
+func Budget(err error) time.Duration {
+	var c *class
+	if errors.As(err, &c) {
+		return c.budget
+	}
+	return 0
+}
 
 // The environment variables, centralized: every code knob with an
 // env-expressible value has a mirror here, and env beats code — an operator
@@ -287,7 +375,12 @@ type Tunnel interface {
 	// or HostnameReady should select on Done too, or a failed tunnel blocks
 	// them forever.
 	Done() <-chan struct{}
-	// Err reports why the tunnel ended (nil while it is alive).
+	// Err reports why the tunnel ended (nil while it is alive). A tunnel that
+	// will not come up reports a failure class: errors.Is(err, ErrFailed) is
+	// the coarse check, and the class wrapping it — ErrCertificate,
+	// ErrRejected, ErrProviderUnreachable, ErrEdgeUnreachable, ErrRateLimited
+	// — is what an operator can act on. A tunnel closed deliberately reports
+	// ErrClosed, which is terminal but not a failure.
 	Err() error
 
 	// WithLogger sets the logger, once. Unset, the tunnel is silent — unless

@@ -147,6 +147,20 @@ type (
 	InterceptCtx = v1.InterceptCtx // per-request handle: request, levers, handler
 )
 
+// The failure classes TunnelV1.Err reports (see v1.ErrFailed) are re-exported
+// from v1 so callers can branch on a failure without importing v1. Every class
+// but ErrClosed answers errors.Is(err, ErrFailed), so that is the coarse "it
+// will not come up" check and the class is the reason.
+var (
+	ErrFailed              = v1.ErrFailed              // umbrella: the tunnel will not come up
+	ErrCertificate         = v1.ErrCertificate         // no trust store, bad clock, MITM proxy
+	ErrRejected            = v1.ErrRejected            // the provider said no, or the request was unbuildable
+	ErrProviderUnreachable = v1.ErrProviderUnreachable // the mint endpoint never answered
+	ErrEdgeUnreachable     = v1.ErrEdgeUnreachable     // the edge never accepted a connection
+	ErrRateLimited         = v1.ErrRateLimited         // throttled past its budget
+	ErrClosed              = v1.ErrClosed              // shut down deliberately; terminal, not a failure
+)
+
 // New returns an unstarted tunnel on the given backend, which also supplies
 // the credential chain. T is the backend's spec type, inferred from the
 // backend and used only to wire the credential chain — it does not appear in

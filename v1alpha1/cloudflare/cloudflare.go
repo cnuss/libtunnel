@@ -84,7 +84,7 @@ const haConnections = 2
 // The sink calls attempt on every Reconnecting, which the supervisor sends
 // before each backoff — including after a dial that never connected, so before
 // the first Connected the count is failed attempts to reach the edge, which is
-// what edgeTimeout reports.
+// what the ErrEdgeUnreachable bound reports.
 type edgeUpWatcher struct {
 	mu       sync.Mutex
 	gen      uint64
@@ -730,7 +730,8 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 
 		// The observer fans connection lifecycle events out to sinks; wire one
 		// that feeds edgeUp, so the Reconnect lever can block until the edge is
-		// back up and edgeTimeout can report how many attempts it took.
+		// back up and the ErrEdgeUnreachable bound can report how many attempts
+		// it took.
 		observer := connection.NewObserver(log, log)
 		observer.RegisterSink(connection.EventSinkFunc(func(e connection.Event) {
 			switch e.EventType {
@@ -842,7 +843,11 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		}
 	}()
 
-	timeout := time.NewTimer(edgeTimeout)
+	// The bound on the first edge connection, read off the class that reports
+	// it — see v1.ErrEdgeUnreachable for why thirty seconds and why only the
+	// first connection.
+	edgeBudget := v1.Budget(v1.ErrEdgeUnreachable)
+	timeout := time.NewTimer(edgeBudget)
 	defer timeout.Stop()
 
 	select {
@@ -851,29 +856,10 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	case <-connected.Wait():
 	case <-timeout.C:
 		return fmt.Errorf("%w: no connection after %d attempts in %s: %s",
-			v1.ErrEdgeUnreachable, b.edgeUp.attemptCount(), edgeTimeout, edgeBlockedHint)
+			v1.ErrEdgeUnreachable, b.edgeUp.attemptCount(), edgeBudget, edgeBlockedHint)
 	}
 	return nil
 }
-
-// edgeTimeout bounds the wait for the first edge connection. The supervisor
-// retries forever — cloudflared builds its backoff with retryForever set, so
-// TunnelConfig.Retries only caps the backoff ceiling, not the attempt count —
-// which leaves a blocked network looking exactly like a slow one until the
-// caller's context expires. This is the terminal state cloudflared has none of.
-//
-// It applies to the first connection only: connect returns once the edge is up,
-// and a connection dropped later is cloudflared's to retry indefinitely, which
-// is the right policy for a tunnel that has already proven the network works.
-//
-// Thirty seconds is a bound on one transport, not a race against a fallback to
-// another: edgeProtocol fixes the edge to TCP, so there is no quic->http2
-// recovery in flight that a short bound could cut off. An earlier version of
-// this had to outlast that fallback and did not, failing a CI runner after four
-// QUIC attempts while http2 was still ahead of it. With the transport fixed, a
-// TCP connect and registration that has not happened in thirty seconds is not
-// going to.
-const edgeTimeout = 30 * time.Second
 
 // edgeBlockedHint is cloudflared's own diagnosis of this failure, which it logs
 // at warn level from selectNextProtocol — where the tunnel's logger is silent

@@ -21,15 +21,11 @@ import (
 // quickTunnelURL is the public endpoint that mints anonymous quick tunnels.
 const quickTunnelURL = "https://tunnel.pizza/tunnel"
 
-// ErrRateLimited marks a quick-tunnel mint rejected with HTTP 429. The
-// provider retries through it with backoff; it surfaces in the returned error
-// chain when the context expires first.
-var ErrRateLimited = errors.New("quick tunnel rate limited")
-
-// ErrMintRejected marks a mint the API definitively refused (success=false on
-// a non-5xx response). Retrying cannot fix it, so Spec returns immediately
-// instead of backing off.
-var ErrMintRejected = errors.New("quick tunnel mint rejected")
+// budget is v1.Budget behind a package var so a test can shorten the retry
+// budgets instead of sleeping through them. Production never reassigns it —
+// this is the same seam shape QuickTunnelProvider.URL already is for the
+// endpoint.
+var budget = v1.Budget
 
 // QuickTunnelProvider mints an anonymous *.tunneled.pizza tunnel from the
 // quick-tunnel API, retrying with linear backoff until the context is done.
@@ -182,18 +178,18 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
 			if secs, err := strconv.Atoi(retryAfter); err == nil && secs > 0 {
 				d := time.Duration(secs) * time.Second
-				return nil, d, fmt.Errorf("%w: resets in %s", ErrRateLimited, d)
+				return nil, d, fmt.Errorf("%w: resets in %s", v1.ErrRateLimited, d)
 			}
 			// RFC 7231 also allows an HTTP-date form.
 			if when, err := http.ParseTime(retryAfter); err == nil {
 				if d := time.Until(when); d > 0 {
-					return nil, d, fmt.Errorf("%w: resets in %s", ErrRateLimited, d.Round(time.Second))
+					return nil, d, fmt.Errorf("%w: resets in %s", v1.ErrRateLimited, d.Round(time.Second))
 				}
 			}
 			if retryAfter != "" {
-				return nil, 0, fmt.Errorf("%w (HTTP 429): Retry-After=%s", ErrRateLimited, retryAfter)
+				return nil, 0, fmt.Errorf("%w (HTTP 429): Retry-After=%s", v1.ErrRateLimited, retryAfter)
 			}
-			return nil, 0, fmt.Errorf("%w (HTTP 429): no rate-limit headers returned", ErrRateLimited)
+			return nil, 0, fmt.Errorf("%w (HTTP 429): no rate-limit headers returned", v1.ErrRateLimited)
 		}
 
 		type response struct {
@@ -218,7 +214,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			// A parsed success=false on a non-5xx response is the API saying
 			// no, not the API having a bad moment — retrying can't fix it.
 			if resp.StatusCode < http.StatusInternalServerError {
-				return nil, 0, fmt.Errorf("%w: %s", ErrMintRejected, strings.Join(errorMessages, "; "))
+				return nil, 0, fmt.Errorf("%w: %s", v1.ErrRejected, strings.Join(errorMessages, "; "))
 			}
 			return nil, 0, fmt.Errorf("tunnel credentials request failed: %s", strings.Join(errorMessages, "; "))
 		}
@@ -227,29 +223,68 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 	sleep := 0 * time.Second
 	hints := cacheHints
+	attempts := 0
+	// Each class keeps its own clock, started at its first failure, so a mint
+	// that hits a rate limit and then a flaky resolver is not charged twice
+	// for one slow start. The clock is wall time rather than a sum of the
+	// backoff waits: three 15s timeouts cost 45s of real time but only 6s of
+	// ramp, and a hang is exactly what the budget exists to catch.
+	since := map[error]time.Time{}
 	for {
+		attempts++
 		spec, retryAfter, err := fetch(hints)
 		if err == nil {
 			return spec, nil
 		}
-		if errors.Is(err, ErrMintRejected) {
-			if len(hints) == 0 {
-				return nil, err
-			}
+
+		if errors.Is(err, v1.ErrRejected) && len(hints) > 0 {
 			// The backend declined to hand the cached tunnel back (reaped
 			// and unreclaimable, claimed elsewhere). That verdict is about
 			// the reclaim, not about a fresh mint — retry once, immediately,
-			// without the cache-derived hints. A rejection of the retry is
-			// terminal above, exactly as when no cache was involved.
+			// without the cache-derived hints. A rejection of the retry has
+			// no hints left and falls through below, terminal, exactly as
+			// when no cache was involved.
 			log.Warn("cached spec refused by the mint provider, minting fresh", "error", err)
 			hints = nil
 			continue
 		}
+
+		class := v1alpha1.Classify(err)
+		// named is err with its class attached — unless fetch already named
+		// it, in which case attaching it again would only say the same thing
+		// twice in the message.
+		named := err
+		if !errors.Is(err, class) {
+			named = fmt.Errorf("%w: %w", class, err)
+		}
+
+		limit := budget(class)
+		if limit == 0 {
+			return nil, named
+		}
+		// A throttle that outlasts its own budget is reported now rather than
+		// slept on: a caller can act on "resets in 5m", where waiting it out
+		// just moves the hang somewhere the caller cannot see it.
+		if retryAfter > limit {
+			log.Warn("quick tunnel rate limited", "error", err, "resetsIn", retryAfter)
+			return nil, named
+		}
+		if _, seen := since[class]; !seen {
+			since[class] = time.Now()
+		}
+		// Checked before the wait, so the worst case is the budget plus one
+		// attempt — a hung endpoint is reported at roughly budget + Timeout,
+		// not at the budget exactly.
+		if spent := time.Since(since[class]); spent > limit {
+			return nil, fmt.Errorf("no spec after %d attempts in %s: %w",
+				attempts, spent.Round(time.Second), named)
+		}
+
 		// The server's Retry-After wins over the linear ramp when it asks for
-		// longer; either way the wait is bounded by ctx below.
+		// longer; either way the wait is bounded by ctx and by the budget.
 		sleep += 1 * time.Second
 		wait := max(sleep, retryAfter)
-		if errors.Is(err, ErrRateLimited) {
+		if errors.Is(err, v1.ErrRateLimited) {
 			log.Warn("quick tunnel rate limited, retrying...", "error", err, "nextAttemptIn", wait)
 		} else {
 			log.Warn("failed to fetch tunnel spec, retrying...", "error", err)
