@@ -115,7 +115,7 @@ type Tunnel interface {
     TunnelReady() <-chan struct{}   // connection up + hostname resolves;
                                     // start trigger, like Listener
     Done() <-chan struct{}          // tunnel failed or shut down
-    Err() error                     // why (nil while alive)
+    Err() error                     // why (nil while alive); see Failure classes
 
     // write-once mutators: first call wins, no-ops once the value is fixed
     WithLogger(log *slog.Logger) Tunnel      // default: silent
@@ -159,6 +159,37 @@ func Version() string                            // the libtunnel release this b
 // parent→child handoff — no API: minting exports the LIBTUNNEL_SPEC env var,
 // construction adopts it
 ```
+
+## Failure classes
+
+A tunnel that will not come up ends with a class off `Err()`, so a caller
+branches on the failure rather than on the text of a message it did not write:
+
+```go
+switch {
+case errors.Is(conn.Err(), libtunnel.ErrCertificate):
+    // no CA bundle, a wrong clock, or an intercepting proxy
+case errors.Is(conn.Err(), libtunnel.ErrEdgeUnreachable):
+    // egress to port 7844 is blocked — WithEdge routes around it
+case errors.Is(conn.Err(), libtunnel.ErrFailed):
+    // it will not come up, and the message says why
+}
+```
+
+| class | meaning | retried for |
+| --- | --- | --- |
+| `ErrCertificate` | the provider's certificate could not be verified | never |
+| `ErrRejected` | the provider said no, or the request could not be built | never |
+| `ErrProviderUnreachable` | the mint endpoint refuses, times out or 5xxs | 45s |
+| `ErrEdgeUnreachable` | the edge never accepted a connection | 30s |
+| `ErrRateLimited` | throttled past its budget, or past its advertised reset | 45s |
+| `ErrClosed` | shut down deliberately — terminal, but not a failure | n/a |
+
+`libtunnel.Budget(err)` reports how long a class is retried for; zero means it
+never is. Every class except `ErrClosed` answers
+`errors.Is(err, libtunnel.ErrFailed)`. Retries are bounded by class rather than
+by the caller's context, so a mint that can never succeed fails with a reason
+instead of hanging.
 
 ## Multiple origins
 
