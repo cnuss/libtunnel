@@ -466,8 +466,8 @@ func TestExplicitHintRejectionStaysTerminal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err := New().WithID("explicit").WithProvider(srv.URL).Provider().Spec(ctx)
-	if !errors.Is(err, ErrMintRejected) {
-		t.Errorf("err = %v, want errors.Is(_, ErrMintRejected)", err)
+	if !errors.Is(err, v1.ErrRejected) {
+		t.Errorf("err = %v, want errors.Is(_, v1.ErrRejected)", err)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("API called %d times, want 1 (explicit-hint rejection must not retry)", got)
@@ -1134,8 +1134,8 @@ func TestQuickTunnelRejectionIsPermanent(t *testing.T) {
 	defer srv.Close()
 
 	_, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(context.Background())
-	if !errors.Is(err, ErrMintRejected) {
-		t.Errorf("err = %v, want errors.Is(_, ErrMintRejected)", err)
+	if !errors.Is(err, v1.ErrRejected) {
+		t.Errorf("err = %v, want errors.Is(_, v1.ErrRejected)", err)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("API called %d times, want 1 (definitive rejection must not retry)", got)
@@ -1171,8 +1171,8 @@ func TestQuickTunnelSurfacesRateLimit(t *testing.T) {
 	defer cancel()
 
 	_, err := (&QuickTunnelProvider{URL: srv.URL, Log: log}).Spec(ctx)
-	if !errors.Is(err, ErrRateLimited) {
-		t.Errorf("err = %v, want errors.Is(_, ErrRateLimited)", err)
+	if !errors.Is(err, v1.ErrRateLimited) {
+		t.Errorf("err = %v, want errors.Is(_, v1.ErrRateLimited)", err)
 	}
 	if !strings.Contains(buf.String(), "quick tunnel rate limited") {
 		t.Errorf("no rate-limit warning logged; log output:\n%s", buf.String())

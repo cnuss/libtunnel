@@ -21,16 +21,6 @@ import (
 // quickTunnelURL is the public endpoint that mints anonymous quick tunnels.
 const quickTunnelURL = "https://tunnel.pizza/tunnel"
 
-// ErrRateLimited marks a quick-tunnel mint rejected with HTTP 429. The
-// provider retries through it with backoff; it surfaces in the returned error
-// chain when the context expires first.
-var ErrRateLimited = errors.New("quick tunnel rate limited")
-
-// ErrMintRejected marks a mint the API definitively refused (success=false on
-// a non-5xx response). Retrying cannot fix it, so Spec returns immediately
-// instead of backing off.
-var ErrMintRejected = errors.New("quick tunnel mint rejected")
-
 // QuickTunnelProvider mints an anonymous *.tunneled.pizza tunnel from the
 // quick-tunnel API, retrying with linear backoff until the context is done.
 // The most recently minted spec (latest.spec.json in the cache dir) seeds the
@@ -182,18 +172,18 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
 			if secs, err := strconv.Atoi(retryAfter); err == nil && secs > 0 {
 				d := time.Duration(secs) * time.Second
-				return nil, d, fmt.Errorf("%w: resets in %s", ErrRateLimited, d)
+				return nil, d, fmt.Errorf("%w: resets in %s", v1.ErrRateLimited, d)
 			}
 			// RFC 7231 also allows an HTTP-date form.
 			if when, err := http.ParseTime(retryAfter); err == nil {
 				if d := time.Until(when); d > 0 {
-					return nil, d, fmt.Errorf("%w: resets in %s", ErrRateLimited, d.Round(time.Second))
+					return nil, d, fmt.Errorf("%w: resets in %s", v1.ErrRateLimited, d.Round(time.Second))
 				}
 			}
 			if retryAfter != "" {
-				return nil, 0, fmt.Errorf("%w (HTTP 429): Retry-After=%s", ErrRateLimited, retryAfter)
+				return nil, 0, fmt.Errorf("%w (HTTP 429): Retry-After=%s", v1.ErrRateLimited, retryAfter)
 			}
-			return nil, 0, fmt.Errorf("%w (HTTP 429): no rate-limit headers returned", ErrRateLimited)
+			return nil, 0, fmt.Errorf("%w (HTTP 429): no rate-limit headers returned", v1.ErrRateLimited)
 		}
 
 		type response struct {
@@ -218,7 +208,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			// A parsed success=false on a non-5xx response is the API saying
 			// no, not the API having a bad moment — retrying can't fix it.
 			if resp.StatusCode < http.StatusInternalServerError {
-				return nil, 0, fmt.Errorf("%w: %s", ErrMintRejected, strings.Join(errorMessages, "; "))
+				return nil, 0, fmt.Errorf("%w: %s", v1.ErrRejected, strings.Join(errorMessages, "; "))
 			}
 			return nil, 0, fmt.Errorf("tunnel credentials request failed: %s", strings.Join(errorMessages, "; "))
 		}
@@ -232,7 +222,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		if err == nil {
 			return spec, nil
 		}
-		if errors.Is(err, ErrMintRejected) {
+		if errors.Is(err, v1.ErrRejected) {
 			if len(hints) == 0 {
 				return nil, err
 			}
@@ -249,7 +239,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		// longer; either way the wait is bounded by ctx below.
 		sleep += 1 * time.Second
 		wait := max(sleep, retryAfter)
-		if errors.Is(err, ErrRateLimited) {
+		if errors.Is(err, v1.ErrRateLimited) {
 			log.Warn("quick tunnel rate limited, retrying...", "error", err, "nextAttemptIn", wait)
 		} else {
 			log.Warn("failed to fetch tunnel spec, retrying...", "error", err)
