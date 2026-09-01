@@ -2,6 +2,7 @@ package cloudflare
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -103,6 +104,12 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 	client := http.Client{
 		Transport: &http.Transport{
+			// The trust set libtunnel ships, not the host's alone: an image
+			// with no ca-certificates package still verifies the mint
+			// endpoint. Without this the edge connection would have verified
+			// fine against the bundle compiled into the same binary while the
+			// mint three files away could not (#164).
+			TLSClientConfig: &tls.Config{RootCAs: caCertPool()},
 			// Per-attempt bounds. The TLS handshake terminates at the
 			// provider's edge and is quick regardless of load, so it stays
 			// tight — a hung handshake is a dead endpoint, and failing fast

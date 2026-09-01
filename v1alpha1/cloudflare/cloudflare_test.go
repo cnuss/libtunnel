@@ -10,6 +10,7 @@ package cloudflare
 import (
 	"bufio"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1530,5 +1531,26 @@ func TestQuickTunnelLongResetFailsImmediately(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("API called %d times, want 1", got)
+	}
+}
+
+// TestCACertPoolCarriesEmbeddedRoots pins #164: the pool libtunnel dials with
+// contains the roots compiled into the binary, so a host with no
+// ca-certificates package can still verify the mint and edge endpoints. Every
+// embedded root is self-signed, so verifying one against the pool proves it is
+// in there without reaching the network.
+func TestCACertPoolCarriesEmbeddedRoots(t *testing.T) {
+	pool := caCertPool()
+	if pool == nil {
+		t.Fatal("caCertPool() = nil")
+	}
+	embedded := caCerts()
+	if len(embedded) == 0 {
+		t.Fatal("no embedded roots parsed")
+	}
+	for _, root := range embedded {
+		if _, err := root.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+			t.Fatalf("embedded root %q not in the pool: %v", root.Subject.CommonName, err)
+		}
 	}
 }
