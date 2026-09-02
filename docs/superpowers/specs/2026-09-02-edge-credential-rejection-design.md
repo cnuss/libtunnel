@@ -50,15 +50,20 @@ Two further facts worth recording:
   propagation lag on new Tunnels". Correct for a fresh mint; never-terminating
   for a reaped one. libtunnel's 30s budget always wins that race, which is why
   the timeout is what the caller sees.
-- **The message is the provider's.** `Unauthorized: Tunnel not found` appears
-  nowhere in cloudflared's source — it arrives over the control stream
-  (`ServeControlStream` → `c.controlStreamErr`, logged at
-  `connection/http2.go:158`) from the service on the other end, which is
-  tunnel.pizza. That the string is absent from cloudflared establishes only
-  that cloudflared did not write it, not who did.
+- **The message comes from the edge, not from the mint API.** Four things fix
+  its origin: `"failed to serve incoming request"` exists at exactly one place
+  in cloudflared (`connection/http2.go:158`, inside `ServeHTTP`, dispatching on
+  `TypeControlStream`) so it is an established connection being served, not a
+  mint; `"component":"tunnel"` is libtunnel's own zerolog context field, so the
+  record came through the cloudflared bridge; the mint path logs through
+  `*slog.Logger` and never touches zerolog, so it cannot produce such a record
+  at all; and on the replay path `/tunnel` is never called, because
+  `cloudflare.From(spec)` pins the chain to a `Static` provider.
 
-  This matters for the design rather than being trivia: the string this
-  depends on is one we control. See "What tunnel.pizza should do" below.
+  tunnel.pizza's reaper is the *cause* — it deleted the tunnel — but the text
+  is the edge's. Which is why the fix below reads a log line rather than a
+  status code, and why the follow-up that would remove that need lives on the
+  mint endpoint. See "Follow-up" below.
 
 ## Design
 
@@ -135,14 +140,13 @@ a fresh backend per tunnel, and `connect` runs once for it.
 containing `Unauthorized`, capturing the record's `error` field as the message.
 
 **On the looseness of that match.** A proxied origin returning 401 could in
-principle also contain the word. Three things bound it: the sink only arms
-before the first successful connection (after that, `connect` has returned and
-nothing reads the channel); it is the identical test cloudflared applies to the
-error value it holds directly; and the string is emitted by tunnel.pizza, so it
-is a contract that can be kept rather than a vendor's wording that can shift
-under us.
+principle also contain the word. Two things bound it: the sink only arms before
+the first successful connection (after that, `connect` has returned and nothing
+reads the channel), and it is the identical test cloudflared applies to the
+error value it holds directly.
 
-That last point is the one worth acting on — see below.
+It stays the weakest part of this design, and the follow-up below is what
+retires it rather than reinforcing it.
 
 ### 3. `ErrCredentialRejected` — `v1/v1.go`
 
@@ -209,22 +213,23 @@ tunneld can then key its recovery on `ErrCredentialRejected`: discard the
 cached spec and mint fresh. That is the actual repair, and it is not a decision
 it can make on `ErrEdgeUnreachable`.
 
-## What tunnel.pizza should do
+## Follow-up: validate before dialing the edge
 
-The refusal text is tunnel.pizza's, which turns the weakest part of this design
-into something fixable at the source:
+The replay path hands credentials to cloudflared and finds out thirty seconds
+later. The mint request already carries the spec's fields as reclaim hints
+(`X-Id` / `X-Name` / `X-Secret`), so the shape for asking the provider "is this
+still yours?" exists. A `410 Gone` for a reaped tunnel — semantically exact: it
+existed, it is permanently gone, do not retry — would let `connect` check
+before handing anything to cloudflared, and map a status code onto
+`ErrCredentialRejected` with no string matching at all.
 
-1. **Treat the refusal as public API.** Document the wording and keep it
-   stable. libtunnel's match then rests on a contract rather than on a guess
-   about someone else's phrasing.
-2. **Distinguish the causes.** "This tunnel was reaped", "these credentials are
-   malformed" and "this tunnel is not yours" want different recoveries, and
-   only the first means *discard the cached spec and mint fresh* — which is
-   what `ErrCredentialRejected` triggers. Collapsed into one string, libtunnel
-   maps all three to "throw the spec away", which is wrong for the other two. A
-   stable distinguishing token would let them be told apart.
+That is a better signal than this design's, and it retires the log-bridge match
+for the common case. It is deliberately not in this change: it needs a server
+change to exist first, and this fix needs none.
 
-Neither is required for this change to land, and neither is in this repo.
+Both are worth having even then. Validation cannot cover a tunnel reaped
+between the check and the registration, or one reaped mid-session; the bridge
+detection can, and becomes the backstop rather than the primary signal.
 
 ## Out of scope
 
