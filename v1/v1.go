@@ -169,22 +169,6 @@ const (
 	// WithLogger keeps its handler — the environment carries a level, not a
 	// sink. An unknown value reads as info, with a warning.
 	LogEnv = "LIBTUNNEL_LOG"
-	// CacheDirEnv overrides where minted specs are cached and where From and
-	// Hosts look. Unset, a per-user location under os.UserCacheDir() is used.
-	// The cache also holds latest.spec.json — the most recent mint — whose
-	// fields seed the next mint's reclaim hints, so a provider that reaps
-	// idle tunnels can hand the same tunnel back instead of minting fresh.
-	//
-	// Unset, a mint also leaves that hint in the working directory as
-	// libtunnel.local (with libtunnel.owner.local beside it), so a service
-	// restarted from the same directory reclaims its own hostname instead of
-	// racing whatever else was minted on the machine that day. Both are mode
-	// 0600 and both are credentials: keep them untracked — the names fall
-	// under the "*.local" line most gitignore templates already carry. A
-	// read-only working directory is not an error; the mint falls back to the
-	// cache dir. Setting this variable is a deliberate statement about where
-	// specs live, so it turns the working-directory hint off entirely.
-	CacheDirEnv = "LIBTUNNEL_CACHE_DIR"
 )
 
 // The Cloudflare backend's variables, following the backend-scoped

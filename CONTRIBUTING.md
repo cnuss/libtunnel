@@ -130,18 +130,11 @@ Easy to get wrong from the diff alone:
   against `api.trycloudflare.com`, so a change is exercised against both
   endpoints in every PR. That cell's check context carries the provider name,
   which keeps it out of branch protection's required list on purpose — a bad
-  day at a third-party endpoint shouldn't block a merge. Its mints are always
-  fresh: the reclaim hints `latest.spec.json` seeds are a `tunnel.pizza`
-  extension. The spec cache key includes the provider, so one provider's
-  credentials are never offered to another.
-- **CI caches the project-scoped hints, not a cache dir.** The workflow
-  deliberately leaves `LIBTUNNEL_CACHE_DIR` unset so the live tier exercises
-  the working-directory hint it ships (#158): the suite's own
-  `e2e/libtunnel.local` (a test binary's working directory is its package's
-  source dir) and `e2e/hints.local/<name>` for the example children, each of
-  which runs in a directory of its own so their hints never cross. Setting the
-  variable would switch that mechanism off and leave CI caching something it
-  no longer used.
+  day at a third-party endpoint shouldn't block a merge.
+- **Every live run mints fresh.** libtunnel persists no specs, so nothing
+  carries a hostname between runs and each cell pays for its own mints. Keep
+  that in mind when adding live cases: the quick-tunnel API rate-limits, which
+  is why the e2e package narrows the live tier per platform.
 - **cloudflared registers prometheus collectors globally.** The Cloudflare
   engine swaps `prometheus.DefaultRegisterer` to a noop (under a mutex) for
   the construction window so host applications' metrics stay clean. Don't

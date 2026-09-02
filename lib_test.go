@@ -45,20 +45,6 @@ func TestFromFile(t *testing.T) {
 	}
 }
 
-// TestFromCachedHostname pins the cache-dir resolution: From with a bare
-// hostname replays the cached spec for it.
-func TestFromCachedHostname(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(v1.CacheDirEnv, dir)
-	spec := &cloudflare.Spec{Hostname: "cached.tunneled.pizza"}
-	if err := os.WriteFile(filepath.Join(dir, "cached.tunneled.pizza.spec.json"), []byte(spec.Serialize()), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if got := libtunnel.From("cached.tunneled.pizza").Hostname(); got != spec.Hostname {
-		t.Errorf("From(hostname).Hostname() = %q, want %q", got, spec.Hostname)
-	}
-}
-
 // TestFromBadInput pins the façade error contract: bad JSON or an unknown
 // backend yields a tunnel already canceled with the cause.
 func TestFromBadInput(t *testing.T) {

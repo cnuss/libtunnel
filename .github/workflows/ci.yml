@@ -66,9 +66,7 @@ jobs:
         include:
           # Same platform as the scenario-tier cell (linux/amd64), so this
           # runs the whole live suite — scenarios and examples — against
-          # api.trycloudflare.com. Its mints are fresh every run: the reclaim
-          # hints latest.spec.json seeds are a tunnel.pizza extension that
-          # Cloudflare's endpoint ignores.
+          # api.trycloudflare.com.
           - os: ubuntu-24.04
             go: stable
             provider: api.trycloudflare.com
@@ -130,50 +128,6 @@ jobs:
       # and the Dependabot exclusion (read from the event payload). A
       # `served: error code: 1033` failure here is edge route propagation
       # lag, not code — rerun the job.
-      #
-      # The spec cache persists the minting cells' hints across runs, so a run
-      # reclaims the previous run's tunnels instead of minting fresh (#142).
-      # The paths are the project-scoped hints libtunnel writes into the
-      # working directory (#158) — e2e/libtunnel.local for the suite itself
-      # (a test binary's working directory is its package's source dir) and
-      # e2e/hints.local for the per-example child directories. Note what is
-      # NOT set below: LIBTUNNEL_CACHE_DIR would be a deliberate statement
-      # that specs live elsewhere and would switch the project hint off, so
-      # CI would then be caching a mechanism it no longer used.
-      #
-      # Keyed per cell (a shared spec would put concurrent connectors with
-      # different origins on one hostname — crosstalk), per ref (a PR run and
-      # a main push overlap in time; sharing a spec across them has the same
-      # problem, so each ref works its own tunnel), per provider (a spec is a
-      # reclaim hint only for the provider that minted it, and offering one
-      # provider's id/name/secret to another both fails to reclaim and hands
-      # a third party credentials it has no business seeing), and per run.
-      #
-      # The run id is what keeps the entry fresh. A cache entry is immutable
-      # and actions/cache skips the save on an exact hit, so a static key is
-      # written once and frozen: the spec inside ages, the provider stops
-      # honoring it as a reclaim hint, and every later run mints fresh with
-      # no way to self-heal. That was the observed steady state (#155) — a
-      # day-old entry restored on every run while all three hostnames came
-      # back new. Appending the run id makes each run save its own entry, and
-      # restore-keys falls back to the newest one sharing the prefix, so the
-      # spec offered for reclaim is minutes old instead of days. The entries
-      # are ~1 KB and GitHub evicts them by age and total size on its own.
-      #
-      # The os list mirrors the e2e package's minting cells — the only cells
-      # with a spec worth keeping.
-      - name: spec cache
-        if: contains(fromJSON('["ubuntu-24.04", "windows-2025", "macos-26"]'), matrix.os)
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            e2e/libtunnel.local
-            e2e/libtunnel.owner.local
-            e2e/hints.local
-          key: libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-${{ matrix.provider }}-${{ github.run_id }}
-          restore-keys: |
-            libtunnel-spec-${{ github.ref }}-${{ matrix.os }}-${{ matrix.go }}-${{ matrix.provider }}-
-
       - name: e2e
         env:
           LIBTUNNEL__CLOUDFLARE_PROVIDER: ${{ matrix.provider }}

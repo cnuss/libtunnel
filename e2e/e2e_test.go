@@ -58,19 +58,10 @@ func (r *runner) run(t *testing.T, args ...string) (string, int) {
 	// Both names: v1.LogEnv is what the library reads, LIBTUNNEL_LOG_LEVEL what
 	// serve-tls checks to build its own logger.
 	//
-	// Each example runs in a working directory of its own, so its mint keeps
-	// its own project hint (#158) instead of sharing one: a child is a fresh
-	// process, and a shared hint would let its mint reclaim the suite's (or
-	// another example's) tunnel — putting this example on a hostname whose
-	// dead connectors still hold sticky edge routes. The directory persists
-	// and CI caches it (#147), so the example's own previous mint seeds its
-	// reclaim hints and it reuses its hostname rather than leaking a fresh
-	// one. LIBTUNNEL_CACHE_DIR is cleared rather than set: an inherited one
-	// would switch the child back to a machine-wide hint and undo the
-	// scoping.
-	cmd.Dir = workDir(t, "example-"+r.name)
-	cmd.Env = append(os.Environ(), v1.LogEnv+"=debug", "LIBTUNNEL_LOG_LEVEL=debug",
-		v1.CacheDirEnv+"=")
+	// Each example runs in a working directory of its own, so nothing it
+	// writes lands in the suite's source tree.
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(), v1.LogEnv+"=debug", "LIBTUNNEL_LOG_LEVEL=debug")
 	out, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {
