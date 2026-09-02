@@ -871,6 +871,8 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-connected.Wait():
+	case <-b.edgeReject.wait():
+		return b.credentialRejected()
 	case <-timeout.C:
 		return fmt.Errorf("%w: no connection after %d attempts in %s: %s",
 			v1.ErrEdgeUnreachable, b.edgeUp.attemptCount(), edgeBudget, edgeBlockedHint)
@@ -878,10 +880,22 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	return nil
 }
 
+// credentialRejected is what a caller sees when the edge refuses these
+// credentials: the class it can branch on, carrying the edge's own words and
+// none of edgeBlockedHint's advice, which is about a network this failure has
+// nothing to do with.
+func (b *Backend) credentialRejected() error {
+	return fmt.Errorf("%w: %s", v1.ErrCredentialRejected, b.edgeReject.message())
+}
+
 // edgeBlockedHint is cloudflared's own diagnosis of this failure, which it logs
-// at warn level from selectNextProtocol — where the tunnel's logger is silent
-// by default (see zerologger) and it is never seen. Repeated verbatim so the
-// error carries the same guidance, plus libtunnel's way around it.
+// at warn level from selectNextProtocol. Repeated verbatim so the error carries
+// the same guidance without the caller having to correlate it with a log line,
+// plus libtunnel's way around it.
+//
+// It rides only the timeout branch. A credential the edge refuses leaves
+// through its own case above, so reaching this means nothing better is known
+// about why the edge never answered.
 const edgeBlockedHint = "your machine/network is getting its egress UDP to port 7844 (or others) " +
 	"blocked or dropped. Make sure to allow egress connectivity as per " +
 	"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/ " +

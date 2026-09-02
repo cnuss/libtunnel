@@ -1448,3 +1448,34 @@ func TestCACertPoolCarriesEmbeddedRoots(t *testing.T) {
 		}
 	}
 }
+
+// TestEdgeRejectionBeatsTheBudget pins the shape of the failure a caller sees.
+// connect's select cannot be driven without a live edge, so this asserts the
+// error the refusal branch constructs: the class, the umbrella, the edge's own
+// words, and — the point of the fix — no firewall advice.
+func TestEdgeRejectionBeatsTheBudget(t *testing.T) {
+	b := New()
+	b.edgeReject = newEdgeReject()
+	b.edgeReject.fire("Unauthorized: Tunnel not found")
+
+	err := b.credentialRejected()
+
+	if !errors.Is(err, v1.ErrCredentialRejected) {
+		t.Errorf("err = %v, want errors.Is(_, ErrCredentialRejected)", err)
+	}
+	if !errors.Is(err, v1.ErrFailed) {
+		t.Errorf("err = %v, want errors.Is(_, ErrFailed)", err)
+	}
+	if errors.Is(err, v1.ErrEdgeUnreachable) {
+		t.Error("a refused credential must not read as an unreachable edge")
+	}
+	if !strings.Contains(err.Error(), "Unauthorized: Tunnel not found") {
+		t.Errorf("err = %v, want the edge's own message", err)
+	}
+	if strings.Contains(err.Error(), "egress") {
+		t.Errorf("err = %v, want no firewall advice on a credential failure", err)
+	}
+	if v1.Budget(err) != 0 {
+		t.Errorf("Budget = %s, want 0 (a dead credential is never retried)", v1.Budget(err))
+	}
+}
