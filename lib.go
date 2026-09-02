@@ -199,9 +199,20 @@ func Cloudflare() *cloudflare.Backend {
 }
 
 // From returns an unstarted tunnel that replays a previously serialized spec
-// instead of minting or adopting one — the credentials are pinned, so it
-// connects under the same hostname. spec is an existing file path, otherwise
-// the serialized JSON itself — from Serialize, or off LIBTUNNEL_SPEC.
+// instead of minting a new one. spec is an existing file path, otherwise the
+// serialized JSON itself — from Serialize, or off LIBTUNNEL_SPEC.
+//
+// The spec's identity rides the mint request, so the provider hands the same
+// tunnel back when it still exists. A provider that reaps idle tunnels may
+// have taken this one: if it can still give you the hostname, it does and the
+// replay succeeds on a new tunnel behind the same name. If it cannot, the
+// tunnel is canceled with ErrCredentialRejected (the spec is dead — discard it
+// and mint fresh) or ErrRejected (the hostname is someone else's now), so a
+// caller learns in one round trip rather than at the edge.
+//
+// A provider that cannot be reached at all is not an error: the spec is
+// replayed as given, which is what it did before the check existed, and a dead
+// spec then fails at the edge as it always would.
 //
 // Like New, it returns immediately and WithListener (or Listener) starts the
 // connection. A spec that can't be parsed, or whose backend tag is unknown,

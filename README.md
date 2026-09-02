@@ -374,10 +374,26 @@ conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 ## Replaying a spec
 
 `Serialize()` renders a live tunnel's spec as a tagged-envelope JSON string —
-the same form `LIBTUNNEL_SPEC` carries. `libtunnel.From(spec)` replays one,
-connecting under the same hostname instead of minting: `spec` is a path to a
-file holding that JSON, or the JSON itself. A bad or unknown spec yields a
-tunnel already canceled with the cause (off `Err()`).
+the same form `LIBTUNNEL_SPEC` carries. `libtunnel.From(spec)` replays one:
+`spec` is a path to a file holding that JSON, or the JSON itself. A bad or
+unknown spec yields a tunnel already canceled with the cause (off `Err()`).
+
+A replay asks the provider for that tunnel rather than assuming it survives —
+providers reap idle tunnels, and the provider is the only thing that knows.
+What comes back decides the outcome:
+
+| what happened | result |
+| --- | --- |
+| the tunnel is still yours | it connects, same tunnel |
+| it was reaped, but the hostname is still yours | it connects on a new tunnel behind the same name |
+| the hostname is gone | `ErrCredentialRejected` — discard the spec, mint fresh |
+| the hostname is someone else's now | `ErrRejected` |
+| the provider cannot be reached at all | the spec is replayed as given |
+
+That last row is what keeps an offline replay working: with a complete
+credential set and no network, `From` starts exactly as it did before the check
+existed. A spec that turns out to be dead then fails at the edge instead, with
+the same `ErrCredentialRejected`.
 
 libtunnel writes nothing to disk. Keeping a spec between runs is the caller's
 to do — and a spec is credentials, so store it as such.
