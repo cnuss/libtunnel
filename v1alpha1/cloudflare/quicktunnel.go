@@ -68,6 +68,49 @@ func (p *QuickTunnelProvider) SetLogger(log *slog.Logger) {
 	}
 }
 
+// reclaimOutcome reads the mint response's verdict on the reclaim hints the
+// request carried, and reports the ones a caller asked for and did not get.
+//
+// The endpoint always returns a working spec: hints mean "prefer this,
+// substitute if it is dead", which is the right default for a service whose
+// hostnames are ephemeral. X-Reclaimed says which of those happened, and that
+// is where the error comes from — a caller replaying a specific spec is owed
+// the news that it is gone, in this round trip, rather than discovering it
+// thirty seconds later when the edge refuses the registration.
+//
+// A substitution that keeps the hostname is not a failure: the identity a
+// caller serves on survived, and only the tunnel behind it is new. An absent
+// header means no usable hints were sent, so nothing was asked for.
+func reclaimOutcome(verdict string) error {
+	switch verdict {
+	case "", "tunnel", "hostname":
+		return nil
+	case "expired":
+		return verdictError{v1.ErrCredentialRejected, "the tunnel named by this spec is gone (X-Reclaimed: expired)"}
+	case "taken":
+		return verdictError{v1.ErrRejected, "the hostname named by this spec is held by someone else (X-Reclaimed: taken)"}
+	case "unknown":
+		return verdictError{v1.ErrProviderUnreachable, "the provider could not check whether this spec is still live (X-Reclaimed: unknown)"}
+	default:
+		// An unrecognized verdict is not a failure: the spec in the body
+		// works, and a provider is free to add outcomes this build predates.
+		return nil
+	}
+}
+
+// verdictError is an error read off X-Reclaimed rather than one from failing
+// to reach the provider at all. The two can share a class — a spec the
+// provider could not check and an endpoint that never answered are both
+// "provider unreachable" to a caller — but only the second may fall back to
+// the spec as given, so replaying has to tell them apart.
+type verdictError struct {
+	class   error
+	message string
+}
+
+func (e verdictError) Error() string { return e.class.Error() + ": " + e.message }
+func (e verdictError) Unwrap() error { return e.class }
+
 // Spec implements v1.Provider. It blocks until credentials are minted or ctx
 // is done, backing off linearly between attempts (the API rate-limits) — and
 // when a 429 carries Retry-After (seconds or HTTP-date), the longer of the
@@ -198,6 +241,9 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 				return nil, 0, fmt.Errorf("%w: %s", v1.ErrRejected, strings.Join(errorMessages, "; "))
 			}
 			return nil, 0, fmt.Errorf("tunnel credentials request failed: %s", strings.Join(errorMessages, "; "))
+		}
+		if err := reclaimOutcome(resp.Header.Get("X-Reclaimed")); err != nil {
+			return nil, 0, err
 		}
 		return &data.Result, 0, nil
 	}

@@ -6,8 +6,11 @@ package libtunnel_test
 // the top turns the process into the child.
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,10 +23,31 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
 
+// mintServer points the credential chain at a stub mint that answers with
+// spec and the given X-Reclaimed verdict. A replay consults the provider (it
+// is the provider that knows whether the tunnel still exists), so a test of
+// From needs one — the real endpoint is e2e's business, not a unit test's.
+func mintServer(t *testing.T, spec *cloudflare.Spec, reclaimed string) {
+	t.Helper()
+	body, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if reclaimed != "" {
+			w.Header().Set("X-Reclaimed", reclaimed)
+		}
+		fmt.Fprintf(w, `{"success":true,"result":%s}`, body)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv(v1.CloudflareProviderEnv, srv.URL)
+}
+
 // TestFromSerializeRoundTrip pins the Serialize -> From loop: a serialized spec
-// replays into a tunnel pinned to the same hostname, no mint, no network.
+// replays into a tunnel on the same hostname when the provider still has it.
 func TestFromSerializeRoundTrip(t *testing.T) {
 	want := &cloudflare.Spec{ID: "id-1", Hostname: "replay.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
+	mintServer(t, want, "tunnel")
 	tun := libtunnel.From(want.Serialize())
 	if got := tun.Hostname(); got != want.Hostname {
 		t.Errorf("Hostname() = %q, want %q", got, want.Hostname)
@@ -36,6 +60,7 @@ func TestFromSerializeRoundTrip(t *testing.T) {
 // TestFromFile pins that From reads a spec file path (the cache-file form).
 func TestFromFile(t *testing.T) {
 	spec := &cloudflare.Spec{Hostname: "file.tunneled.pizza"}
+	mintServer(t, spec, "tunnel")
 	path := filepath.Join(t.TempDir(), "file.tunneled.pizza.spec.json")
 	if err := os.WriteFile(path, []byte(spec.Serialize()), 0o600); err != nil {
 		t.Fatal(err)

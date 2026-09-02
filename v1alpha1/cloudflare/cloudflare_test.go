@@ -103,18 +103,45 @@ func clearSpecEnv(t *testing.T) {
 	}
 }
 
-// TestSpecFieldSettersPatchResolvedSpec pins the overlay: WithName patches
-// the field onto the spec the chain resolves (here a code-pinned one).
+// TestSpecFieldSettersPatchResolvedSpec pins the overlay: WithName patches the
+// field onto the spec the chain resolves.
 func TestSpecFieldSettersPatchResolvedSpec(t *testing.T) {
 	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
 
-	b := From(&Spec{ID: "id", Hostname: "pinned.tunneled.pizza"}).WithName("patched")
+	b := New().WithProvider(srv.URL).WithName("patched")
 	spec, err := b.Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Name != "patched" || spec.Hostname != "pinned.tunneled.pizza" {
-		t.Errorf("spec = %+v, want Name patched onto the pinned spec", spec)
+	if spec.Name != "patched" || spec.Hostname != "minted.tunneled.pizza" {
+		t.Errorf("spec = %+v, want Name patched onto the resolved spec", spec)
+	}
+}
+
+// TestReplayedSpecIsNotOverlaid pins the half that a replay depends on: the
+// hints From sends ride the request but are never stamped back onto the
+// answer, so a spec the provider substitutes arrives as the provider wrote it.
+// Overlaying would hand the caller a stale id on a fresh tunnel.
+func TestReplayedSpecIsNotOverlaid(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	replayed := &Spec{ID: "stale-id", Name: "mine", Hostname: "gone.tunneled.pizza", Secret: []byte("s")}
+	spec, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.ID == replayed.ID {
+		t.Errorf("ID = %q, want the provider's own — a replayed id must not be overlaid", spec.ID)
+	}
+	if spec.Hostname != "minted.tunneled.pizza" {
+		t.Errorf("Hostname = %q, want the provider's own", spec.Hostname)
+	}
+	if got := seen.Get("X-Id"); got != "stale-id" {
+		t.Errorf("X-Id = %q, want the replayed spec's id sent as a hint", got)
 	}
 }
 
@@ -124,7 +151,9 @@ func TestSpecFieldEnvBeatsCode(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.CloudflareNameEnv, "from-env")
 
-	b := From(&Spec{Hostname: "pinned.tunneled.pizza"}).WithName("from-code")
+	var seen http.Header
+	srv := mintServer(t, &seen)
+	b := New().WithProvider(srv.URL).WithName("from-code")
 	spec, err := b.Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1446,5 +1475,140 @@ func TestCACertPoolCarriesEmbeddedRoots(t *testing.T) {
 		if _, err := root.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
 			t.Fatalf("embedded root %q not in the pool: %v", root.Subject.CommonName, err)
 		}
+	}
+}
+
+// TestEdgeRejectionBeatsTheBudget pins the shape of the failure a caller sees.
+// connect's select cannot be driven without a live edge, so this asserts the
+// error the refusal branch constructs: the class, the umbrella, the edge's own
+// words, and — the point of the fix — no firewall advice.
+func TestEdgeRejectionBeatsTheBudget(t *testing.T) {
+	b := New()
+	b.edgeReject = newEdgeReject()
+	b.edgeReject.fire("Unauthorized: Tunnel not found")
+
+	err := b.credentialRejected()
+
+	if !errors.Is(err, v1.ErrCredentialRejected) {
+		t.Errorf("err = %v, want errors.Is(_, ErrCredentialRejected)", err)
+	}
+	if !errors.Is(err, v1.ErrFailed) {
+		t.Errorf("err = %v, want errors.Is(_, ErrFailed)", err)
+	}
+	if errors.Is(err, v1.ErrEdgeUnreachable) {
+		t.Error("a refused credential must not read as an unreachable edge")
+	}
+	if !strings.Contains(err.Error(), "Unauthorized: Tunnel not found") {
+		t.Errorf("err = %v, want the edge's own message", err)
+	}
+	if strings.Contains(err.Error(), "egress") {
+		t.Errorf("err = %v, want no firewall advice on a credential failure", err)
+	}
+	if v1.Budget(err) != 0 {
+		t.Errorf("Budget = %s, want 0 (a dead credential is never retried)", v1.Budget(err))
+	}
+}
+
+// TestReclaimOutcomeMapsVerdicts pins the verdict table. The provider always
+// answers with a working spec — hints mean "prefer this, substitute if it is
+// dead" — so the error is libtunnel's judgment about whether the caller got
+// what it replayed, not something the wire carries.
+func TestReclaimOutcomeMapsVerdicts(t *testing.T) {
+	for _, tc := range []struct {
+		verdict string
+		want    error
+	}{
+		{"", nil},         // no usable hints were sent; nothing was asked for
+		{"tunnel", nil},   // same tunnel back
+		{"hostname", nil}, // new tunnel, same hostname: the identity served on survived
+		{"expired", v1.ErrCredentialRejected},
+		{"taken", v1.ErrRejected},
+		{"unknown", v1.ErrProviderUnreachable},
+		{"something-this-build-predates", nil},
+	} {
+		err := reclaimOutcome(tc.verdict)
+		if tc.want == nil {
+			if err != nil {
+				t.Errorf("reclaimOutcome(%q) = %v, want nil", tc.verdict, err)
+			}
+			continue
+		}
+		if !errors.Is(err, tc.want) {
+			t.Errorf("reclaimOutcome(%q) = %v, want errors.Is(_, %v)", tc.verdict, err, tc.want)
+		}
+		if !errors.Is(err, v1.ErrFailed) {
+			t.Errorf("reclaimOutcome(%q) = %v, want it under ErrFailed", tc.verdict, err)
+		}
+		if !strings.Contains(err.Error(), tc.verdict) {
+			t.Errorf("reclaimOutcome(%q) = %v, want the verdict named in the message", tc.verdict, err)
+		}
+	}
+}
+
+// TestReplayFailsOnSubstitution pins the point of routing a replay through the
+// mint: a caller learns its spec is gone here, in one round trip, instead of
+// thirty seconds later when the edge refuses the registration.
+func TestReplayFailsOnSubstitution(t *testing.T) {
+	clearSpecEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Reclaimed", "expired")
+		fmt.Fprint(w, `{"success":true,"result":{"id":"fresh","hostname":"fresh.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	defer srv.Close()
+
+	replayed := &Spec{ID: "dead", Name: "mine", Hostname: "dead.tunneled.pizza", Secret: []byte("s")}
+	_, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
+	if !errors.Is(err, v1.ErrCredentialRejected) {
+		t.Fatalf("err = %v, want errors.Is(_, ErrCredentialRejected)", err)
+	}
+	if v1.Budget(err) != 0 {
+		t.Errorf("Budget = %s, want 0 — a substituted spec is not retried", v1.Budget(err))
+	}
+}
+
+// TestReplayFallsBackWhenProviderUnreachable pins the offline path: a complete
+// credential set still starts a process that cannot reach the mint, the way it
+// did before the reclaim check existed. A dead spec then fails at the edge,
+// which is the backstop, rather than failing to start at all.
+func TestReplayFallsBackWhenProviderUnreachable(t *testing.T) {
+	clearSpecEnv(t)
+	shortBudgets(t, 50*time.Millisecond)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // nothing is listening now, so the mint is refused
+
+	replayed := &Spec{ID: "id", Name: "mine", Hostname: "offline.tunneled.pizza", Secret: []byte("s")}
+	spec, err := From(replayed).WithProvider("http://" + addr).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatalf("Spec() = %v, want the replayed spec when the provider cannot be reached", err)
+	}
+	if spec.Hostname != replayed.Hostname || spec.ID != replayed.ID {
+		t.Errorf("spec = %+v, want the replayed one verbatim", spec)
+	}
+}
+
+// TestReplayDoesNotFallBackOnAVerdict pins the distinction the fallback turns
+// on: a provider that answered and said the spec was substituted has given the
+// answer the replay went to get, and must not be papered over with the spec.
+func TestReplayDoesNotFallBackOnAVerdict(t *testing.T) {
+	clearSpecEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Reclaimed", "unknown")
+		fmt.Fprint(w, `{"success":true,"result":{"id":"fresh","hostname":"fresh.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	defer srv.Close()
+	shortBudgets(t, 50*time.Millisecond)
+
+	replayed := &Spec{ID: "id", Name: "mine", Hostname: "unchecked.tunneled.pizza", Secret: []byte("s")}
+	_, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
+	if !errors.Is(err, v1.ErrProviderUnreachable) {
+		t.Fatalf("err = %v, want errors.Is(_, ErrProviderUnreachable)", err)
+	}
+	if !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("err = %v, want the verdict named", err)
 	}
 }

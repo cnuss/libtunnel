@@ -17,6 +17,7 @@ func TestFailureClassesAnswerErrFailed(t *testing.T) {
 	classes := []error{
 		v1.ErrCertificate,
 		v1.ErrRejected,
+		v1.ErrCredentialRejected,
 		v1.ErrProviderUnreachable,
 		v1.ErrEdgeUnreachable,
 		v1.ErrRateLimited,
@@ -74,6 +75,7 @@ func TestBudgets(t *testing.T) {
 	}{
 		{v1.ErrCertificate, 0},
 		{v1.ErrRejected, 0},
+		{v1.ErrCredentialRejected, 0},
 		{v1.ErrProviderUnreachable, 45 * time.Second},
 		{v1.ErrEdgeUnreachable, 30 * time.Second},
 		{v1.ErrRateLimited, 45 * time.Second},
@@ -95,5 +97,20 @@ func TestBudgetThroughWrapping(t *testing.T) {
 		fmt.Errorf("%w: resets in 12s", v1.ErrRateLimited))
 	if got, want := v1.Budget(err), 45*time.Second; got != want {
 		t.Errorf("Budget(wrapped) = %s, want %s", got, want)
+	}
+}
+
+// TestCredentialRejectionIsItsOwnClass pins the distinction that motivates a
+// separate class: a caller replaying a spec acts on this one by discarding it,
+// which is the wrong move for a provider that declined to mint.
+func TestCredentialRejectionIsItsOwnClass(t *testing.T) {
+	if errors.Is(v1.ErrCredentialRejected, v1.ErrRejected) {
+		t.Error("errors.Is(ErrCredentialRejected, ErrRejected) = true, want false")
+	}
+	if errors.Is(v1.ErrRejected, v1.ErrCredentialRejected) {
+		t.Error("errors.Is(ErrRejected, ErrCredentialRejected) = true, want false")
+	}
+	if got, want := v1.ErrCredentialRejected.Error(), "tunnel failed: credential rejected by the edge"; got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
 	}
 }

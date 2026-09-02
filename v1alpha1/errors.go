@@ -31,6 +31,7 @@ func Classify(err error) error {
 	for _, known := range []error{
 		v1.ErrCertificate,
 		v1.ErrRejected,
+		v1.ErrCredentialRejected,
 		v1.ErrProviderUnreachable,
 		v1.ErrEdgeUnreachable,
 		v1.ErrRateLimited,

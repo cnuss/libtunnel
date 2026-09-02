@@ -66,6 +66,13 @@ var (
 	// of it retryable.
 	ErrRejected error = &class{ErrFailed, "rejected by the provider", 0}
 
+	// ErrCredentialRejected is the Err result of a tunnel whose credentials
+	// the edge refused: the spec names a tunnel that no longer exists, or was
+	// never this caller's. Distinct from ErrRejected, which is a provider
+	// declining to mint — the recoveries differ, and only this one means the
+	// spec that was replayed is dead and should be discarded.
+	ErrCredentialRejected error = &class{ErrFailed, "credential rejected by the edge", 0}
+
 	// ErrProviderUnreachable is the Err result of a mint endpoint that never
 	// answered: it refuses, times out, or keeps returning 5xx for the budget.
 	//
@@ -362,7 +369,8 @@ type Tunnel interface {
 	// Err reports why the tunnel ended (nil while it is alive). A tunnel that
 	// will not come up reports a failure class: errors.Is(err, ErrFailed) is
 	// the coarse check, and the class wrapping it — ErrCertificate,
-	// ErrRejected, ErrProviderUnreachable, ErrEdgeUnreachable, ErrRateLimited
+	// ErrRejected, ErrCredentialRejected, ErrProviderUnreachable,
+	// ErrEdgeUnreachable, ErrRateLimited
 	// — is what an operator can act on. A tunnel closed deliberately reports
 	// ErrClosed, which is terminal but not a failure.
 	Err() error

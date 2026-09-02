@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -140,6 +141,12 @@ type Backend struct {
 	// fields carries the spec-field overrides set via WithID and friends,
 	// applied by the overlay provider when the spec resolves.
 	fields Spec
+	// hints is the spec being replayed (From). Its identity rides the mint
+	// request so the provider can hand the same tunnel back, but unlike
+	// fields it is never overlaid onto the result — a spec the provider
+	// substitutes must come back as the provider wrote it, or a stale id
+	// would be stamped over a fresh one. Nil unless this backend is a replay.
+	hints *Spec
 	// providerHost overrides the quick-tunnel mint provider host (WithProvider);
 	// the endpoint https://<host>/tunnel is synthesized from it (a value carrying
 	// a scheme is used verbatim). Empty means the default (tunnel.pizza);
@@ -155,12 +162,14 @@ type Backend struct {
 	// and pinned specs never hit the API, so these never apply to them.
 	headers http.Header
 	// Runtime state wired at connect. reconnected feeds the supervisor's
-	// external-control channel, edgeUp tracks edge connections, and reconnectCtx
+	// external-control channel, edgeUp tracks edge connections, edgeReject
+	// carries a refused registration back from the log bridge, and reconnectCtx
 	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
 	// and listener is the loopback socket cloudflared dials to reach it. All nil
 	// until connect runs.
 	reconnected  chan supervisor.ReconnectSignal
 	edgeUp       *edgeUpWatcher
+	edgeReject   *edgeReject
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
 	listener     net.Listener
@@ -186,14 +195,46 @@ func New() *Backend {
 	return b
 }
 
-// From returns a Cloudflare backend pinned to spec: it connects with the
-// given credentials instead of minting. It backs libtunnel.From. The pin sits
-// at the end of the env chain, so LIBTUNNEL_SPEC and LIBTUNNEL_FROM still
-// override it (env beats code).
+// From returns a Cloudflare backend that replays spec: its identity rides the
+// mint request as reclaim hints, so the provider hands the same tunnel back
+// when it still exists. It backs libtunnel.From.
+//
+// The provider always answers with a working spec, substituting when the
+// original is gone, and says which happened. A substitution that keeps the
+// hostname is honored silently — the identity a caller serves on survived. One
+// that does not is an error (see reclaimOutcome): a caller replaying a
+// specific spec is owed that news here, in one round trip, rather than at the
+// edge thirty seconds later.
+//
+// It sits at the end of the env chain, so LIBTUNNEL_SPEC and LIBTUNNEL_FROM
+// still override it (env beats code).
 func From(spec *Spec) *Backend {
 	b := New()
-	b.provider = v1alpha1.Static(spec)
+	b.hints = spec
 	return b
+}
+
+// hintFields is the identity the mint request carries: a replayed spec's
+// fields, with the explicit setters (WithID and friends) over the top, since
+// a caller naming a field outright means it.
+func (b *Backend) hintFields() Spec {
+	var out Spec
+	if b.hints != nil {
+		out = *b.hints
+	}
+	if b.fields.ID != "" {
+		out.ID = b.fields.ID
+	}
+	if b.fields.Name != "" {
+		out.Name = b.fields.Name
+	}
+	if len(b.fields.Secret) > 0 {
+		out.Secret = b.fields.Secret
+	}
+	if b.fields.Hostname != "" {
+		out.Hostname = b.fields.Hostname
+	}
+	return out
 }
 
 // WithTLS declares whether the origin terminates TLS (https vs http ingress).
@@ -440,10 +481,51 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 		if host != "" {
 			qt.URL = providerEndpoint(host)
 		}
-		qt.Headers = mintHeaders(b.fields, b.headers)
+		qt.Headers = mintHeaders(b.hintFields(), b.headers)
 		next = qt
 	}
+	if b.hints != nil {
+		next = &replayFallback{spec: b.hints, next: next}
+	}
 	return v1alpha1.Env(b.Name(), overlay{fields: b.fields, next: v1alpha1.Replay(b.Name(), next)})
+}
+
+// replayFallback serves the spec being replayed when the provider cannot be
+// reached at all, so a complete credential set still starts an air-gapped or
+// flaky-network process the way it did before the reclaim check existed.
+//
+// Only an unreachable provider falls back. A verdict — the provider answered
+// and said the spec was substituted — is the answer the replay went to get,
+// and is returned as the error it is.
+type replayFallback struct {
+	spec *Spec
+	next v1.Provider[*Spec]
+	log  *slog.Logger
+}
+
+// SetLogger keeps the tunnel's logger for the fallback warning and forwards it
+// to the wrapped provider.
+func (p *replayFallback) SetLogger(log *slog.Logger) {
+	p.log = log
+	if pl, ok := p.next.(v1alpha1.LoggerSetter); ok {
+		pl.SetLogger(log)
+	}
+}
+
+func (p *replayFallback) Spec(ctx context.Context) (*Spec, error) {
+	spec, err := p.next.Spec(ctx)
+	if err == nil {
+		return spec, nil
+	}
+	var verdict verdictError
+	if errors.As(err, &verdict) || !errors.Is(err, v1.ErrProviderUnreachable) {
+		return nil, err
+	}
+	if p.log != nil {
+		p.log.Warn("mint provider unreachable, replaying the spec as given", "error", err,
+			"hostname", p.spec.GetHostname())
+	}
+	return p.spec, nil
 }
 
 // mintHeaders resolves the mint request headers, three layers, each beating
@@ -681,6 +763,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	// pipeline are live.
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edgeUp = newEdgeUpWatcher()
+	b.edgeReject = newEdgeReject()
 	b.reconnectCtx = t.Context()
 	wsOrigin, _ := t.WebSocketOrigin()
 	b.proxy = newOriginProxy(originURLs, wsOrigin, t.Logger(), transport)
@@ -694,7 +777,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origins", originURLs)
 	service := (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
 	ctx := t.Context()
-	log := zerologger(t.Logger())
+	log := zerologger(t.Logger(), b.edgeReject)
 	spec := t.Spec()
 	if spec == nil {
 		return fmt.Errorf("no spec resolved")
@@ -868,6 +951,8 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-connected.Wait():
+	case <-b.edgeReject.wait():
+		return b.credentialRejected()
 	case <-timeout.C:
 		return fmt.Errorf("%w: no connection after %d attempts in %s: %s",
 			v1.ErrEdgeUnreachable, b.edgeUp.attemptCount(), edgeBudget, edgeBlockedHint)
@@ -875,10 +960,22 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	return nil
 }
 
+// credentialRejected is what a caller sees when the edge refuses these
+// credentials: the class it can branch on, carrying the edge's own words and
+// none of edgeBlockedHint's advice, which is about a network this failure has
+// nothing to do with.
+func (b *Backend) credentialRejected() error {
+	return fmt.Errorf("%w: %s", v1.ErrCredentialRejected, b.edgeReject.message())
+}
+
 // edgeBlockedHint is cloudflared's own diagnosis of this failure, which it logs
-// at warn level from selectNextProtocol — where the tunnel's logger is silent
-// by default (see zerologger) and it is never seen. Repeated verbatim so the
-// error carries the same guidance, plus libtunnel's way around it.
+// at warn level from selectNextProtocol. Repeated verbatim so the error carries
+// the same guidance without the caller having to correlate it with a log line,
+// plus libtunnel's way around it.
+//
+// It rides only the timeout branch. A credential the edge refuses leaves
+// through its own case above, so reaching this means nothing better is known
+// about why the edge never answered.
 const edgeBlockedHint = "your machine/network is getting its egress UDP to port 7844 (or others) " +
 	"blocked or dropped. Make sure to allow egress connectivity as per " +
 	"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/ " +
