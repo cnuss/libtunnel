@@ -3,7 +3,6 @@ package cloudflare
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,9 +29,9 @@ var budget = v1.Budget
 
 // QuickTunnelProvider mints an anonymous *.tunneled.pizza tunnel from the
 // quick-tunnel API, retrying with linear backoff until the context is done.
-// The most recently minted spec (latest.spec.json in the cache dir) seeds the
-// request's reclaim hints, so a provider that reaps idle tunnels can hand the
-// same tunnel back instead of minting fresh — see Spec.
+// Spec-field setters carried through Headers ride the request as reclaim
+// hints, so a provider that reaps idle tunnels can hand the named tunnel back
+// instead of minting fresh — see Spec.
 type QuickTunnelProvider struct {
 	// URL overrides the quick-tunnel API endpoint (synthesized from WithProvider
 	// / its LIBTUNNEL__CLOUDFLARE_PROVIDER mirror, or set directly in tests).
@@ -74,13 +73,11 @@ func (p *QuickTunnelProvider) SetLogger(log *slog.Logger) {
 // when a 429 carries Retry-After (seconds or HTTP-date), the longer of the
 // two waits is honored.
 //
-// The mint request carries reclaim hints (X-Id / X-Name / X-Secret) seeded
-// from the most recently minted spec, latest.spec.json in the cache dir, for
-// whichever of those keys Headers does not already set — the cache is a hint
-// source, never credentials, and the backend decides whether to hand that
-// tunnel back. A mint rejected while carrying cache-derived hints retries
-// once, immediately, without them (the rejection judged the reclaim, not a
-// fresh mint); a rejection with no cache hints in play stays terminal.
+// The mint request carries whatever reclaim hints Headers holds (X-Id /
+// X-Name / X-Secret, from the spec-field setters): a hint names a tunnel to
+// hand back, never a credential to adopt, and the backend decides whether to
+// honor it. A refused mint is terminal — the backend has judged the request
+// it was given.
 func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	log := p.Log
 	if log == nil {
@@ -124,40 +121,17 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		Timeout: 15 * time.Second,
 	}
 
-	// Reclaim hints from the most recently minted spec (latest.spec.json,
-	// #142): only for the hint keys p.Headers does not already carry — the
-	// explicit spec-field setters and WithHeader land there and win. The
-	// cache seeds hints, never credentials: the request always mints, and
-	// the backend decides whether to hand the cached tunnel back.
-	cacheHints := http.Header{}
-	var cached Spec
-	if v1alpha1.LatestSpec(backendName, &cached) {
-		if cached.ID != "" && p.Headers.Get("X-Id") == "" {
-			cacheHints.Set("X-Id", cached.ID)
-		}
-		if cached.Name != "" && p.Headers.Get("X-Name") == "" {
-			cacheHints.Set("X-Name", cached.Name)
-		}
-		if len(cached.Secret) > 0 && p.Headers.Get("X-Secret") == "" {
-			cacheHints.Set("X-Secret", base64.StdEncoding.EncodeToString(cached.Secret))
-		}
-	}
-
 	// fetch's middle result is the server-requested retry delay: a 429's
 	// Retry-After when it carries one, zero otherwise.
-	fetch := func(hints http.Header) (*Spec, time.Duration, error) {
+	fetch := func() (*Spec, time.Duration, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to create request: %w", err)
 		}
 		req.Header.Add("Content-Type", "application/json")
 		req.Header.Add("User-Agent", fmt.Sprintf("cloudflared/%s", cloudflaredVersion))
-		for k, vs := range hints {
-			req.Header[k] = vs
-		}
 		// Caller headers (WithHeader) apply over the defaults above — a supplied
-		// key replaces the default for that key. (Cache hints never share a key
-		// with them by construction.)
+		// key replaces the default for that key.
 		for k, vs := range p.Headers {
 			req.Header.Del(k)
 			for _, v := range vs {
@@ -229,7 +203,6 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	}
 
 	sleep := 0 * time.Second
-	hints := cacheHints
 	attempts := 0
 	// Each class keeps its own clock, started at its first failure, so a mint
 	// that hits a rate limit and then a flaky resolver is not charged twice
@@ -239,21 +212,9 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	since := map[error]time.Time{}
 	for {
 		attempts++
-		spec, retryAfter, err := fetch(hints)
+		spec, retryAfter, err := fetch()
 		if err == nil {
 			return spec, nil
-		}
-
-		if errors.Is(err, v1.ErrRejected) && len(hints) > 0 {
-			// The backend declined to hand the cached tunnel back (reaped
-			// and unreclaimable, claimed elsewhere). That verdict is about
-			// the reclaim, not about a fresh mint — retry once, immediately,
-			// without the cache-derived hints. A rejection of the retry has
-			// no hints left and falls through below, terminal, exactly as
-			// when no cache was involved.
-			log.Warn("cached spec refused by the mint provider, minting fresh", "error", err)
-			hints = nil
-			continue
 		}
 
 		class := v1alpha1.Classify(err)

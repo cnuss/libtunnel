@@ -151,7 +151,6 @@ func Cloudflare() v1.Backend[*cloudflare.Spec]   // in-process cloudflared engin
                                                  // an anonymous quick tunnel
 func From(spec string) v1.Tunnel                 // replay a serialized spec (JSON,
                                                  // file path, or cached hostname)
-func Hosts() []string                            // public URLs of cached specs
 func Version() string                            // the libtunnel release this build
                                                  // links against (matches the git tag
                                                  // and the container image tag)
@@ -370,38 +369,14 @@ conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 
 ## Replaying a spec
 
-A freshly minted spec is cached to disk as `<hostname>.spec.json` (the
-`Serialize()` envelope, same form as `LIBTUNNEL_SPEC`) under the cache dir —
-`LIBTUNNEL_CACHE_DIR` if set, else a per-user location from `os.UserCacheDir()`.
-`libtunnel.Hosts()` lists the cached tunnels as `https://<host>:443/` URLs, and
-`libtunnel.From(spec)` replays one — `spec` is the JSON, a file path, or just a
-cached hostname — connecting under the same hostname instead of minting. Only
-minted specs are cached (adopted or `From`-loaded ones are not), and a
-bad/unknown spec yields a tunnel already canceled with the cause (off `Err()`).
+`Serialize()` renders a live tunnel's spec as a tagged-envelope JSON string —
+the same form `LIBTUNNEL_SPEC` carries. `libtunnel.From(spec)` replays one,
+connecting under the same hostname instead of minting: `spec` is a path to a
+file holding that JSON, or the JSON itself. A bad or unknown spec yields a
+tunnel already canceled with the cause (off `Err()`).
 
-A mint also writes `latest.spec.json` — the most recent spec under a fixed
-name. It is never adopted as credentials: its fields seed the next mint's
-reclaim hints (`X-Id`/`X-Name`/`X-Secret`, under any explicit setters), so a
-provider that reaps idle tunnels hands the same tunnel back instead of minting
-fresh. If the provider refuses the reclaim, the mint retries once without the
-cached hints and the fresh spec overwrites `latest.spec.json`.
-
-Unless `LIBTUNNEL_CACHE_DIR` is set, that hint is also written into the working
-directory as **`libtunnel.local`** (with `libtunnel.owner.local` beside it), so
-a service restarted from the same directory reclaims its own hostname rather
-than racing whatever else was minted on the machine that day — and the project
-you are in can see which tunnel it has been getting. **Both files are
-credentials.** They are written mode `0600`, and their names fall under the
-`*.local` line most gitignore templates already carry — keep them untracked. A
-read-only working directory is not an error; the mint falls back to the cache
-dir. Setting `LIBTUNNEL_CACHE_DIR` says where specs live deliberately, so it
-turns the working-directory hint off entirely.
-
-The owner file records the pid holding the tunnel, so a second process does not
-reclaim a hostname the first one is still serving — otherwise two connectors
-with different origins end up behind one hostname, which is silent and
-intermittent from either side. A dead owner (exit or crash) frees the hint
-immediately.
+libtunnel writes nothing to disk. Keeping a spec between runs is the caller's
+to do — and a spec is credentials, so store it as such.
 
 ```go
 // replay the most recently cached tunnel by hostname
@@ -423,7 +398,6 @@ rebuild. (The one exception is noted below.)
 | `LIBTUNNEL_HTTP2` | `WithHTTP2()` | Same rules as `LIBTUNNEL_TLS`. |
 | `LIBTUNNEL_LOG` | `WithLogger()` | `debug`\|`info`\|`warn`\|`error`: the default logger becomes a stderr text logger at that level instead of silent. *The exception:* an explicit `WithLogger` keeps its handler — env carries a level, not a sink. |
 | `LIBTUNNEL_HOSTNAME` | — | Export-only mirror of the minted spec's hostname, for tooling; never adopted. |
-| `LIBTUNNEL_CACHE_DIR` | — | Where minted specs are cached and `From`/`Hosts` look; also holds `latest.spec.json`, which seeds the next mint's reclaim hints. Unset, the hint is also written to `./libtunnel.local` (credentials — keep untracked); set, it is not. |
 
 Backend-scoped variables follow `LIBTUNNEL__<BACKEND>_<FIELD>` (double
 underscore namespaces the backend) and live with their backend package. For
@@ -433,7 +407,7 @@ credential set (id, hostname, account tag, secret) skips resolution entirely.
 When the chain does mint, the fields known beforehand also ride the mint
 request as reclaim hints — `X-Id`, `X-Name`, `X-Secret` (base64) — so a
 provider that reaps idle tunnels can hand the matching tunnel back instead of
-minting fresh:
+minting fresh. Only fields the caller supplies become hints:
 
 | Variable | Mirrors |
 | -------- | ------- |
@@ -443,7 +417,7 @@ minting fresh:
 | `LIBTUNNEL__CLOUDFLARE_ACCOUNT_TAG` | `WithAccountTag()` |
 | `LIBTUNNEL__CLOUDFLARE_SECRET` | `WithSecret()` (base64) |
 | `LIBTUNNEL__CLOUDFLARE_PROVIDER` | `WithProvider()` — quick-tunnel provider host, default `tunnel.pizza` (endpoint `https://<host>/tunnel` synthesized; a value with a scheme is used verbatim) |
-| `LIBTUNNEL__CLOUDFLARE_HEADERS` | `WithHeader()` — request headers on the mint call, comma-separated `K=V` (e.g. `X-Opaque=true`, or `X-Ephemeral=true` to mark the mint unreclaimable once reaped); entries beat code per key, and the reclaim hints too. No escaping — values can't contain `,` or `=`. Mint-only. |
+| `LIBTUNNEL__CLOUDFLARE_HEADERS` | `WithHeader()` — request headers on the mint call, comma-separated `K=V` (e.g. `X-Opaque=true`, or `X-Ephemeral=true` to mark the mint unreclaimable once reaped); entries beat code per key. No escaping — values can't contain `,` or `=`. Mint-only. |
 | `LIBTUNNEL__CLOUDFLARE_EDGE` | `WithEdge()` — comma-separated `host:port` list to dial for the tunnel edge instead of discovering it by SRV (which yields Cloudflare's edge on port 7844). Replaces the code value wholesale; forces the `http2` edge protocol. For reaching the edge through a relay on an allowed port. |
 
 The Cloudflare backend also has a bare activation switch, `LIBTUNNEL__CLOUDFLARE=1`,

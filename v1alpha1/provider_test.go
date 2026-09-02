@@ -3,15 +3,12 @@ package v1alpha1_test
 import (
 	"context"
 	"crypto/x509"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -19,19 +16,6 @@ import (
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare"
 )
-
-// TestMain redirects the cache dir to a throwaway: minting (even the fake mints
-// below) caches the spec there, and the suite must not touch a real cache.
-func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "libtunnel-cache")
-	if err != nil {
-		panic(err)
-	}
-	os.Setenv(v1.CacheDirEnv, dir)
-	code := m.Run()
-	os.RemoveAll(dir)
-	os.Exit(code)
-}
 
 func TestSpecEnvironRoundTrip(t *testing.T) {
 	spec := &cloudflare.Spec{
@@ -89,84 +73,6 @@ func TestExportSpecGuardsSelfAdoption(t *testing.T) {
 	}
 }
 
-func TestMintCachesSpec(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(v1.CacheDirEnv, dir)
-	t.Setenv(v1.SpecEnv, "") // force the mint path, not adopt
-
-	next := &trackingProvider{spec: &cloudflare.Spec{Hostname: "cached.tunneled.pizza"}}
-	if _, err := v1alpha1.Env("cloudflare", next).Spec(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	path := filepath.Join(dir, "cached.tunneled.pizza.spec.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("mint did not cache the spec at %s: %v", path, err)
-	}
-	tag, _, err := v1alpha1.DecodeSpec(string(data))
-	if err != nil || tag != "cloudflare" {
-		t.Errorf("cache content = %q (tag %q, err %v), want a cloudflare envelope", data, tag, err)
-	}
-}
-
-func TestAdoptedSpecIsNotCached(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(v1.CacheDirEnv, dir)
-	t.Setenv(v1.SpecEnv, `{"backend":"cloudflare","spec":{"hostname":"adopted.tunneled.pizza"}}`)
-
-	next := &trackingProvider{}
-	if _, err := v1alpha1.Env("cloudflare", next).Spec(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	path := filepath.Join(dir, "adopted.tunneled.pizza.spec.json")
-	if _, err := os.Stat(path); err == nil {
-		t.Errorf("adopted spec was cached at %s; want mint-only caching", path)
-	}
-}
-
-func TestCacheDirDefaultUsesPackagePath(t *testing.T) {
-	t.Setenv(v1.CacheDirEnv, "") // unset -> default
-	dir, err := v1alpha1.CacheDir()
-	if err != nil {
-		t.Skipf("no user cache dir: %v", err)
-	}
-	if !strings.HasSuffix(filepath.ToSlash(dir), "github.com/cnuss/libtunnel/v1") {
-		t.Errorf("CacheDir() = %q, want it namespaced by the v1 package path", dir)
-	}
-}
-
-func TestHostsListsCachedSpecs(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(v1.CacheDirEnv, dir)
-
-	for _, h := range []string{"bbb.tunneled.pizza", "aaa.tunneled.pizza"} {
-		spec := &cloudflare.Spec{Hostname: h}
-		if err := os.WriteFile(filepath.Join(dir, h+".spec.json"), []byte(spec.Serialize()), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// A non-spec file is ignored.
-	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("ignore me"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	got := v1alpha1.Hosts()
-	want := []string{
-		"https://aaa.tunneled.pizza:443/",
-		"https://bbb.tunneled.pizza:443/",
-	}
-	if len(got) != len(want) {
-		t.Fatalf("Hosts() = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("Hosts()[%d] = %q, want %q (sorted, 443 backfilled)", i, got[i], want[i])
-		}
-	}
-}
-
 func TestSpecFromEnvAbsent(t *testing.T) {
 	t.Setenv(v1.SpecEnv, "")
 	if ok, err := v1alpha1.SpecFromEnv("cloudflare", &cloudflare.Spec{}); ok || err != nil {
@@ -201,20 +107,19 @@ func TestSpecFromEnvRejectsUntaggedSpec(t *testing.T) {
 }
 
 // trackingProvider records whether it was consulted.
-// TestReplayEnvReplaysCachedSpec pins LIBTUNNEL_FROM: a bare hostname
-// resolves through the cache (like libtunnel.From) and supersedes the wrapped
-// provider — even a code-pinned spec.
-func TestReplayEnvReplaysCachedSpec(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(v1.CacheDirEnv, dir)
+// TestReplayEnvReplaysSpecFile pins LIBTUNNEL_FROM: a path to a serialized
+// spec resolves (like libtunnel.From) and supersedes the wrapped provider —
+// even a code-pinned spec.
+func TestReplayEnvReplaysSpecFile(t *testing.T) {
 	envelope, err := v1alpha1.EncodeSpec("cloudflare", &cloudflare.Spec{Hostname: "replayed.tunneled.pizza"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "replayed.tunneled.pizza.spec.json"), []byte(envelope), 0o600); err != nil {
+	path := filepath.Join(t.TempDir(), "replayed.json")
+	if err := os.WriteFile(path, []byte(envelope), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(v1.FromEnv, "replayed.tunneled.pizza")
+	t.Setenv(v1.FromEnv, path)
 
 	pinned := &trackingProvider{spec: &cloudflare.Spec{Hostname: "pinned.tunneled.pizza"}}
 	spec, err := v1alpha1.Replay("cloudflare", v1.Provider[*cloudflare.Spec](pinned)).Spec(context.Background())
@@ -420,209 +325,5 @@ func TestEnvProviderNeverAdoptsOwnExport(t *testing.T) {
 	}
 	if spec.Hostname != "beta.tunneled.pizza" {
 		t.Errorf("second tunnel's Hostname = %q, want its own mint", spec.Hostname)
-	}
-}
-
-// TestMintCachesLatestSpec pins the latest.spec.json write and the
-// self-cache guard (#142): a mint through the env chain records the spec
-// under the fixed name for the NEXT process — this process's own LatestSpec
-// skips it, or a second tunnel here would reclaim the first's live tunnel.
-func TestMintCachesLatestSpec(t *testing.T) {
-	t.Setenv(v1.SpecEnv, "")
-	dir := t.TempDir()
-	t.Setenv(v1.CacheDirEnv, dir)
-
-	spec := &cloudflare.Spec{ID: "id-latest", Hostname: "cachedmint.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
-	if _, err := v1alpha1.Env("cloudflare", v1alpha1.Static(spec)).Spec(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := os.ReadFile(filepath.Join(dir, "latest.spec.json"))
-	if err != nil {
-		t.Fatalf("latest.spec.json not written: %v", err)
-	}
-	if backend, _, err := v1alpha1.DecodeSpec(string(data)); err != nil || backend != "cloudflare" {
-		t.Errorf("latest.spec.json envelope = (%q, %v), want a cloudflare envelope", backend, err)
-	}
-	var got cloudflare.Spec
-	if v1alpha1.LatestSpec("cloudflare", &got) {
-		t.Error("LatestSpec = true for a spec this process cached itself, want the self-cache skip")
-	}
-}
-
-// TestLatestSpecLoadsPreviousProcessSpec pins the read half: a
-// latest.spec.json left behind by another process (written directly here)
-// loads — for the matching backend only.
-func TestLatestSpecLoadsPreviousProcessSpec(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(v1.CacheDirEnv, dir)
-
-	spec := &cloudflare.Spec{ID: "id-prev", Hostname: "previous.tunneled.pizza"}
-	if err := os.WriteFile(filepath.Join(dir, "latest.spec.json"), []byte(spec.Serialize()), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	var got cloudflare.Spec
-	if !v1alpha1.LatestSpec("cloudflare", &got) {
-		t.Fatal("LatestSpec = false, want the previous process's spec loaded")
-	}
-	if got.ID != spec.ID || got.Hostname != spec.Hostname {
-		t.Errorf("LatestSpec loaded %+v, want %+v", got, *spec)
-	}
-	var foreign cloudflare.Spec
-	if v1alpha1.LatestSpec("other", &foreign) {
-		t.Error("LatestSpec = true for a foreign backend tag, want absent")
-	}
-}
-
-// TestLatestSpecAbsent pins the quiet default: an empty cache reads as
-// absent, never an error — the file is a hint source, not credentials.
-func TestLatestSpecAbsent(t *testing.T) {
-	t.Setenv(v1.CacheDirEnv, t.TempDir())
-
-	var got cloudflare.Spec
-	if v1alpha1.LatestSpec("cloudflare", &got) {
-		t.Error("LatestSpec = true with an empty cache, want false")
-	}
-}
-
-// deadPid returns the pid of a process that has certainly exited: this test
-// binary re-run with a filter that matches nothing, waited to completion.
-func deadPid(t *testing.T) int {
-	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^$")
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("spawning a throwaway child: %v", err)
-	}
-	return cmd.ProcessState.Pid()
-}
-
-// writeHint stages a hint file and, when pid is non-zero, the owner sidecar
-// naming the process that holds the tunnel it points at.
-func writeHint(t *testing.T, dir, specFile, ownerFile string, spec *cloudflare.Spec, pid int) {
-	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, specFile), []byte(spec.Serialize()), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if pid == 0 {
-		return
-	}
-	owner := fmt.Sprintf(`{"pid":%d,"hostname":%q}`, pid, spec.Hostname)
-	if err := os.WriteFile(filepath.Join(dir, ownerFile), []byte(owner), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestLatestSpecSkipsSpecOwnedByLiveProcess pins the cross-process half of the
-// reclaim guard (#157): a hint whose owning process is still running names a
-// tunnel that is still connected, so handing it out as a reclaim hint would
-// put two connectors with different origins behind one hostname. The
-// in-process selfCached map cannot see another process, so the owner sidecar
-// carries the liveness signal.
-func TestLatestSpecSkipsSpecOwnedByLiveProcess(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(v1.CacheDirEnv, dir)
-
-	spec := &cloudflare.Spec{ID: "id-live", Hostname: "live.tunneled.pizza"}
-	writeHint(t, dir, "latest.spec.json", "latest.spec.owner", spec, os.Getpid())
-
-	var got cloudflare.Spec
-	if v1alpha1.LatestSpec("cloudflare", &got) {
-		t.Error("LatestSpec = true for a spec whose owner is alive, want the reclaim skipped")
-	}
-}
-
-// TestLatestSpecLoadsSpecOwnedByExitedProcess is the other half: once the
-// owning process is gone the tunnel is free, so the hint is offered again —
-// including after a crash, since a dead pid is a dead pid.
-func TestLatestSpecLoadsSpecOwnedByExitedProcess(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(v1.CacheDirEnv, dir)
-
-	spec := &cloudflare.Spec{ID: "id-gone", Hostname: "gone.tunneled.pizza"}
-	writeHint(t, dir, "latest.spec.json", "latest.spec.owner", spec, deadPid(t))
-
-	var got cloudflare.Spec
-	if !v1alpha1.LatestSpec("cloudflare", &got) {
-		t.Fatal("LatestSpec = false for a spec whose owner exited, want it offered")
-	}
-	if got.Hostname != spec.Hostname {
-		t.Errorf("LatestSpec loaded %q, want %q", got.Hostname, spec.Hostname)
-	}
-}
-
-// projectScope points a test at a working directory and a user cache of its
-// own, with v1.CacheDirEnv unset so the project-scoped hint file is in play.
-func projectScope(t *testing.T) (cwd, userCache string) {
-	t.Helper()
-	cwd, userCache = t.TempDir(), t.TempDir()
-	t.Chdir(cwd)
-	t.Setenv(v1.CacheDirEnv, "")
-	// os.UserCacheDir reads a different variable per platform; set all three
-	// so the suite never touches the real user cache.
-	t.Setenv("XDG_CACHE_HOME", userCache)
-	t.Setenv("HOME", userCache)
-	t.Setenv("LOCALAPPDATA", userCache)
-	return cwd, userCache
-}
-
-// TestCacheSpecWritesProjectHint pins the project-scoped hint (#158): with no
-// explicit cache dir, a mint leaves its hint in the working directory, so the
-// tunnel identity travels with the project instead of being a machine-global
-// fact. The name ends in .local, which the common gitignore templates already
-// cover, and the mode stays 0600 — a spec is credentials.
-func TestCacheSpecWritesProjectHint(t *testing.T) {
-	cwd, _ := projectScope(t)
-
-	spec := &cloudflare.Spec{ID: "id-proj", Hostname: "project.tunneled.pizza"}
-	if err := v1alpha1.CacheSpec(spec); err != nil {
-		t.Fatal(err)
-	}
-
-	info, err := os.Stat(filepath.Join(cwd, "libtunnel.local"))
-	if err != nil {
-		t.Fatalf("project hint not written: %v", err)
-	}
-	// Windows has no Unix permission bits: Go synthesizes 0666 for any
-	// writable file whatever mode the write asked for, so the assertion only
-	// means something where the mode is real.
-	if runtime.GOOS != "windows" {
-		if perm := info.Mode().Perm(); perm&0o077 != 0 {
-			t.Errorf("project hint mode = %v, want no group/other access", perm)
-		}
-	}
-}
-
-// TestLatestSpecPrefersProjectHint pins the precedence: the working
-// directory's hint is what "most recent" means for this project, so it beats
-// whatever another project left in the shared user cache.
-func TestLatestSpecPrefersProjectHint(t *testing.T) {
-	cwd, _ := projectScope(t)
-
-	mine := &cloudflare.Spec{ID: "id-mine", Hostname: "mine.tunneled.pizza"}
-	writeHint(t, cwd, "libtunnel.local", "libtunnel.owner.local", mine, deadPid(t))
-
-	var got cloudflare.Spec
-	if !v1alpha1.LatestSpec("cloudflare", &got) {
-		t.Fatal("LatestSpec = false with a project hint present")
-	}
-	if got.Hostname != mine.Hostname {
-		t.Errorf("LatestSpec loaded %q, want the project's own %q", got.Hostname, mine.Hostname)
-	}
-}
-
-// TestCacheDirEnvSuppressesProjectHint pins the escape hatch: an explicitly
-// set cache dir is a deliberate statement about where specs live (a CI cache,
-// a container mount), so nothing is written into the working tree.
-func TestCacheDirEnvSuppressesProjectHint(t *testing.T) {
-	cwd := t.TempDir()
-	t.Chdir(cwd)
-	t.Setenv(v1.CacheDirEnv, t.TempDir())
-
-	if err := v1alpha1.CacheSpec(&cloudflare.Spec{ID: "id", Hostname: "explicit.tunneled.pizza"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(cwd, "libtunnel.local")); !os.IsNotExist(err) {
-		t.Errorf("project hint written despite %s being set (stat err = %v)", v1.CacheDirEnv, err)
 	}
 }

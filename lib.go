@@ -199,12 +199,8 @@ func Cloudflare() *cloudflare.Backend {
 
 // From returns an unstarted tunnel that replays a previously serialized spec
 // instead of minting or adopting one — the credentials are pinned, so it
-// connects under the same hostname. spec is resolved in order: an existing file
-// at that path; a file of that name in the cache dir; a cached spec for that
-// hostname (so From("foo.tunneled.pizza") replays the cached mint); finally
-// the serialized JSON itself. The cache dir is LIBTUNNEL_CACHE_DIR when set,
-// else a per-user location under os.UserCacheDir() — where a mint writes its
-// spec.
+// connects under the same hostname. spec is an existing file path, otherwise
+// the serialized JSON itself — from Serialize, or off LIBTUNNEL_SPEC.
 //
 // Like New, it returns immediately and WithListener (or Listener) starts the
 // connection. A spec that can't be parsed, or whose backend tag is unknown,
@@ -228,24 +224,4 @@ func From(spec string) TunnelV1 {
 			return nil, fmt.Errorf("unknown backend %q", backend)
 		}
 	})
-}
-
-// Hosts lists the public URLs of the specs cached on disk —
-// "https://<hostname>:443/" each, sorted — from LIBTUNNEL_CACHE_DIR if set,
-// else a per-user location under os.UserCacheDir(). A mint caches its spec
-// there, so this enumerates the tunnels From can replay. Best effort: an
-// unreadable cache yields a shorter or empty list, never an error.
-func Hosts() []string {
-	return v1alpha1.Hosts()
-}
-
-// CacheDir is where minted specs are cached and where From and Hosts look:
-// LIBTUNNEL_CACHE_DIR if set, else a per-user location under os.UserCacheDir().
-// Empty if no per-user cache directory can be determined.
-func CacheDir() string {
-	dir, err := v1alpha1.CacheDir()
-	if err != nil {
-		return ""
-	}
-	return dir
 }

@@ -20,8 +20,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -94,40 +92,14 @@ func TestEnvKnobsUnsetLeaveCodeInCharge(t *testing.T) {
 	}
 }
 
-// TestMain redirects the spec cache to a throwaway: chain mints cache their
-// specs there, and QuickTunnelProvider reads its latest.spec.json for reclaim
-// hints — neither may touch (or see) a real user cache.
-func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "libtunnel-cache")
-	if err != nil {
-		panic(err)
-	}
-	os.Setenv(v1.CacheDirEnv, dir)
-	code := m.Run()
-	os.RemoveAll(dir)
-	os.Exit(code)
-}
-
 // clearSpecEnv scrubs the credential-chain env vars so a test resolves
-// exactly the channel it stages, and points the spec cache at a per-test
-// directory so one test's latest.spec.json never seeds another's mint.
+// exactly the channel it stages.
 func clearSpecEnv(t *testing.T) {
 	t.Helper()
 	for _, v := range []string{v1.SpecEnv, v1.FromEnv, v1.CloudflareIDEnv, v1.CloudflareNameEnv,
 		v1.CloudflareHostnameEnv, v1.CloudflareAccountTagEnv, v1.CloudflareSecretEnv,
 		v1.CloudflareProviderEnv, v1.CloudflareHeadersEnv} {
 		t.Setenv(v, "")
-	}
-	t.Setenv(v1.CacheDirEnv, t.TempDir())
-}
-
-// writeLatestSpec seeds the test-scoped cache dir with a latest.spec.json,
-// as a previous run's mint would have.
-func writeLatestSpec(t *testing.T, spec *Spec) {
-	t.Helper()
-	path := filepath.Join(os.Getenv(v1.CacheDirEnv), "latest.spec.json")
-	if err := os.WriteFile(path, []byte(spec.Serialize()), 0o600); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -370,84 +342,6 @@ func TestWithHeaderBeatsReclaimHint(t *testing.T) {
 	}
 	if got := seen.Values("X-Id"); len(got) != 1 || got[0] != "explicit" {
 		t.Errorf("X-Id = %v, want exactly [explicit] (WithHeader beats the hint)", got)
-	}
-}
-
-// TestCachedSpecSeedsReclaimHints pins the latest.spec.json seed (#142): a
-// bare provider's mint carries the cached spec's fields as X-Id / X-Name /
-// X-Secret — hints for backend-driven reclamation, never credentials.
-func TestCachedSpecSeedsReclaimHints(t *testing.T) {
-	clearSpecEnv(t)
-	writeLatestSpec(t, &Spec{ID: "cached-id", Name: "cached-name", Hostname: "cached.tunneled.pizza", Secret: []byte("secret")})
-	var seen http.Header
-	srv := mintServer(t, &seen)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := seen.Get("X-Id"); got != "cached-id" {
-		t.Errorf("X-Id = %q, want the cached spec's id", got)
-	}
-	if got := seen.Get("X-Name"); got != "cached-name" {
-		t.Errorf("X-Name = %q, want the cached spec's name", got)
-	}
-	if got := seen.Get("X-Secret"); got != "c2VjcmV0" {
-		t.Errorf("X-Secret = %q, want the cached spec's secret (base64)", got)
-	}
-}
-
-// TestExplicitHintBeatsCachedSpec pins the layering: an explicit spec-field
-// setter owns its hint key, and the cache fills only the keys left unset.
-func TestExplicitHintBeatsCachedSpec(t *testing.T) {
-	clearSpecEnv(t)
-	writeLatestSpec(t, &Spec{ID: "cached-id", Name: "cached-name", Hostname: "cached.tunneled.pizza"})
-	var seen http.Header
-	srv := mintServer(t, &seen)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := New().WithID("explicit").WithProvider(srv.URL).Provider().Spec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := seen.Get("X-Id"); got != "explicit" {
-		t.Errorf("X-Id = %q, want the explicit WithID value over the cache", got)
-	}
-	if got := seen.Get("X-Name"); got != "cached-name" {
-		t.Errorf("X-Name = %q, want the cache to fill the key WithID left unset", got)
-	}
-}
-
-// TestCachedHintRejectionMintsFresh pins the fall-through (#142): a mint
-// rejected while carrying cache-derived hints retries once, immediately,
-// without them — the backend judged the reclaim, not a fresh mint.
-func TestCachedHintRejectionMintsFresh(t *testing.T) {
-	clearSpecEnv(t)
-	writeLatestSpec(t, &Spec{ID: "cached-id", Hostname: "cached.tunneled.pizza"})
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		if r.Header.Get("X-Id") != "" {
-			w.WriteHeader(http.StatusConflict)
-			fmt.Fprint(w, `{"success":false,"errors":[{"code":1,"message":"tunnel not reclaimable"}]}`)
-			return
-		}
-		fmt.Fprint(w, specJSON)
-	}))
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	spec, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := calls.Load(); got != 2 {
-		t.Errorf("API called %d times, want 2 (reclaim refused, one hint-less retry)", got)
-	}
-	if spec.Hostname != "test.tunneled.pizza" {
-		t.Errorf("Hostname = %q, want the fresh mint's", spec.Hostname)
 	}
 }
 

@@ -23,7 +23,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -63,32 +62,6 @@ func gateLive(t *testing.T) {
 	t.Helper()
 	gateLiveBare(t)
 	adoptPreflightSpec(t)
-}
-
-// hintsDir is where per-process working directories live: a subdirectory of
-// the suite's own (this package's source dir, since that is a test binary's
-// working directory). It is named to fall under the "*.local" gitignore line
-// the hint files themselves use, because that is exactly what it holds.
-const hintsDir = "hints.local"
-
-// workDir returns a persistent working directory scoped to name, for a child
-// process that should keep its own project hint (#158) rather than share the
-// suite's. Persistent, not throwaway: CI caches this tree, so the child's
-// previous mint seeds its reclaim hints and it reuses its hostname instead of
-// leaking a fresh one every run. Falls back to a throwaway when the directory
-// cannot be made — a read-only checkout costs mints, not a failed run.
-func workDir(t *testing.T, name string) string {
-	dir := filepath.Join(hintsDir, name)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Logf("work dir %s: %v (using a throwaway)", dir, err)
-		return t.TempDir()
-	}
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		t.Logf("work dir %s: %v (using a throwaway)", dir, err)
-		return t.TempDir()
-	}
-	return abs
 }
 
 // Tier selection (#147): no env opt-in — the -short flag draws the line. The
@@ -197,22 +170,13 @@ func preflight() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		// Hand the provider the suite's debug logger, or a throttled
-		// preflight fails with nothing but a deadline in the CI log. Not
-		// ephemeral (and not since #142): reclaimability is the point — the
-		// provider reads latest.spec.json for reclaim hints, so a CI-cache
-		// restore turns this mint into a reclaim of the previous run's
-		// tunnel.
+		// preflight fails with nothing but a deadline in the CI log.
 		// URL is left unset so the provider resolves its endpoint from
 		// v1.CloudflareProviderEnv — the variable each CI provider cell sets,
 		// and the same one the tunnels under test read.
 		qt := cloudflare.QuickTunnel()
 		qt.Log = slog.Default()
 		preflightSpec, preflightErr = qt.Spec(ctx)
-		if preflightErr == nil {
-			// The direct provider bypasses the chain's cache write; record
-			// the mint so the next run (via the Actions cache) reclaims it.
-			_ = v1alpha1.CacheSpec(preflightSpec)
-		}
 		lastLiveStart = time.Now() // the mint counts toward pacing
 	})
 	return preflightErr
