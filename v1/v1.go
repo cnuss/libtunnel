@@ -369,7 +369,8 @@ type Tunnel interface {
 	// Err reports why the tunnel ended (nil while it is alive). A tunnel that
 	// will not come up reports a failure class: errors.Is(err, ErrFailed) is
 	// the coarse check, and the class wrapping it — ErrCertificate,
-	// ErrRejected, ErrProviderUnreachable, ErrEdgeUnreachable, ErrRateLimited
+	// ErrRejected, ErrCredentialRejected, ErrProviderUnreachable,
+	// ErrEdgeUnreachable, ErrRateLimited
 	// — is what an operator can act on. A tunnel closed deliberately reports
 	// ErrClosed, which is terminal but not a failure.
 	Err() error

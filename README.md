@@ -168,6 +168,9 @@ branches on the failure rather than on the text of a message it did not write:
 switch {
 case errors.Is(conn.Err(), libtunnel.ErrCertificate):
     // no CA bundle, a wrong clock, or an intercepting proxy
+case errors.Is(conn.Err(), libtunnel.ErrCredentialRejected):
+    // the spec you replayed names a tunnel that no longer exists —
+    // discard it and mint fresh
 case errors.Is(conn.Err(), libtunnel.ErrEdgeUnreachable):
     // egress to port 7844 is blocked — WithEdge routes around it
 case errors.Is(conn.Err(), libtunnel.ErrFailed):
@@ -179,6 +182,7 @@ case errors.Is(conn.Err(), libtunnel.ErrFailed):
 | --- | --- | --- |
 | `ErrCertificate` | the provider's certificate could not be verified | never |
 | `ErrRejected` | the provider said no, or the request could not be built | never |
+| `ErrCredentialRejected` | the edge refused these credentials — the tunnel is gone | never |
 | `ErrProviderUnreachable` | the mint endpoint refuses, times out or 5xxs | 45s |
 | `ErrEdgeUnreachable` | the edge never accepted a connection | 30s |
 | `ErrRateLimited` | throttled past its budget, or past its advertised reset | 45s |
