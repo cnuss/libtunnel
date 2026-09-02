@@ -155,6 +155,7 @@ var (
 	ErrFailed              = v1.ErrFailed              // umbrella: the tunnel will not come up
 	ErrCertificate         = v1.ErrCertificate         // no trust store, bad clock, MITM proxy
 	ErrRejected            = v1.ErrRejected            // the provider said no, or the request was unbuildable
+	ErrCredentialRejected  = v1.ErrCredentialRejected  // the edge refused these credentials
 	ErrProviderUnreachable = v1.ErrProviderUnreachable // the mint endpoint never answered
 	ErrEdgeUnreachable     = v1.ErrEdgeUnreachable     // the edge never accepted a connection
 	ErrRateLimited         = v1.ErrRateLimited         // throttled past its budget

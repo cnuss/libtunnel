@@ -66,6 +66,13 @@ var (
 	// of it retryable.
 	ErrRejected error = &class{ErrFailed, "rejected by the provider", 0}
 
+	// ErrCredentialRejected is the Err result of a tunnel whose credentials
+	// the edge refused: the spec names a tunnel that no longer exists, or was
+	// never this caller's. Distinct from ErrRejected, which is a provider
+	// declining to mint — the recoveries differ, and only this one means the
+	// spec that was replayed is dead and should be discarded.
+	ErrCredentialRejected error = &class{ErrFailed, "credential rejected by the edge", 0}
+
 	// ErrProviderUnreachable is the Err result of a mint endpoint that never
 	// answered: it refuses, times out, or keeps returning 5xx for the budget.
 	//
