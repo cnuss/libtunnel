@@ -123,9 +123,10 @@ No mutex or atomic on `msg`: it is written inside `once.Do` before `close(ch)`,
 and every reader reaches it through a receive on `ch`, so the channel supplies
 the happens-before. The race detector covers this in the CI race lane.
 
-The value is created in `New()` alongside the backend's other channels. One per
-backend is right — `libtunnel.Cloudflare()` hands out a fresh backend per
-tunnel, and `connect` runs once for it.
+The value is created in `connect`, beside `b.reconnected` and `b.edgeUp`
+(`cloudflare.go:682-683`) — the block the struct already labels "runtime state
+wired at connect". One per backend is right: `libtunnel.Cloudflare()` hands out
+a fresh backend per tunnel, and `connect` runs once for it.
 
 `slogWriter` holds a pointer to it and fires on an error-level record
 containing `Unauthorized`, capturing the record's `error` field as the message.
