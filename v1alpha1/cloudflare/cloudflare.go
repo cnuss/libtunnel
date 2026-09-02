@@ -155,12 +155,14 @@ type Backend struct {
 	// and pinned specs never hit the API, so these never apply to them.
 	headers http.Header
 	// Runtime state wired at connect. reconnected feeds the supervisor's
-	// external-control channel, edgeUp tracks edge connections, and reconnectCtx
+	// external-control channel, edgeUp tracks edge connections, edgeReject
+	// carries a refused registration back from the log bridge, and reconnectCtx
 	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
 	// and listener is the loopback socket cloudflared dials to reach it. All nil
 	// until connect runs.
 	reconnected  chan supervisor.ReconnectSignal
 	edgeUp       *edgeUpWatcher
+	edgeReject   *edgeReject
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
 	listener     net.Listener
@@ -681,6 +683,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	// pipeline are live.
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edgeUp = newEdgeUpWatcher()
+	b.edgeReject = newEdgeReject()
 	b.reconnectCtx = t.Context()
 	wsOrigin, _ := t.WebSocketOrigin()
 	b.proxy = newOriginProxy(originURLs, wsOrigin, t.Logger(), transport)
@@ -694,7 +697,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origins", originURLs)
 	service := (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
 	ctx := t.Context()
-	log := zerologger(t.Logger())
+	log := zerologger(t.Logger(), b.edgeReject)
 	spec := t.Spec()
 	if spec == nil {
 		return fmt.Errorf("no spec resolved")

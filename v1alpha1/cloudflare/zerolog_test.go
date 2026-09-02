@@ -83,11 +83,75 @@ func TestSlogWriterForwardsAtRecordLevel(t *testing.T) {
 // reads.
 func TestZerologgerThreshold(t *testing.T) {
 	quiet := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	if got := zerologger(quiet).GetLevel(); got != zerolog.WarnLevel {
+	if got := zerologger(quiet, nil).GetLevel(); got != zerolog.WarnLevel {
 		t.Errorf("info-level handler yields zerolog %v, want %v", got, zerolog.WarnLevel)
 	}
 	loud := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	if got := zerologger(loud).GetLevel(); got != zerolog.DebugLevel {
+	if got := zerologger(loud, nil).GetLevel(); got != zerolog.DebugLevel {
 		t.Errorf("debug-level handler yields zerolog %v, want %v", got, zerolog.DebugLevel)
+	}
+}
+
+// TestEdgeRejectFiresOnRefusal pins the detection. The record is the one from
+// #170, verbatim: the edge refusing a replayed spec whose tunnel was reaped.
+func TestEdgeRejectFiresOnRefusal(t *testing.T) {
+	r := newEdgeReject()
+	w := slogWriter{log: slog.New(&capture{}), reject: r}
+
+	line := `{"level":"error","component":"tunnel","error":"Unauthorized: Tunnel not found","message":"failed to serve incoming request"}`
+	if _, err := w.Write([]byte(line + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-r.wait():
+	default:
+		t.Fatal("the refusal did not fire")
+	}
+	if got, want := r.message(), "Unauthorized: Tunnel not found"; got != want {
+		t.Errorf("message() = %q, want the edge's own text %q", got, want)
+	}
+}
+
+// TestEdgeRejectIgnoresNonRefusals pins what must NOT fire: the match is scoped
+// to an error-level record carrying an error field that names the refusal, so
+// ordinary traffic cannot strand a working tunnel.
+func TestEdgeRejectIgnoresNonRefusals(t *testing.T) {
+	for _, line := range []string{
+		`{"level":"debug","component":"tunnel","error":"Unauthorized: Tunnel not found","message":"noise"}`,
+		`{"level":"error","component":"tunnel","error":"Failed to proxy HTTP: 503","message":"failed to serve incoming request"}`,
+		`{"level":"error","component":"tunnel","message":"no error field"}`,
+		`{"level":"info","component":"tunnel","message":"Registered tunnel connection"}`,
+	} {
+		r := newEdgeReject()
+		w := slogWriter{log: slog.New(&capture{}), reject: r}
+		if _, err := w.Write([]byte(line + "\n")); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-r.wait():
+			t.Errorf("fired on a record that is not a refusal: %s", line)
+		default:
+		}
+	}
+}
+
+// TestEdgeRejectFiresOnce pins the once-guard: the edge refuses every retry,
+// and a second close would panic.
+func TestEdgeRejectFiresOnce(t *testing.T) {
+	r := newEdgeReject()
+	r.fire("first")
+	r.fire("second")
+	if got := r.message(); got != "first" {
+		t.Errorf("message() = %q, want the first refusal", got)
+	}
+}
+
+// TestSlogWriterWithoutRejectSink pins that the sink is optional — the bridge
+// is constructed without one in tests and must not panic.
+func TestSlogWriterWithoutRejectSink(t *testing.T) {
+	w := slogWriter{log: slog.New(&capture{})}
+	line := `{"level":"error","error":"Unauthorized: Tunnel not found","message":"boom"}`
+	if _, err := w.Write([]byte(line)); err != nil {
+		t.Fatal(err)
 	}
 }
