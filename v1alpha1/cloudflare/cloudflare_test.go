@@ -129,7 +129,9 @@ func TestReplayedSpecIsNotOverlaid(t *testing.T) {
 	var seen http.Header
 	srv := mintServer(t, &seen)
 
-	replayed := &Spec{ID: "stale-id", Name: "mine", Hostname: "gone.tunneled.pizza", Secret: []byte("s")}
+	// The hostname matches what the stub answers, so this exercises the
+	// overlay rather than the substitution check.
+	replayed := &Spec{ID: "stale-id", Name: "mine", Hostname: "minted.tunneled.pizza", Secret: []byte("s")}
 	spec, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -140,9 +142,7 @@ func TestReplayedSpecIsNotOverlaid(t *testing.T) {
 	if spec.Hostname != "minted.tunneled.pizza" {
 		t.Errorf("Hostname = %q, want the provider's own", spec.Hostname)
 	}
-	if got := seen.Get("X-Id"); got != "stale-id" {
-		t.Errorf("X-Id = %q, want the replayed spec's id sent as a hint", got)
-	}
+	_ = seen
 }
 
 // TestSpecFieldEnvBeatsCode pins per-field precedence: the
@@ -293,9 +293,11 @@ func TestHeadersEnvBeatsCode(t *testing.T) {
 	}
 }
 
-// TestReclaimHintsSentToMint pins the reclaim hints: spec fields known before
-// minting ride the request as X-Id / X-Name / X-Secret (base64), so a
-// provider that reaps idle tunnels can hand the matching tunnel back.
+// TestReclaimHintsSentToMint pins the reclaim hints: the name and secret a
+// tunnel was minted under ride the request as X-Name / X-Secret (base64), so a
+// provider that reaps idle tunnels can hand the matching hostname back. The id
+// is not among them — the provider reads it from the record it reclaims by,
+// and a tunnel replaced behind a hostname has a different one.
 func TestReclaimHintsSentToMint(t *testing.T) {
 	clearSpecEnv(t)
 	var seen http.Header
@@ -307,8 +309,8 @@ func TestReclaimHintsSentToMint(t *testing.T) {
 	if _, err := b.Provider().Spec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := seen.Get("X-Id"); got != "id-1" {
-		t.Errorf("X-Id = %q, want %q", got, "id-1")
+	if got := seen.Values("X-Id"); len(got) != 0 {
+		t.Errorf("X-Id = %v, want it not sent even when WithID is set", got)
 	}
 	if got := seen.Get("X-Name"); got != "pizza-1" {
 		t.Errorf("X-Name = %q, want %q", got, "pizza-1")
@@ -1509,63 +1511,6 @@ func TestEdgeRejectionBeatsTheBudget(t *testing.T) {
 	}
 }
 
-// TestReclaimOutcomeMapsVerdicts pins the verdict table. The provider always
-// answers with a working spec — hints mean "prefer this, substitute if it is
-// dead" — so the error is libtunnel's judgment about whether the caller got
-// what it replayed, not something the wire carries.
-func TestReclaimOutcomeMapsVerdicts(t *testing.T) {
-	for _, tc := range []struct {
-		verdict string
-		want    error
-	}{
-		{"", nil},         // no usable hints were sent; nothing was asked for
-		{"tunnel", nil},   // same tunnel back
-		{"hostname", nil}, // new tunnel, same hostname: the identity served on survived
-		{"expired", v1.ErrCredentialRejected},
-		{"taken", v1.ErrRejected},
-		{"unknown", v1.ErrProviderUnreachable},
-		{"something-this-build-predates", nil},
-	} {
-		err := reclaimOutcome(tc.verdict)
-		if tc.want == nil {
-			if err != nil {
-				t.Errorf("reclaimOutcome(%q) = %v, want nil", tc.verdict, err)
-			}
-			continue
-		}
-		if !errors.Is(err, tc.want) {
-			t.Errorf("reclaimOutcome(%q) = %v, want errors.Is(_, %v)", tc.verdict, err, tc.want)
-		}
-		if !errors.Is(err, v1.ErrFailed) {
-			t.Errorf("reclaimOutcome(%q) = %v, want it under ErrFailed", tc.verdict, err)
-		}
-		if !strings.Contains(err.Error(), tc.verdict) {
-			t.Errorf("reclaimOutcome(%q) = %v, want the verdict named in the message", tc.verdict, err)
-		}
-	}
-}
-
-// TestReplayFailsOnSubstitution pins the point of routing a replay through the
-// mint: a caller learns its spec is gone here, in one round trip, instead of
-// thirty seconds later when the edge refuses the registration.
-func TestReplayFailsOnSubstitution(t *testing.T) {
-	clearSpecEnv(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Reclaimed", "expired")
-		fmt.Fprint(w, `{"success":true,"result":{"id":"fresh","hostname":"fresh.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
-	}))
-	defer srv.Close()
-
-	replayed := &Spec{ID: "dead", Name: "mine", Hostname: "dead.tunneled.pizza", Secret: []byte("s")}
-	_, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
-	if !errors.Is(err, v1.ErrCredentialRejected) {
-		t.Fatalf("err = %v, want errors.Is(_, ErrCredentialRejected)", err)
-	}
-	if v1.Budget(err) != 0 {
-		t.Errorf("Budget = %s, want 0 — a substituted spec is not retried", v1.Budget(err))
-	}
-}
-
 // TestReplayFallsBackWhenProviderUnreachable pins the offline path: a complete
 // credential set still starts a process that cannot reach the mint, the way it
 // did before the reclaim check existed. A dead spec then fails at the edge,
@@ -1591,24 +1536,70 @@ func TestReplayFallsBackWhenProviderUnreachable(t *testing.T) {
 	}
 }
 
-// TestReplayDoesNotFallBackOnAVerdict pins the distinction the fallback turns
-// on: a provider that answered and said the spec was substituted has given the
-// answer the replay went to get, and must not be papered over with the spec.
-func TestReplayDoesNotFallBackOnAVerdict(t *testing.T) {
+// TestReplaySubstitutionIsCredentialRejected pins the verdict, now read off the
+// spec rather than a header: a provider that answers on a different hostname
+// could not give the reservation back, and the spec that named it is dead.
+func TestReplaySubstitutionIsCredentialRejected(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen) // answers on minted.tunneled.pizza
+
+	replayed := &Spec{Name: "mine", Hostname: "gone.tunneled.pizza", Secret: []byte("s")}
+	_, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
+	if !errors.Is(err, v1.ErrCredentialRejected) {
+		t.Fatalf("err = %v, want errors.Is(_, ErrCredentialRejected)", err)
+	}
+	if v1.Budget(err) != 0 {
+		t.Errorf("Budget = %s, want 0 — a substituted spec is not retried", v1.Budget(err))
+	}
+	if !strings.Contains(err.Error(), "gone.tunneled.pizza") || !strings.Contains(err.Error(), "minted.tunneled.pizza") {
+		t.Errorf("err = %v, want both hostnames named", err)
+	}
+}
+
+// TestReplayAcceptsAReplacedTunnel pins the row that must NOT be an error: the
+// provider reclaims by name, so a reaped tunnel comes back as a fresh one
+// behind the same hostname. The identity a caller serves on survived, and only
+// the id moved.
+func TestReplayAcceptsAReplacedTunnel(t *testing.T) {
 	clearSpecEnv(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Reclaimed", "unknown")
-		fmt.Fprint(w, `{"success":true,"result":{"id":"fresh","hostname":"fresh.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"replacement","hostname":"kept.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
-	shortBudgets(t, 50*time.Millisecond)
 
-	replayed := &Spec{ID: "id", Name: "mine", Hostname: "unchecked.tunneled.pizza", Secret: []byte("s")}
-	_, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
-	if !errors.Is(err, v1.ErrProviderUnreachable) {
-		t.Fatalf("err = %v, want errors.Is(_, ErrProviderUnreachable)", err)
+	replayed := &Spec{ID: "reaped", Name: "mine", Hostname: "kept.tunneled.pizza", Secret: []byte("s")}
+	spec, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatalf("Spec() = %v, want the replacement accepted", err)
 	}
-	if !strings.Contains(err.Error(), "unknown") {
-		t.Errorf("err = %v, want the verdict named", err)
+	if spec.ID != "replacement" {
+		t.Errorf("ID = %q, want the provider's replacement", spec.ID)
+	}
+	if spec.Hostname != replayed.Hostname {
+		t.Errorf("Hostname = %q, want it kept", spec.Hostname)
+	}
+}
+
+// TestMintHintsAreNameAndSecret pins the identity the request carries. The id
+// is not a hint: the provider reads it from the record it reclaims by, and a
+// tunnel replaced behind a hostname has a different one.
+func TestMintHintsAreNameAndSecret(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	replayed := &Spec{ID: "stale", Name: "mine", Hostname: "minted.tunneled.pizza", Secret: []byte("secret")}
+	if _, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("X-Name"); got != "mine" {
+		t.Errorf("X-Name = %q, want the replayed name", got)
+	}
+	if got := seen.Get("X-Secret"); got != "c2VjcmV0" {
+		t.Errorf("X-Secret = %q, want the replayed secret (base64)", got)
+	}
+	if got := seen.Values("X-Id"); len(got) != 0 {
+		t.Errorf("X-Id = %v, want it not sent — the provider ignores it", got)
 	}
 }

@@ -200,11 +200,11 @@ func New() *Backend {
 // when it still exists. It backs libtunnel.From.
 //
 // The provider always answers with a working spec, substituting when the
-// original is gone, and says which happened. A substitution that keeps the
-// hostname is honored silently — the identity a caller serves on survived. One
-// that does not is an error (see reclaimOutcome): a caller replaying a
-// specific spec is owed that news here, in one round trip, rather than at the
-// edge thirty seconds later.
+// original is gone. A substitution that keeps the hostname is honored
+// silently — the identity a caller serves on survived, and only the tunnel
+// behind it is new. One that does not is an error (see replayCheck): a caller
+// replaying a specific spec is owed that news here, in one round trip, rather
+// than at the edge thirty seconds later.
 //
 // It sits at the end of the env chain, so LIBTUNNEL_SPEC and LIBTUNNEL_FROM
 // still override it (env beats code).
@@ -485,56 +485,83 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 		next = qt
 	}
 	if b.hints != nil {
-		next = &replayFallback{spec: b.hints, next: next}
+		next = &replayCheck{spec: b.hints, next: next}
 	}
 	return v1alpha1.Env(b.Name(), overlay{fields: b.fields, next: v1alpha1.Replay(b.Name(), next)})
 }
 
-// replayFallback serves the spec being replayed when the provider cannot be
-// reached at all, so a complete credential set still starts an air-gapped or
-// flaky-network process the way it did before the reclaim check existed.
+// replayCheck decides whether a replay got what it asked for, and serves the
+// spec unchanged when the provider cannot be reached at all.
 //
-// Only an unreachable provider falls back. A verdict — the provider answered
-// and said the spec was substituted — is the answer the replay went to get,
-// and is returned as the error it is.
-type replayFallback struct {
+// The verdict is the hostname. A provider reclaims by name: hand it the name
+// and secret a spec was minted under and it returns that hostname, on the
+// original tunnel if it survives and on a fresh one behind the same name if it
+// does not. Either way the identity a caller serves on is intact, and only the
+// tunnel id may have moved. A different hostname means the reservation is gone
+// and a new one was substituted, which is the spec being dead.
+//
+// Reading the answer off the spec rather than off a header keeps this true of
+// any provider: one that ignores reclaim hints entirely answers with a fresh
+// hostname, and that is reported as what it is.
+type replayCheck struct {
 	spec *Spec
 	next v1.Provider[*Spec]
 	log  *slog.Logger
 }
 
-// SetLogger keeps the tunnel's logger for the fallback warning and forwards it
-// to the wrapped provider.
-func (p *replayFallback) SetLogger(log *slog.Logger) {
+// SetLogger keeps the tunnel's logger for the notices below and forwards it to
+// the wrapped provider.
+func (p *replayCheck) SetLogger(log *slog.Logger) {
 	p.log = log
 	if pl, ok := p.next.(v1alpha1.LoggerSetter); ok {
 		pl.SetLogger(log)
 	}
 }
 
-func (p *replayFallback) Spec(ctx context.Context) (*Spec, error) {
-	spec, err := p.next.Spec(ctx)
-	if err == nil {
-		return spec, nil
-	}
-	var verdict verdictError
-	if errors.As(err, &verdict) || !errors.Is(err, v1.ErrProviderUnreachable) {
-		return nil, err
-	}
-	if p.log != nil {
-		p.log.Warn("mint provider unreachable, replaying the spec as given", "error", err,
+func (p *replayCheck) Spec(ctx context.Context) (*Spec, error) {
+	got, err := p.next.Spec(ctx)
+	if err != nil {
+		// An endpoint that never answered is not a verdict on the spec. Serve
+		// it as given so a complete credential set still starts an air-gapped
+		// or flaky-network process; a spec that turns out to be dead then
+		// fails at the edge, which is where it failed before any of this.
+		if !errors.Is(err, v1.ErrProviderUnreachable) {
+			return nil, err
+		}
+		p.logf("mint provider unreachable, replaying the spec as given", "error", err,
 			"hostname", p.spec.GetHostname())
+		return p.spec, nil
 	}
-	return p.spec, nil
+
+	want := p.spec.GetHostname()
+	if want == "" || got == nil {
+		return got, nil
+	}
+	if got.GetHostname() != want {
+		return nil, fmt.Errorf("%w: replayed %s, the provider answered with %s",
+			v1.ErrCredentialRejected, want, got.GetHostname())
+	}
+	if got.ID != p.spec.ID {
+		p.logf("tunnel replaced behind the same hostname", "hostname", want,
+			"was", p.spec.ID, "now", got.ID)
+	}
+	return got, nil
+}
+
+func (p *replayCheck) logf(msg string, args ...any) {
+	if p.log != nil {
+		p.log.Warn(msg, args...)
+	}
 }
 
 // mintHeaders resolves the mint request headers, three layers, each beating
-// the one before it per key. First the reclaim hints: the spec fields known
-// before minting (WithID / WithName / WithSecret, each superseded by its
-// LIBTUNNEL__CLOUDFLARE_* mirror), sent as X-Id, X-Name, and X-Secret
-// (base64) so a provider that reaps idle tunnels can hand the matching tunnel
-// back instead of minting fresh — optimistic, so whatever is known is sent
-// and absent fields send nothing. Then the code headers (WithHeader), then
+// the one before it per key. First the reclaim hints: the name and secret a
+// tunnel was minted under (WithName / WithSecret, each superseded by its
+// LIBTUNNEL__CLOUDFLARE_* mirror), sent as X-Name and X-Secret (base64) so a
+// provider that reaps idle tunnels can hand the matching hostname back instead
+// of minting fresh — optimistic, so whatever is known is sent and absent
+// fields send nothing. The pair is the identity; an id names a tunnel that may
+// be replaced behind a hostname the pair still owns, so it is not a hint. Then the code headers (WithHeader), then
 // v1.CloudflareHeadersEnv, a comma-separated K=V list (env beats code).
 // Returns nil when all three are empty. Values cannot contain a comma or an
 // equals sign — the env form has no escaping.
@@ -547,7 +574,6 @@ func mintHeaders(fields Spec, code http.Header) http.Header {
 		out.Set(key, value)
 	}
 
-	stringEnv(v1.CloudflareIDEnv, &fields.ID)
 	stringEnv(v1.CloudflareNameEnv, &fields.Name)
 	if v := os.Getenv(v1.CloudflareSecretEnv); v != "" {
 		// An undecodable value is ignored rather than surfaced: the overlay
@@ -555,9 +581,6 @@ func mintHeaders(fields Spec, code http.Header) http.Header {
 		if secret, err := base64.StdEncoding.DecodeString(v); err == nil {
 			fields.Secret = secret
 		}
-	}
-	if fields.ID != "" {
-		set("X-Id", fields.ID)
 	}
 	if fields.Name != "" {
 		set("X-Name", fields.Name)
