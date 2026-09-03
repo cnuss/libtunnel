@@ -386,13 +386,18 @@ What comes back decides the outcome:
 | --- | --- |
 | the same hostname, same tunnel | it connects, unchanged |
 | the same hostname, a different tunnel id | it connects — the name is still yours, the tunnel behind it is new |
-| a different hostname | `ErrCredentialRejected` — the reservation is gone; discard the spec and mint fresh |
+| a different hostname | it connects on that one, and says so at warn level |
 | nothing (the provider cannot be reached) | the spec is replayed as given |
 
-The hostname is the verdict. A provider reclaims by name — hand it the name and
-secret a spec was minted under and it answers on that hostname if the
-reservation still holds, whatever became of the tunnel behind it. A different
-hostname means it could not, so the spec that named the old one is dead.
+A provider reclaims by name — hand it the name and secret a spec was minted
+under and it answers on that hostname if the reservation still holds, whatever
+became of the tunnel behind it. If the reservation is gone it mints a fresh
+one, and libtunnel uses that: the tunnel exists by then either way, and
+refusing it would only cost a second mint for the same new name.
+
+**So a replay can come back on a different hostname.** Re-read the spec after
+the tunnel is up rather than trusting the one you stored — `LIBTUNNEL_SPEC`
+carries the resolved one.
 
 That last row is what keeps an offline replay working: with a complete
 credential set and no network, `From` starts exactly as it did before the check

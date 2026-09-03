@@ -492,19 +492,13 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 	return v1alpha1.Env(b.Name(), overlay{fields: b.fields, next: v1alpha1.Replay(b.Name(), next)})
 }
 
-// replayCheck decides whether a replay got what it asked for, and serves the
-// spec unchanged when the provider cannot be reached at all.
+// replayCheck reports what a replay got and serves the spec unchanged when the
+// provider cannot be reached at all.
 //
-// The verdict is the hostname. A provider reclaims by name: hand it the name
-// and secret a spec was minted under and it returns that hostname, on the
-// original tunnel if it survives and on a fresh one behind the same name if it
-// does not. Either way the identity a caller serves on is intact, and only the
-// tunnel id may have moved. A different hostname means the reservation is gone
-// and a new one was substituted, which is the spec being dead.
-//
-// Reading the answer off the spec rather than off a header keeps this true of
-// any provider: one that ignores reclaim hints entirely answers with a fresh
-// hostname, and that is reported as what it is.
+// It does not reject a substitute. By the time it runs the mint has happened
+// and a real tunnel exists, so refusing the spec strands that tunnel and
+// leaves the caller no move but to mint a second one for the new hostname it
+// was already being handed (#175).
 type replayCheck struct {
 	spec *Spec
 	next v1.Provider[*Spec]
@@ -536,14 +530,15 @@ func (p *replayCheck) Spec(ctx context.Context) (*Spec, error) {
 	}
 
 	want := p.spec.GetHostname()
-	if want == "" || got == nil {
-		return got, nil
-	}
-	if got.GetHostname() != want {
-		return nil, fmt.Errorf("%w: replayed %s, the provider answered with %s",
-			v1.ErrCredentialRejected, want, got.GetHostname())
-	}
-	if got.ID != p.spec.ID {
+	switch {
+	case want == "" || got == nil:
+	case got.GetHostname() != want:
+		// The reservation is gone. The hostname changes whether or not this
+		// spec is used, so a caller holding the old one needs telling — it is
+		// the only notice it gets.
+		p.logf("replayed hostname is gone, adopting the one minted for it",
+			"was", want, "now", got.GetHostname())
+	case got.ID != p.spec.ID:
 		p.logf("tunnel replaced behind the same hostname", "hostname", want,
 			"was", p.spec.ID, "now", got.ID)
 	}
