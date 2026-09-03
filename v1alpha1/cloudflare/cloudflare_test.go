@@ -1531,24 +1531,40 @@ func TestReplayFallsBackWhenProviderUnreachable(t *testing.T) {
 	}
 }
 
-// TestReplaySubstitutionIsCredentialRejected pins the verdict, now read off the
-// spec rather than a header: a provider that answers on a different hostname
-// could not give the reservation back, and the spec that named it is dead.
-func TestReplaySubstitutionIsCredentialRejected(t *testing.T) {
+// TestReplayAdoptsASubstitutedHostname pins #175: the mint has already run by
+// the time the hostname is compared, so a real tunnel exists. Refusing it
+// strands that tunnel and forces the caller to mint a second one for the same
+// new hostname it was being handed.
+func TestReplayAdoptsASubstitutedHostname(t *testing.T) {
 	clearSpecEnv(t)
-	var seen http.Header
-	srv := mintServer(t, &seen) // answers on minted.tunneled.pizza
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"fresh","hostname":"substitute.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	defer srv.Close()
+
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	replayed := &Spec{Name: "mine", Hostname: "gone.tunneled.pizza", Secret: []byte("s")}
-	_, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
-	if !errors.Is(err, v1.ErrCredentialRejected) {
-		t.Fatalf("err = %v, want errors.Is(_, ErrCredentialRejected)", err)
+	b := From(replayed).WithProvider(srv.URL)
+	prov := b.Provider()
+	if pl, ok := prov.(v1alpha1.LoggerSetter); ok {
+		pl.SetLogger(log)
 	}
-	if v1.Budget(err) != 0 {
-		t.Errorf("Budget = %s, want 0 — a substituted spec is not retried", v1.Budget(err))
+	spec, err := prov.Spec(context.Background())
+	if err != nil {
+		t.Fatalf("Spec() = %v, want the substitute adopted", err)
 	}
-	if !strings.Contains(err.Error(), "gone.tunneled.pizza") || !strings.Contains(err.Error(), "minted.tunneled.pizza") {
-		t.Errorf("err = %v, want both hostnames named", err)
+	if spec.Hostname != "substitute.tunneled.pizza" {
+		t.Errorf("Hostname = %q, want the one the provider minted", spec.Hostname)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("API called %d times, want 1 — a second mint is the bug", got)
+	}
+	if !strings.Contains(buf.String(), "gone.tunneled.pizza") {
+		t.Errorf("the hostname change was not reported; log:\n%s", buf.String())
 	}
 }
 
