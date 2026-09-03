@@ -202,13 +202,14 @@ func Cloudflare() *cloudflare.Backend {
 // instead of minting a new one. spec is an existing file path, otherwise the
 // serialized JSON itself — from Serialize, or off LIBTUNNEL_SPEC.
 //
-// The spec's identity rides the mint request, so the provider hands the same
-// tunnel back when it still exists. A provider that reaps idle tunnels may
-// have taken this one: if it can still give you the hostname, it does and the
-// replay succeeds on a new tunnel behind the same name. If it cannot, the
-// tunnel is canceled with ErrCredentialRejected (the spec is dead — discard it
-// and mint fresh) or ErrRejected (the hostname is someone else's now), so a
-// caller learns in one round trip rather than at the edge.
+// The name and secret the spec was minted under ride the mint request, so the
+// provider hands the same hostname back while that reservation holds. A
+// provider that reaps idle tunnels may have taken the tunnel: if the
+// reservation survives it answers on the same hostname with a new tunnel
+// behind it, and the replay succeeds. If it does not, the answer is a
+// different hostname, and the tunnel is canceled with ErrCredentialRejected —
+// the spec is dead, discard it and mint fresh — so a caller learns in one
+// round trip rather than at the edge.
 //
 // A provider that cannot be reached at all is not an error: the spec is
 // replayed as given, which is what it did before the check existed, and a dead

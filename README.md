@@ -382,13 +382,17 @@ A replay asks the provider for that tunnel rather than assuming it survives —
 providers reap idle tunnels, and the provider is the only thing that knows.
 What comes back decides the outcome:
 
-| what happened | result |
+| what came back | result |
 | --- | --- |
-| the tunnel is still yours | it connects, same tunnel |
-| it was reaped, but the hostname is still yours | it connects on a new tunnel behind the same name |
-| the hostname is gone | `ErrCredentialRejected` — discard the spec, mint fresh |
-| the hostname is someone else's now | `ErrRejected` |
-| the provider cannot be reached at all | the spec is replayed as given |
+| the same hostname, same tunnel | it connects, unchanged |
+| the same hostname, a different tunnel id | it connects — the name is still yours, the tunnel behind it is new |
+| a different hostname | `ErrCredentialRejected` — the reservation is gone; discard the spec and mint fresh |
+| nothing (the provider cannot be reached) | the spec is replayed as given |
+
+The hostname is the verdict. A provider reclaims by name — hand it the name and
+secret a spec was minted under and it answers on that hostname if the
+reservation still holds, whatever became of the tunnel behind it. A different
+hostname means it could not, so the spec that named the old one is dead.
 
 That last row is what keeps an offline replay working: with a complete
 credential set and no network, `From` starts exactly as it did before the check
@@ -425,7 +429,8 @@ Cloudflare, each mirrors a spec-field setter on the backend — env beats code,
 field by field, patched onto whatever spec the chain resolves; a complete
 credential set (id, hostname, account tag, secret) skips resolution entirely.
 When the chain does mint, the fields known beforehand also ride the mint
-request as reclaim hints — `X-Id`, `X-Name`, `X-Secret` (base64) — so a
+request as reclaim hints — `X-Name` and `X-Secret` (base64), the pair that
+identifies a reservation — so a
 provider that reaps idle tunnels can hand the matching tunnel back instead of
 minting fresh. Only fields the caller supplies become hints:
 
