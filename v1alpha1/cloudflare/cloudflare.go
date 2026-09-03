@@ -215,15 +215,12 @@ func From(spec *Spec) *Backend {
 }
 
 // hintFields is the identity the mint request carries: a replayed spec's
-// fields, with the explicit setters (WithID and friends) over the top, since
-// a caller naming a field outright means it.
+// fields, with the explicit setters over the top, since a caller naming a
+// field outright means it.
 func (b *Backend) hintFields() Spec {
 	var out Spec
 	if b.hints != nil {
 		out = *b.hints
-	}
-	if b.fields.ID != "" {
-		out.ID = b.fields.ID
 	}
 	if b.fields.Name != "" {
 		out.Name = b.fields.Name
@@ -299,16 +296,21 @@ func (b *Backend) Reconnect(ctx context.Context) error {
 // The spec-field setters override individual fields of whatever spec the
 // credential chain resolves — adopt, replay, pin, or mint — and a complete
 // credential set (id, hostname, account tag, secret) short-circuits the
-// resolve entirely. When the chain does mint, the fields known beforehand
-// also ride the mint request as reclaim hints — X-Id, X-Name, X-Secret
-// (base64) — so a provider that reaps idle tunnels can hand the matching
-// tunnel back instead of minting fresh (see mintHeaders; a key the caller
-// leaves unset sends no hint). Each is superseded
+// resolve entirely. When the chain does mint, the name and secret ride the
+// request as reclaim hints — X-Name and X-Secret (base64) — so a provider
+// that reaps idle tunnels can hand the matching hostname back instead of
+// minting fresh (see mintHeaders; a key the caller leaves unset sends no
+// hint). Each is superseded
 // field-by-field by its LIBTUNNEL__CLOUDFLARE_* variable (env beats code).
 // They return the concrete backend, so chain them before the v1.Backend
 // mutators (WithTLS, WithHTTP2), which return the interface.
 
-// WithID overrides the tunnel ID (a UUID). Env mirror: LIBTUNNEL__CLOUDFLARE_ID.
+// WithID sets the tunnel ID (a UUID). Env mirror: LIBTUNNEL__CLOUDFLARE_ID.
+//
+// It carries only as part of a complete credential set — with hostname,
+// account tag and secret — which is the spec, resolved without a mint.
+// Anything that resolves a spec assigns its own id, so a partial set leaves
+// this unused.
 func (b *Backend) WithID(id string) *Backend {
 	b.fields.ID = id
 	return b
@@ -443,7 +445,7 @@ func edgeAddresses(code []string) []string {
 // repeating a key adds another value. Env mirror: LIBTUNNEL__CLOUDFLARE_HEADERS,
 // a comma-separated K=V list, whose entries beat code per key. Applied over the
 // headers the mint sets itself (Content-Type, User-Agent) and over the reclaim
-// hints (X-Id, X-Name, X-Secret — see WithID), so a caller may override any of
+// hints (X-Name, X-Secret — see WithName), so a caller may override any of
 // them — overriding User-Agent changes how the endpoint sees the
 // connector version. Mint-only, following the WithProvider boundary: adopted,
 // replayed, and pinned specs never hit the API, so headers never apply to them.
@@ -666,7 +668,9 @@ func (p overlay) Spec(ctx context.Context) (*Spec, error) {
 		return nil, err
 	}
 	merged := *base
-	stringField(fields.ID, &merged.ID)
+	// Not the id: whatever resolved the spec — mint, replay, adopt — owns it,
+	// and overwriting it here leaves a spec whose id is not its tunnel's. A
+	// caller supplying one supplies all four, which returns above.
 	stringField(fields.Name, &merged.Name)
 	stringField(fields.Hostname, &merged.Hostname)
 	stringField(fields.AccountTag, &merged.AccountTag)
