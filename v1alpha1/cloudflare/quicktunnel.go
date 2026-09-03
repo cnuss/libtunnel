@@ -73,10 +73,10 @@ func (p *QuickTunnelProvider) SetLogger(log *slog.Logger) {
 // when a 429 carries Retry-After (seconds or HTTP-date), the longer of the
 // two waits is honored.
 //
-// The mint request carries whatever reclaim hints Headers holds (X-Id /
-// X-Name / X-Secret, from the spec-field setters): a hint names a tunnel to
-// hand back, never a credential to adopt, and the backend decides whether to
-// honor it. A refused mint is terminal — the backend has judged the request
+// The mint request carries whatever reclaim hints Headers holds (X-Name and
+// X-Secret, from the spec-field setters): the pair names a hostname to hand
+// back, never a credential to adopt, and the backend decides whether to honor
+// it. A refused mint is terminal — the backend has judged the request
 // it was given.
 func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	log := p.Log

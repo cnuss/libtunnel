@@ -295,9 +295,7 @@ func TestHeadersEnvBeatsCode(t *testing.T) {
 
 // TestReclaimHintsSentToMint pins the reclaim hints: the name and secret a
 // tunnel was minted under ride the request as X-Name / X-Secret (base64), so a
-// provider that reaps idle tunnels can hand the matching hostname back. The id
-// is not among them — the provider reads it from the record it reclaims by,
-// and a tunnel replaced behind a hostname has a different one.
+// provider that reaps idle tunnels can hand the matching hostname back.
 func TestReclaimHintsSentToMint(t *testing.T) {
 	clearSpecEnv(t)
 	var seen http.Header
@@ -308,9 +306,6 @@ func TestReclaimHintsSentToMint(t *testing.T) {
 	b := New().WithID("id-1").WithName("pizza-1").WithSecret([]byte("secret")).WithProvider(srv.URL)
 	if _, err := b.Provider().Spec(ctx); err != nil {
 		t.Fatal(err)
-	}
-	if got := seen.Values("X-Id"); len(got) != 0 {
-		t.Errorf("X-Id = %v, want it not sent even when WithID is set", got)
 	}
 	if got := seen.Get("X-Name"); got != "pizza-1" {
 		t.Errorf("X-Name = %q, want %q", got, "pizza-1")
@@ -332,7 +327,7 @@ func TestReclaimHintsAbsentByDefault(t *testing.T) {
 	if _, err := New().WithProvider(srv.URL).Provider().Spec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"X-Id", "X-Name", "X-Secret"} {
+	for _, k := range []string{"X-Name", "X-Secret"} {
 		if _, ok := seen[k]; ok {
 			t.Errorf("%s = %q, want absent", k, seen.Get(k))
 		}
@@ -367,12 +362,12 @@ func TestWithHeaderBeatsReclaimHint(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	b := New().WithID("id-1").WithProvider(srv.URL).WithHeader("X-Id", "explicit")
+	b := New().WithName("from-setter").WithProvider(srv.URL).WithHeader("X-Name", "explicit")
 	if _, err := b.Provider().Spec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := seen.Values("X-Id"); len(got) != 1 || got[0] != "explicit" {
-		t.Errorf("X-Id = %v, want exactly [explicit] (WithHeader beats the hint)", got)
+	if got := seen.Values("X-Name"); len(got) != 1 || got[0] != "explicit" {
+		t.Errorf("X-Name = %v, want exactly [explicit] (WithHeader beats the hint)", got)
 	}
 }
 
@@ -1581,9 +1576,8 @@ func TestReplayAcceptsAReplacedTunnel(t *testing.T) {
 	}
 }
 
-// TestMintHintsAreNameAndSecret pins the identity the request carries. The id
-// is not a hint: the provider reads it from the record it reclaims by, and a
-// tunnel replaced behind a hostname has a different one.
+// TestMintHintsAreNameAndSecret pins the identity a replay sends: the pair the
+// provider reclaims by, taken from the spec being replayed.
 func TestMintHintsAreNameAndSecret(t *testing.T) {
 	clearSpecEnv(t)
 	var seen http.Header
@@ -1599,7 +1593,22 @@ func TestMintHintsAreNameAndSecret(t *testing.T) {
 	if got := seen.Get("X-Secret"); got != "c2VjcmV0" {
 		t.Errorf("X-Secret = %q, want the replayed secret (base64)", got)
 	}
-	if got := seen.Values("X-Id"); len(got) != 0 {
-		t.Errorf("X-Id = %v, want it not sent — the provider ignores it", got)
+}
+
+// TestPartialIDDoesNotOverwriteResolvedSpec pins that a resolved spec keeps the
+// id whatever resolved it assigned. Overwriting it produces a spec whose id is
+// not its tunnel's, which is then what LIBTUNNEL_SPEC exports for a caller to
+// store and replay.
+func TestPartialIDDoesNotOverwriteResolvedSpec(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	spec, err := New().WithID("stale").WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.ID == "stale" {
+		t.Errorf("ID = %q, want the id the mint assigned", spec.ID)
 	}
 }
