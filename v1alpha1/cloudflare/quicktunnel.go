@@ -21,6 +21,35 @@ import (
 // quickTunnelURL is the public endpoint that mints anonymous quick tunnels.
 const quickTunnelURL = "https://tunnel.pizza/tunnel"
 
+// recordHeader carries the provider's handle on the DNS record reserving a
+// hostname, both ways: returned by a mint, sent back to resume it.
+const recordHeader = "X-Record-Id"
+
+// throttleReason renders a throttle's cause with the wait the provider asked
+// for, so an error a caller reads carries the number it would otherwise have
+// to find in a log line.
+func throttleReason(after time.Duration, cause string) string {
+	switch {
+	case after > 0 && cause != "":
+		return fmt.Sprintf("%s, resets in %s", cause, after)
+	case after > 0:
+		return fmt.Sprintf("resets in %s", after)
+	case cause != "":
+		return cause
+	default:
+		return "no rate-limit headers returned"
+	}
+}
+
+// mintResult is one mint request's answer. record and after are set even when
+// the request failed — the record so the next attempt resumes instead of
+// minting again, after so it waits the interval the provider asked for.
+type mintResult struct {
+	spec   *Spec
+	record string
+	after  time.Duration
+}
+
 // budget is v1.Budget behind a package var so a test can shorten the retry
 // budgets instead of sleeping through them. Production never reassigns it —
 // this is the same seam shape QuickTunnelProvider.URL already is for the
@@ -41,13 +70,16 @@ type QuickTunnelProvider struct {
 	// endpoint (a mock, an alternate API) rather than a configuration knob.
 	URL string
 	// Headers are added to the mint request (WithHeader / its
-	// LIBTUNNEL__CLOUDFLARE_HEADERS mirror, plus the backend's reclaim hints —
-	// see mintHeaders). They are applied over the headers set here
+	// LIBTUNNEL__CLOUDFLARE_HEADERS mirror — see mintHeaders). They are
+	// applied over the headers set here
 	// (Content-Type, User-Agent), so a caller-supplied key replaces the
 	// default for that key. Nil adds nothing.
 	Headers http.Header
 	// Log receives retry warnings. Nil is silent.
 	Log *slog.Logger
+	// record resumes a hostname minted earlier (X-Record-Id). Empty mints a
+	// fresh one.
+	record string
 }
 
 // QuickTunnel returns a provider that mints anonymous quick tunnels.
@@ -73,11 +105,15 @@ func (p *QuickTunnelProvider) SetLogger(log *slog.Logger) {
 // when a 429 carries Retry-After (seconds or HTTP-date), the longer of the
 // two waits is honored.
 //
-// The mint request carries whatever reclaim hints Headers holds (X-Name and
-// X-Secret, from the spec-field setters): the pair names a hostname to hand
-// back, never a credential to adopt, and the backend decides whether to honor
-// it. A refused mint is terminal — the backend has judged the request
-// it was given.
+// A replayed spec's record id rides the request, naming the hostname to
+// resume; without it the provider mints a fresh record and tunnel, so a retry
+// that drops it costs a tunnel per attempt. A refused mint is terminal — the
+// backend has judged the request it was given.
+//
+// A 429 is the provider's cadence, not a verdict. Carrying a spec it means the
+// hostname does not resolve yet, and the record is replayed until it does;
+// carrying an error it is the provider's own failure with the wait it wants.
+// Either way Retry-After governs, bounded by the rate-limit budget.
 func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	log := p.Log
 	if log == nil {
@@ -123,13 +159,19 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 	// fetch's middle result is the server-requested retry delay: a 429's
 	// Retry-After when it carries one, zero otherwise.
-	fetch := func() (*Spec, time.Duration, error) {
+	// fetch makes one mint request. record resumes a hostname when non-empty;
+	// without it the provider mints a fresh record and tunnel, so a retry that
+	// drops it costs a tunnel per attempt.
+	fetch := func(record string) (mintResult, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 		if err != nil {
-			return nil, 0, fmt.Errorf("failed to create request: %w", err)
+			return mintResult{}, fmt.Errorf("failed to create request: %w", err)
 		}
 		req.Header.Add("Content-Type", "application/json")
 		req.Header.Add("User-Agent", fmt.Sprintf("cloudflared/%s", cloudflaredVersion))
+		if record != "" {
+			req.Header.Set(recordHeader, record)
+		}
 		// Caller headers (WithHeader) apply over the defaults above — a supplied
 		// key replaces the default for that key.
 		for k, vs := range p.Headers {
@@ -141,36 +183,38 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, 0, fmt.Errorf("failed to request tunnel credentials: %w", err)
+			return mintResult{}, fmt.Errorf("failed to request tunnel credentials: %w", err)
 		}
 		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return nil, 0, fmt.Errorf("failed to read tunnel credentials response: %w", err)
+			return mintResult{}, fmt.Errorf("failed to read tunnel credentials response: %w", err)
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests {
-			// The full header set, not just Retry-After: a fronted mint (a
-			// serverless provider, a proxy) names its throttle reason in
-			// provider-specific headers, and a silent CI failure is diagnosed
-			// from exactly this line.
-			log.Debug("quick tunnel mint rate limited", "status", resp.StatusCode, "headers", resp.Header)
-			retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
-			if secs, err := strconv.Atoi(retryAfter); err == nil && secs > 0 {
-				d := time.Duration(secs) * time.Second
-				return nil, d, fmt.Errorf("%w: resets in %s", v1.ErrRateLimited, d)
-			}
-			// RFC 7231 also allows an HTTP-date form.
-			if when, err := http.ParseTime(retryAfter); err == nil {
+		// Read off the headers before the body: a throttle can arrive with no
+		// body at all — a proxy, a CDN, the endpoint's own per-IP cap — and it
+		// is still a throttle, with a wait worth honoring.
+		//
+		// The record is carried whether or not this attempt succeeded. It
+		// exists from the provider's first step, and the next attempt needs it
+		// to resume rather than mint a second tunnel.
+		out := mintResult{record: resp.Header.Get(recordHeader)}
+		throttled := resp.StatusCode == http.StatusTooManyRequests
+		if throttled {
+			// The full header set, not just Retry-After: a fronted mint names
+			// its throttle reason in provider-specific headers, and a silent
+			// CI failure is diagnosed from exactly this line.
+			log.Debug("quick tunnel mint throttled", "status", resp.StatusCode, "headers", resp.Header)
+			raw := strings.TrimSpace(resp.Header.Get("Retry-After"))
+			if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+				out.after = time.Duration(secs) * time.Second
+			} else if when, err := http.ParseTime(raw); err == nil {
+				// RFC 7231 also allows an HTTP-date form.
 				if d := time.Until(when); d > 0 {
-					return nil, d, fmt.Errorf("%w: resets in %s", v1.ErrRateLimited, d.Round(time.Second))
+					out.after = d.Round(time.Second)
 				}
 			}
-			if retryAfter != "" {
-				return nil, 0, fmt.Errorf("%w (HTTP 429): Retry-After=%s", v1.ErrRateLimited, retryAfter)
-			}
-			return nil, 0, fmt.Errorf("%w (HTTP 429): no rate-limit headers returned", v1.ErrRateLimited)
 		}
 
 		type response struct {
@@ -181,41 +225,84 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			} `json:"errors"`
 			Result Spec `json:"result"`
 		}
-
 		var data response
 		if err := json.Unmarshal(body, &data); err != nil {
-			return nil, 0, fmt.Errorf("tunnel credentials request failed (status=%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			if throttled {
+				return out, fmt.Errorf("%w: %s", v1.ErrRateLimited, throttleReason(out.after, strings.TrimSpace(string(body))))
+			}
+			return out, fmt.Errorf("tunnel credentials request failed (status=%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
-		if !data.Success {
-			var errorMessages []string
-			for _, e := range data.Errors {
-				errorMessages = append(errorMessages, fmt.Sprintf("%d: %s", e.Code, e.Message))
+		if data.Success {
+			out.spec = &data.Result
+			if !throttled {
+				return out, nil
 			}
-			// A parsed success=false on a non-5xx response is the API saying
-			// no, not the API having a bad moment — retrying can't fix it.
-			if resp.StatusCode < http.StatusInternalServerError {
-				return nil, 0, fmt.Errorf("%w: %s", v1.ErrRejected, strings.Join(errorMessages, "; "))
-			}
-			return nil, 0, fmt.Errorf("tunnel credentials request failed: %s", strings.Join(errorMessages, "; "))
+			// The spec is complete and the tunnel exists; the hostname just
+			// does not resolve yet. Replaying the record is idempotent, so
+			// this waits it out rather than handing back a name that answers
+			// nothing.
+			return out, fmt.Errorf("%w: %s", v1.ErrRateLimited, throttleReason(out.after, "hostname not resolving yet"))
 		}
-		return &data.Result, 0, nil
+
+		var errorMessages []string
+		for _, e := range data.Errors {
+			errorMessages = append(errorMessages, fmt.Sprintf("%d: %s", e.Code, e.Message))
+		}
+		joined := strings.Join(errorMessages, "; ")
+		switch {
+		case throttled:
+			// Every failure the provider owns arrives this way, with the wait
+			// it wants. Retryable by construction.
+			return out, fmt.Errorf("%w: %s", v1.ErrRateLimited, throttleReason(out.after, joined))
+		case resp.StatusCode < http.StatusInternalServerError:
+			// A parsed success=false without a throttle is the API saying no,
+			// not the API having a bad moment — retrying can't fix it.
+			return out, fmt.Errorf("%w: %s", v1.ErrRejected, joined)
+		default:
+			return out, fmt.Errorf("tunnel credentials request failed: %s", joined)
+		}
 	}
 
 	sleep := 0 * time.Second
 	attempts := 0
+	record := p.record
 	// Each class keeps its own clock, started at its first failure, so a mint
 	// that hits a rate limit and then a flaky resolver is not charged twice
 	// for one slow start. The clock is wall time rather than a sum of the
 	// backoff waits: three 15s timeouts cost 45s of real time but only 6s of
 	// ramp, and a hang is exactly what the budget exists to catch.
 	since := map[error]time.Time{}
+	// minted holds the last complete spec a response carried. A throttled
+	// answer carries one whenever the tunnel exists and only the hostname is
+	// still settling, so giving up after that would strand a real tunnel and
+	// cost the caller a second mint for a hostname it already has.
+	var minted *Spec
+	// abandon ends the loop. With a spec in hand the tunnel exists, so hand it
+	// back — the hostname may need a few more seconds, which is what the
+	// warning is for. Without one there is nothing to return but the failure.
+	abandon := func(err, named error) (*Spec, error) {
+		if minted == nil {
+			return nil, named
+		}
+		log.Warn("mint never confirmed the hostname resolves; using the tunnel it minted",
+			"error", err, "hostname", minted.GetHostname())
+		return minted, nil
+	}
 	for {
 		attempts++
-		spec, retryAfter, err := fetch()
-		if err == nil {
-			return spec, nil
+		res, err := fetch(record)
+		if res.record != "" {
+			record = res.record
 		}
+		if res.spec != nil {
+			res.spec.RecordID = record
+			minted = res.spec
+		}
+		if err == nil {
+			return res.spec, nil
+		}
+		retryAfter := res.after
 
 		class := v1alpha1.Classify(err)
 		// named is err with its class attached — unless fetch already named
@@ -228,14 +315,14 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 		limit := budget(class)
 		if limit == 0 {
-			return nil, named
+			return abandon(err, named)
 		}
 		// A throttle that outlasts its own budget is reported now rather than
 		// slept on: a caller can act on "resets in 5m", where waiting it out
 		// just moves the hang somewhere the caller cannot see it.
 		if retryAfter > limit {
 			log.Warn("quick tunnel rate limited", "error", err, "resetsIn", retryAfter)
-			return nil, named
+			return abandon(err, named)
 		}
 		if _, seen := since[class]; !seen {
 			since[class] = time.Now()
@@ -244,8 +331,8 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		// attempt — a hung endpoint is reported at roughly budget + Timeout,
 		// not at the budget exactly.
 		if spent := time.Since(since[class]); spent > limit {
-			return nil, fmt.Errorf("no spec after %d attempts in %s: %w",
-				attempts, spent.Round(time.Second), named)
+			return abandon(err, fmt.Errorf("no spec after %d attempts in %s: %w",
+				attempts, spent.Round(time.Second), named))
 		}
 
 		// The server's Retry-After wins over the linear ramp when it asks for
@@ -253,7 +340,9 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		sleep += 1 * time.Second
 		wait := max(sleep, retryAfter)
 		if errors.Is(err, v1.ErrRateLimited) {
-			log.Warn("quick tunnel rate limited, retrying...", "error", err, "nextAttemptIn", wait)
+			// One class, two causes — a hostname still settling and a real
+			// throttle both arrive as 429 with a wait. The error says which.
+			log.Warn("mint asked us to wait, retrying...", "error", err, "nextAttemptIn", wait)
 		} else {
 			log.Warn("failed to fetch tunnel spec, retrying...", "error", err)
 		}

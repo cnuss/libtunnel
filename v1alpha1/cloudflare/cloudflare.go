@@ -196,7 +196,7 @@ func New() *Backend {
 }
 
 // From returns a Cloudflare backend that replays spec: its identity rides the
-// mint request as reclaim hints, so the provider hands the same tunnel back
+// mint request as its record id, so the provider hands the same tunnel back
 // when it still exists. It backs libtunnel.From.
 //
 // The provider always answers with a working spec, substituting when the
@@ -214,24 +214,13 @@ func From(spec *Spec) *Backend {
 	return b
 }
 
-// hintFields is the identity the mint request carries: a replayed spec's
-// fields, with the explicit setters over the top, since a caller naming a
-// field outright means it.
-func (b *Backend) hintFields() Spec {
-	var out Spec
-	if b.hints != nil {
-		out = *b.hints
+// recordHint is the record a replay resumes, from the spec being replayed.
+// Empty mints a fresh hostname.
+func (b *Backend) recordHint() string {
+	if b.hints == nil {
+		return ""
 	}
-	if b.fields.Name != "" {
-		out.Name = b.fields.Name
-	}
-	if len(b.fields.Secret) > 0 {
-		out.Secret = b.fields.Secret
-	}
-	if b.fields.Hostname != "" {
-		out.Hostname = b.fields.Hostname
-	}
-	return out
+	return b.hints.RecordID
 }
 
 // WithTLS declares whether the origin terminates TLS (https vs http ingress).
@@ -296,11 +285,9 @@ func (b *Backend) Reconnect(ctx context.Context) error {
 // The spec-field setters override individual fields of whatever spec the
 // credential chain resolves — adopt, replay, pin, or mint — and a complete
 // credential set (id, hostname, account tag, secret) short-circuits the
-// resolve entirely. When the chain does mint, the name and secret ride the
-// request as reclaim hints — X-Name and X-Secret (base64) — so a provider
-// that reaps idle tunnels can hand the matching hostname back instead of
-// minting fresh (see mintHeaders; a key the caller leaves unset sends no
-// hint). Each is superseded
+// resolve entirely. None of them ride the mint request: what resumes a
+// hostname is the record id on a replayed spec (see recordHint). Each is
+// superseded
 // field-by-field by its LIBTUNNEL__CLOUDFLARE_* variable (env beats code).
 // They return the concrete backend, so chain them before the v1.Backend
 // mutators (WithTLS, WithHTTP2), which return the interface.
@@ -445,7 +432,7 @@ func edgeAddresses(code []string) []string {
 // repeating a key adds another value. Env mirror: LIBTUNNEL__CLOUDFLARE_HEADERS,
 // a comma-separated K=V list, whose entries beat code per key. Applied over the
 // headers the mint sets itself (Content-Type, User-Agent) and over the reclaim
-// hints (X-Name, X-Secret — see WithName), so a caller may override any of
+// record id, so a caller may override any of
 // them — overriding User-Agent changes how the endpoint sees the
 // connector version. Mint-only, following the WithProvider boundary: adopted,
 // replayed, and pinned specs never hit the API, so headers never apply to them.
@@ -483,7 +470,8 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 		if host != "" {
 			qt.URL = providerEndpoint(host)
 		}
-		qt.Headers = mintHeaders(b.hintFields(), b.headers)
+		qt.Headers = mintHeaders(b.headers)
+		qt.record = b.recordHint()
 		next = qt
 	}
 	if b.hints != nil {
@@ -551,40 +539,16 @@ func (p *replayCheck) logf(msg string, args ...any) {
 	}
 }
 
-// mintHeaders resolves the mint request headers, three layers, each beating
-// the one before it per key. First the reclaim hints: the name and secret a
-// tunnel was minted under (WithName / WithSecret, each superseded by its
-// LIBTUNNEL__CLOUDFLARE_* mirror), sent as X-Name and X-Secret (base64) so a
-// provider that reaps idle tunnels can hand the matching hostname back instead
-// of minting fresh — optimistic, so whatever is known is sent and absent
-// fields send nothing. The pair is the identity; an id names a tunnel that may
-// be replaced behind a hostname the pair still owns, so it is not a hint. Then the code headers (WithHeader), then
-// v1.CloudflareHeadersEnv, a comma-separated K=V list (env beats code).
-// Returns nil when all three are empty. Values cannot contain a comma or an
-// equals sign — the env form has no escaping.
-func mintHeaders(fields Spec, code http.Header) http.Header {
+// mintHeaders resolves the caller's mint request headers: the code headers
+// (WithHeader), then v1.CloudflareHeadersEnv, a comma-separated K=V list (env
+// beats code). Returns nil when both are empty. Values cannot contain a comma
+// or an equals sign — the env form has no escaping.
+//
+// Spec fields are not among them. What resumes a hostname is the record the
+// provider handed back (see recordHint), which QuickTunnelProvider sends
+// itself.
+func mintHeaders(code http.Header) http.Header {
 	var out http.Header
-	set := func(key, value string) {
-		if out == nil {
-			out = http.Header{}
-		}
-		out.Set(key, value)
-	}
-
-	stringEnv(v1.CloudflareNameEnv, &fields.Name)
-	if v := os.Getenv(v1.CloudflareSecretEnv); v != "" {
-		// An undecodable value is ignored rather than surfaced: the overlay
-		// decodes the same variable before any mint runs and fails resolution.
-		if secret, err := base64.StdEncoding.DecodeString(v); err == nil {
-			fields.Secret = secret
-		}
-	}
-	if fields.Name != "" {
-		set("X-Name", fields.Name)
-	}
-	if len(fields.Secret) > 0 {
-		set("X-Secret", base64.StdEncoding.EncodeToString(fields.Secret))
-	}
 
 	for key, values := range code {
 		if out == nil {
