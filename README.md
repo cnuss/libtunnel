@@ -188,6 +188,12 @@ case errors.Is(conn.Err(), libtunnel.ErrFailed):
 | `ErrRateLimited` | throttled past its budget, or past its advertised reset | 45s |
 | `ErrClosed` | shut down deliberately — terminal, but not a failure | n/a |
 
+A tunnel can also stop existing while it is running — reaped by the provider,
+deleted out from under a live connection. `WithEventListener` reports that as
+`EventGone`: once the edge has been down for a few seconds, libtunnel asks it
+whether the tunnel is still one it knows, and the edge answers. It is a report,
+not a verdict — the tunnel keeps retrying, and stopping is yours to decide.
+
 Every class except `ErrClosed` answers `errors.Is(err, libtunnel.ErrFailed)`.
 Retries are bounded by class rather than by the caller's context, so a mint
 that can never succeed fails with a reason instead of hanging.

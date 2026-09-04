@@ -1767,3 +1767,80 @@ func TestEdgeEventLogOmitsUnsetFields(t *testing.T) {
 		t.Errorf("a disconnected event named a protocol it does not carry: %s", buf.String())
 	}
 }
+
+// TestGoneWatchProbesOncePerOutage pins the trigger: the supervisor emits a
+// Disconnected per serve attempt, so a flapping edge would otherwise spend a
+// credentialed registration on each one.
+func TestGoneWatchProbesOncePerOutage(t *testing.T) {
+	var g goneWatch
+	var probes atomic.Int32
+	probe := func() { probes.Add(1) }
+
+	for range 5 {
+		g.down(probe)
+	}
+	if got := probes.Load(); got != 0 {
+		t.Fatalf("probed %d times before the settle expired, want 0", got)
+	}
+
+	// The timer is the real one, so wait it out rather than reaching inside.
+	deadline := time.Now().Add(goneSettle + 5*time.Second)
+	for probes.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("probed %d times for one outage, want 1", got)
+	}
+
+	// Further disconnects after the answer must not re-probe.
+	for range 3 {
+		g.down(probe)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := probes.Load(); got != 1 {
+		t.Errorf("probed %d times, want the answer to stand", got)
+	}
+}
+
+// TestGoneWatchCancelsWhenTheEdgeReturns pins the common case: a reconnect
+// inside the settle window means there was nothing to ask about.
+func TestGoneWatchCancelsWhenTheEdgeReturns(t *testing.T) {
+	var g goneWatch
+	var probes atomic.Int32
+
+	g.down(func() { probes.Add(1) })
+	g.up()
+
+	time.Sleep(200 * time.Millisecond)
+	if got := probes.Load(); got != 0 {
+		t.Errorf("probed %d times after the edge came back, want 0", got)
+	}
+}
+
+// TestRegistrationRefused pins what counts as the edge disowning a tunnel, and
+// what does not. The strings come from the #182 captures.
+func TestRegistrationRefused(t *testing.T) {
+	for _, tc := range []struct {
+		err  string
+		want bool
+	}{
+		{"Unauthorized: Tunnel not found", true},
+		{"Tunnel not found", true},
+		{"Application error 0x0 (remote)", false},
+		{"control stream encountered a failure while serving", false},
+		{"failed to dial to edge with quic: sendmsg: network is unreachable", false},
+		{"EDUPCONN", false},
+	} {
+		if got := registrationRefused(errors.New(tc.err)); got != tc.want {
+			t.Errorf("registrationRefused(%q) = %t, want %t", tc.err, got, tc.want)
+		}
+	}
+}
+
+// TestProbeIndexIsClearOfTheSupervisor pins that the probe cannot collide with
+// a real connection, which would answer EDUPCONN instead of the question.
+func TestProbeIndexIsClearOfTheSupervisor(t *testing.T) {
+	if probeConnIndex < haConnections {
+		t.Errorf("probe index %d is inside the supervisor's range 0..%d", probeConnIndex, haConnections-1)
+	}
+}

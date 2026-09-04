@@ -41,6 +41,14 @@ const (
 	// EventReconnected fires when an edge connection registers again after a
 	// disconnect.
 	EventReconnected EventKind = "reconnected"
+	// EventGone fires when the edge says the tunnel no longer exists.
+	// Reconnecting will not bring it back: the spec that names it is dead and
+	// a caller holding one should discard it and mint fresh.
+	//
+	// It does not end the tunnel. cloudflared keeps retrying either way, and
+	// stopping is the caller's decision to make — which means a caller that
+	// registers no listener is not told, and Done does not close.
+	EventGone EventKind = "gone"
 	// EventError fires when the tunnel ends for a reason that is a failure —
 	// anything but a deliberate close. Err carries the cause.
 	EventError EventKind = "error"
