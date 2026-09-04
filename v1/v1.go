@@ -21,6 +21,46 @@ import (
 	"time"
 )
 
+// EventKind names a moment in a tunnel's life.
+type EventKind string
+
+const (
+	// EventHostnameReady fires when the public hostname is expected to
+	// resolve, the same moment HostnameReady closes.
+	EventHostnameReady EventKind = "hostname-ready"
+	// EventTunnelReady fires when the tunnel is reachable end to end, the same
+	// moment TunnelReady closes.
+	EventTunnelReady EventKind = "tunnel-ready"
+	// EventConnected fires the first time each edge connection registers.
+	EventConnected EventKind = "connected"
+	// EventDisconnected fires when an edge connection ends. The engine reports
+	// one for every connection attempt that finishes, whether or not it ever
+	// carried traffic, so this counts attempts ending rather than live
+	// connections lost.
+	EventDisconnected EventKind = "disconnected"
+	// EventReconnected fires when an edge connection registers again after a
+	// disconnect.
+	EventReconnected EventKind = "reconnected"
+	// EventError fires when the tunnel ends for a reason that is a failure —
+	// anything but a deliberate close. Err carries the cause.
+	EventError EventKind = "error"
+	// EventDone fires when the tunnel ends, for any reason, after any
+	// EventError. Err carries the cause, which is ErrClosed for a deliberate
+	// shutdown.
+	EventDone EventKind = "done"
+)
+
+// Event is something that happened to a tunnel, delivered to the listeners
+// registered with WithEventListener.
+type Event struct {
+	// Kind is what happened.
+	Kind EventKind
+	// Hostname is the tunnel's public hostname, empty before one is minted.
+	Hostname string
+	// Err is the cause on EventError and EventDone, nil otherwise.
+	Err error
+}
+
 // ErrFailed marks a tunnel that will not come up. Retrying will not help; the
 // class wrapping it says what an operator can do about it. Every failure class
 // below answers errors.Is(err, ErrFailed) — ErrClosed does not, because a
@@ -214,12 +254,13 @@ const (
 	// — the list form has no escaping. Only the mint path uses it.
 	CloudflareHeadersEnv = "LIBTUNNEL__CLOUDFLARE_HEADERS"
 
-	// CloudflareEdgeEnv mirrors WithEdge: a comma-separated list of host:port
-	// addresses to dial for the tunnel edge instead of discovering it by SRV
-	// (which yields Cloudflare's edge on port 7844). Set, it also forces the
-	// http2 edge protocol. Intended for a relay on an allowed port; see
-	// WithEdge for the constraints.
-	CloudflareEdgeEnv = "LIBTUNNEL__CLOUDFLARE_EDGE"
+	// CloudflareEdgeProtocolEnv mirrors WithEdgeProtocol: a comma-separated
+	// preference order for the edge transport, from quic, http2, and auto.
+	// Each is probed in turn and the first reachable one is used; the last is
+	// the fallback and is taken as given. An unrecognized value fails the
+	// tunnel rather than falling back silently — an operator naming a
+	// transport means it.
+	CloudflareEdgeProtocolEnv = "LIBTUNNEL__CLOUDFLARE_EDGE_PROTOCOL"
 )
 
 // Spec is the credential/identity set a Provider yields. Each backend defines
@@ -374,6 +415,20 @@ type Tunnel interface {
 	// — is what an operator can act on. A tunnel closed deliberately reports
 	// ErrClosed, which is terminal but not a failure.
 	Err() error
+
+	// WithEventListener registers a function to receive the tunnel's lifecycle
+	// events. Layerable, not write-once: every registered listener is called,
+	// in registration order.
+	//
+	// Listeners run synchronously on the goroutine that produced the event, so
+	// one that blocks holds up the tunnel — hand off anything slow. A panicking
+	// listener is recovered and logged rather than taking the tunnel down with
+	// it.
+	//
+	// The events are a notification channel, not the source of truth. Done and
+	// Err remain that: a listener registered after a tunnel has already failed
+	// receives nothing, because the event has been and gone.
+	WithEventListener(func(Event)) Tunnel
 
 	// WithLogger sets the logger, once. Unset, the tunnel is silent — unless
 	// the LIBTUNNEL_LOG environment variable names a level
