@@ -72,7 +72,7 @@ const backendName = "cloudflare"
 // The reconnect lever fires one ReconnectSignal per conn to cycle them all.
 const haConnections = 2
 
-// edgeUpWatcher tracks the tunnel's edge connections from the Observer sink:
+// edgeWatcher tracks the tunnel's edge connections from the Observer sink:
 // Connected events, so a caller can wait for N of them past a barrier, and the
 // failed attempts between them.
 //
@@ -86,22 +86,28 @@ const haConnections = 2
 // before each backoff — including after a dial that never connected, so before
 // the first Connected the count is failed attempts to reach the edge, which is
 // what the ErrEdgeUnreachable bound reports.
-type edgeUpWatcher struct {
-	mu       sync.Mutex
-	gen      uint64
-	ch       chan struct{}
-	attempts uint64
+//
+// It calls disconnect on every Disconnected, which the supervisor defers around
+// each serve attempt. That fires whether or not the attempt ever connected, so
+// the count says how many serve attempts ended — not how many live connections
+// were lost, and not why.
+type edgeWatcher struct {
+	mu          sync.Mutex
+	gen         uint64
+	ch          chan struct{}
+	attempts    uint64
+	disconnects uint64
 }
 
-func newEdgeUpWatcher() *edgeUpWatcher { return &edgeUpWatcher{ch: make(chan struct{})} }
+func newEdgeWatcher() *edgeWatcher { return &edgeWatcher{ch: make(chan struct{})} }
 
-func (e *edgeUpWatcher) generation() (uint64, <-chan struct{}) {
+func (e *edgeWatcher) generation() (uint64, <-chan struct{}) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.gen, e.ch
 }
 
-func (e *edgeUpWatcher) up() {
+func (e *edgeWatcher) up() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.gen++
@@ -109,16 +115,50 @@ func (e *edgeUpWatcher) up() {
 	e.ch = make(chan struct{})
 }
 
-func (e *edgeUpWatcher) attempt() {
+func (e *edgeWatcher) attempt() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.attempts++
 }
 
-func (e *edgeUpWatcher) attemptCount() uint64 {
+func (e *edgeWatcher) disconnect() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.disconnects++
+}
+
+func (e *edgeWatcher) disconnectCount() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.disconnects
+}
+
+func (e *edgeWatcher) attemptCount() uint64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.attempts
+}
+
+// edgeEventName renders an Observer event for a log line. cloudflared's Status
+// is an unnamed int, so an unrecognized one is reported as itself rather than
+// guessed at.
+func edgeEventName(s connection.Status) string {
+	switch s {
+	case connection.Connected:
+		return "connected"
+	case connection.Disconnected:
+		return "disconnected"
+	case connection.Reconnecting:
+		return "reconnecting"
+	case connection.RegisteringTunnel:
+		return "registering"
+	case connection.Unregistering:
+		return "unregistering"
+	case connection.SetURL:
+		return "set-url"
+	default:
+		return fmt.Sprintf("status(%d)", int(s))
+	}
 }
 
 // Backend is the cloudflared quick-tunnel engine. It carries the origin-scheme
@@ -161,13 +201,13 @@ type Backend struct {
 	// and pinned specs never hit the API, so these never apply to them.
 	headers http.Header
 	// Runtime state wired at connect. reconnected feeds the supervisor's
-	// external-control channel, edgeUp tracks edge connections, edgeReject
+	// external-control channel, edge tracks edge connections, edgeReject
 	// carries a refused registration back from the log bridge, and reconnectCtx
 	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
 	// and listener is the loopback socket cloudflared dials to reach it. All nil
 	// until connect runs.
 	reconnected  chan supervisor.ReconnectSignal
-	edgeUp       *edgeUpWatcher
+	edge         *edgeWatcher
 	edgeReject   *edgeReject
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
@@ -250,13 +290,13 @@ func (b *Backend) WithHTTP2(http2 bool) v1.Backend[*Spec] {
 // Connected, so the barrier is correct for any HA count. Errors if called before
 // the tunnel has connected.
 func (b *Backend) Reconnect(ctx context.Context) error {
-	if b.reconnected == nil || b.edgeUp == nil || b.reconnectCtx == nil {
+	if b.reconnected == nil || b.edge == nil || b.reconnectCtx == nil {
 		return fmt.Errorf("cloudflare: Reconnect before tunnel connected")
 	}
 	// Wait on the caller's ctx (its deadline/cancellation) and on the tunnel
 	// context, so a tunnel teardown mid-reconnect unblocks even if ctx does not.
 	done := b.reconnectCtx.Done()
-	base, _ := b.edgeUp.generation()
+	base, _ := b.edge.generation()
 	for range haConnections {
 		select {
 		case b.reconnected <- supervisor.ReconnectSignal{}:
@@ -267,7 +307,7 @@ func (b *Backend) Reconnect(ctx context.Context) error {
 		}
 	}
 	for {
-		gen, ch := b.edgeUp.generation()
+		gen, ch := b.edge.generation()
 		if gen-base >= haConnections {
 			return nil
 		}
@@ -709,13 +749,13 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	}
 	transport := originTransport(originURLs)
 	// Wire runtime state onto the backend: reconnected feeds the supervisor's
-	// external-control channel (see NewSupervisor below), edgeUp counts Connected
+	// external-control channel (see NewSupervisor below), edge counts Connected
 	// events via the Observer sink, reconnectCtx is the tunnel context, and
 	// proxy/listener back the Engine's Proxy/Listener (seeding each interception's
 	// default handler and Target). Once set, b.Reconnect and the interceptor
 	// pipeline are live.
 	b.reconnected = make(chan supervisor.ReconnectSignal)
-	b.edgeUp = newEdgeUpWatcher()
+	b.edge = newEdgeWatcher()
 	b.edgeReject = newEdgeReject()
 	b.reconnectCtx = t.Context()
 	wsOrigin, _ := t.WebSocketOrigin()
@@ -785,16 +825,24 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		originDialer := ingress.NewOriginDialer(ingress.OriginConfig{}, log)
 
 		// The observer fans connection lifecycle events out to sinks; wire one
-		// that feeds edgeUp, so the Reconnect lever can block until the edge is
+		// that feeds edge, so the Reconnect lever can block until the edge is
 		// back up and the ErrEdgeUnreachable bound can report how many attempts
 		// it took.
 		observer := connection.NewObserver(log, log)
 		observer.RegisterSink(connection.EventSinkFunc(func(e connection.Event) {
+			// Every event, not only the two acted on: this is the only
+			// structured view of what the edge is doing, and cloudflared's own
+			// account of it is prose in a log line.
+			t.Logger().Debug("edge event", "event", edgeEventName(e.EventType),
+				"connIndex", e.Index, "protocol", e.Protocol.String(),
+				"location", e.Location, "edgeAddress", e.EdgeAddress, "url", e.URL)
 			switch e.EventType {
 			case connection.Connected:
-				b.edgeUp.up()
+				b.edge.up()
 			case connection.Reconnecting:
-				b.edgeUp.attempt()
+				b.edge.attempt()
+			case connection.Disconnected:
+				b.edge.disconnect()
 			}
 		}))
 
@@ -911,8 +959,8 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	case <-b.edgeReject.wait():
 		return b.credentialRejected()
 	case <-timeout.C:
-		return fmt.Errorf("%w: no connection after %d attempts in %s: %s",
-			v1.ErrEdgeUnreachable, b.edgeUp.attemptCount(), edgeBudget, edgeBlockedHint)
+		return fmt.Errorf("%w: no connection after %d attempts (%d ended) in %s: %s",
+			v1.ErrEdgeUnreachable, b.edge.attemptCount(), b.edge.disconnectCount(), edgeBudget, edgeBlockedHint)
 	}
 	return nil
 }

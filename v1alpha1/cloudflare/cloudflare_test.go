@@ -28,7 +28,9 @@ import (
 
 	"github.com/cloudflare/cloudflared/supervisor"
 
+	"github.com/cloudflare/cloudflared/connection"
 	v1 "github.com/cnuss/libtunnel/v1"
+
 	"github.com/cnuss/libtunnel/v1alpha1"
 )
 
@@ -978,8 +980,8 @@ func TestQuickTunnelSurfacesRateLimit(t *testing.T) {
 
 // --- reconnect lever ---
 
-func TestEdgeUpWatcher(t *testing.T) {
-	w := newEdgeUpWatcher()
+func TestEdgeWatcher(t *testing.T) {
+	w := newEdgeWatcher()
 
 	gen, ch := w.generation()
 	if gen != 0 {
@@ -1007,12 +1009,12 @@ func TestEdgeUpWatcher(t *testing.T) {
 	}
 }
 
-// TestEdgeUpWatcherCountsAttempts pins the count the ErrEdgeUnreachable
+// TestEdgeWatcherCountsAttempts pins the count the ErrEdgeUnreachable
 // bound reports: every
 // Reconnecting the supervisor sends before the edge is up is one failed attempt
 // to reach it, and Connected events are not attempts.
-func TestEdgeUpWatcherCountsAttempts(t *testing.T) {
-	w := newEdgeUpWatcher()
+func TestEdgeWatcherCountsAttempts(t *testing.T) {
+	w := newEdgeWatcher()
 
 	if got := w.attemptCount(); got != 0 {
 		t.Fatalf("initial attemptCount() = %d, want 0", got)
@@ -1054,7 +1056,7 @@ func TestReconnectBeforeConnect(t *testing.T) {
 func wireReconnect(tunnelCtx context.Context) *Backend {
 	b := New()
 	b.reconnected = make(chan supervisor.ReconnectSignal)
-	b.edgeUp = newEdgeUpWatcher()
+	b.edge = newEdgeWatcher()
 	b.reconnectCtx = tunnelCtx
 	return b
 }
@@ -1068,7 +1070,7 @@ func TestReconnectCyclesAndWaits(t *testing.T) {
 	go func() {
 		for range haConnections {
 			<-b.reconnected
-			b.edgeUp.up()
+			b.edge.up()
 		}
 		close(served)
 	}()
@@ -1703,5 +1705,45 @@ func TestEdgeProtocolRejectsNonsense(t *testing.T) {
 	t.Setenv(v1.CloudflareEdgeProtocolEnv, "tcp")
 	if _, err := New().resolveEdgeProtocol(); err == nil {
 		t.Error("tcp accepted from the env, want it rejected")
+	}
+}
+
+// TestEdgeWatcherCountsDisconnects pins what the count means. The supervisor
+// defers Disconnected around each serve attempt, so it fires whether or not
+// that attempt connected — the number is serve attempts that ended, not live
+// connections lost, which is why it cannot stand in for a refusal.
+func TestEdgeWatcherCountsDisconnects(t *testing.T) {
+	w := newEdgeWatcher()
+	if got := w.disconnectCount(); got != 0 {
+		t.Errorf("disconnects = %d, want 0", got)
+	}
+	w.disconnect()
+	w.disconnect()
+	if got := w.disconnectCount(); got != 2 {
+		t.Errorf("disconnects = %d, want 2", got)
+	}
+	if got := w.attemptCount(); got != 0 {
+		t.Errorf("attempts = %d, want disconnects not to be counted as attempts", got)
+	}
+}
+
+// TestEdgeEventNames pins the log rendering, including that an event this
+// build does not know is reported as itself rather than guessed at.
+func TestEdgeEventNames(t *testing.T) {
+	for _, tc := range []struct {
+		status connection.Status
+		want   string
+	}{
+		{connection.Connected, "connected"},
+		{connection.Disconnected, "disconnected"},
+		{connection.Reconnecting, "reconnecting"},
+		{connection.RegisteringTunnel, "registering"},
+		{connection.Unregistering, "unregistering"},
+		{connection.SetURL, "set-url"},
+		{connection.Status(99), "status(99)"},
+	} {
+		if got := edgeEventName(tc.status); got != tc.want {
+			t.Errorf("edgeEventName(%d) = %q, want %q", tc.status, got, tc.want)
+		}
 	}
 }
