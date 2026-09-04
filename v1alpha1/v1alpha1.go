@@ -9,6 +9,7 @@ package v1alpha1
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -102,7 +103,15 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	// it is not inherently a warning.
 	go func() {
 		<-t.ctx.Done()
-		t.Logger().Info("tunnel context canceled", "cause", context.Cause(t.ctx))
+		cause := context.Cause(t.ctx)
+		t.Logger().Info("tunnel context canceled", "cause", cause)
+		// Error first, then Done: a listener that only cares about failure
+		// hears about it before the tunnel is reported finished, and one that
+		// only cares about the end sees a single terminal event either way.
+		if cause != nil && !errors.Is(cause, v1.ErrClosed) {
+			t.Emit(v1.Event{Kind: v1.EventError, Err: cause})
+		}
+		t.Emit(v1.Event{Kind: v1.EventDone, Err: cause})
 	}()
 
 	return t
@@ -117,6 +126,15 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 type TunnelImpl[T v1.Spec] struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
+
+	// listenersMu guards listeners, which WithEventListener appends to and
+	// Emit walks. Layerable rather than write-once: a listener is an
+	// observation, and observing twice is not a conflict.
+	listenersMu sync.Mutex
+	listeners   []func(v1.Event)
+	// hostname is the public hostname once known, readable from any goroutine
+	// an event can be emitted on — unlike spec, which specOnce guards.
+	hostname atomic.Pointer[string]
 
 	// logOnce fixes log: the first WithLogger wins; a Logger read before any
 	// WithLogger fixes the silent default.

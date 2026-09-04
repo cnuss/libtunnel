@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -373,6 +374,7 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 
 		t.Logger().Info("tunnel is ready")
 		close(t.tunnelReady)
+		t.Emit(v1.Event{Kind: v1.EventTunnelReady})
 	}()
 }
 
@@ -716,8 +718,56 @@ func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
 // markHostnameReady logs the ready hostname and closes the readiness
 // channel. One caller (start) reaches it once, so the close needs no guard.
 func (t *TunnelImpl[T]) markHostnameReady(host string) {
+	t.hostname.Store(&host)
 	t.Logger().Info("hostname ready", "hostname", host)
 	close(t.hostnameReady)
+	t.Emit(v1.Event{Kind: v1.EventHostnameReady, Hostname: host})
+}
+
+// WithEventListener registers fn to receive the tunnel's lifecycle events.
+// Implements v1.Tunnel.
+func (t *TunnelImpl[T]) WithEventListener(fn func(v1.Event)) v1.Tunnel {
+	if fn == nil {
+		return t
+	}
+	t.listenersMu.Lock()
+	t.listeners = append(t.listeners, fn)
+	t.listenersMu.Unlock()
+	return t
+}
+
+// Emit delivers e to every registered listener, in registration order. The
+// engine calls it for the edge events only it can see; the tunnel core calls
+// it for readiness and for the end.
+//
+// Listeners run on the caller's goroutine, so a slow one holds up whatever
+// produced the event — that is the contract, and it is documented on
+// WithEventListener. A panicking one is contained here: a caller's bad
+// callback should not take a working tunnel down.
+func (t *TunnelImpl[T]) Emit(e v1.Event) {
+	if e.Hostname == "" {
+		// Read from the atomic, not t.spec: that field is guarded by specOnce
+		// and written on whichever goroutine resolves it, while an event can
+		// be emitted from any of them. Empty until the hostname is known,
+		// which is the honest answer before then.
+		if host := t.hostname.Load(); host != nil {
+			e.Hostname = *host
+		}
+	}
+	t.listenersMu.Lock()
+	listeners := slices.Clone(t.listeners)
+	t.listenersMu.Unlock()
+
+	for _, fn := range listeners {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Logger().Error("event listener panicked", "event", e.Kind, "panic", r)
+				}
+			}()
+			fn(e)
+		}()
+	}
 }
 
 // hostOf returns the first label of hostname.

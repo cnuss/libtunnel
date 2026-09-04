@@ -1285,3 +1285,72 @@ func TestWithLocalURLSingleWebSocketMarkerInert(t *testing.T) {
 		t.Errorf("LocalURL() = %v, want the base scheme kept", got)
 	}
 }
+
+// TestEventListenersAreLayered pins that registering is additive, not
+// write-once: an observation is not a conflict, so every listener hears
+// everything, in the order it registered.
+func TestEventListenersAreLayered(t *testing.T) {
+	tun := v1alpha1.New[*cloudflare.Spec](cloudflare.New())
+
+	var order []string
+	tun.WithEventListener(func(v1.Event) { order = append(order, "first") })
+	tun.WithEventListener(func(v1.Event) { order = append(order, "second") })
+	tun.WithEventListener(nil) // ignored rather than panicking later
+
+	tun.Emit(v1.Event{Kind: v1.EventTunnelReady})
+	if len(order) != 2 || order[0] != "first" || order[1] != "second" {
+		t.Errorf("listeners ran %v, want [first second]", order)
+	}
+}
+
+// TestEventListenerPanicIsContained pins that a caller's bad callback cannot
+// take a working tunnel down, and does not stop the listeners behind it.
+func TestEventListenerPanicIsContained(t *testing.T) {
+	tun := v1alpha1.New[*cloudflare.Spec](cloudflare.New())
+
+	reached := false
+	tun.WithEventListener(func(v1.Event) { panic("listener blew up") })
+	tun.WithEventListener(func(v1.Event) { reached = true })
+
+	tun.Emit(v1.Event{Kind: v1.EventTunnelReady})
+	if !reached {
+		t.Error("a panicking listener stopped the ones after it")
+	}
+}
+
+// TestFailedTunnelEmitsErrorThenDone pins the terminal pair and their order: a
+// listener watching only for failure hears it before the tunnel is reported
+// finished.
+func TestFailedTunnelEmitsErrorThenDone(t *testing.T) {
+	var kinds []v1.EventKind
+	var seen []error
+	done := make(chan struct{})
+
+	// Registered before the cancel: the contract is that events are a
+	// notification channel, so a listener attached after the fact hears
+	// nothing — Failed() tunnels are already over by the time you hold one.
+	tun := v1alpha1.New[*cloudflare.Spec](cloudflare.New())
+	tun.WithEventListener(func(e v1.Event) {
+		kinds = append(kinds, e.Kind)
+		seen = append(seen, e.Err)
+		if e.Kind == v1.EventDone {
+			close(done)
+		}
+	})
+
+	tun.Cancel(v1.ErrCertificate)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no done event; got %v", kinds)
+	}
+	if len(kinds) != 2 || kinds[0] != v1.EventError || kinds[1] != v1.EventDone {
+		t.Fatalf("kinds = %v, want [error done]", kinds)
+	}
+	for i, err := range seen {
+		if !errors.Is(err, v1.ErrCertificate) {
+			t.Errorf("event %d carried %v, want the cause", i, err)
+		}
+	}
+}

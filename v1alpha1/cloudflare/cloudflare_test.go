@@ -993,7 +993,7 @@ func TestEdgeWatcher(t *testing.T) {
 	default:
 	}
 
-	w.up()
+	w.up(0)
 	select {
 	case <-ch:
 	default:
@@ -1022,7 +1022,7 @@ func TestEdgeWatcherCountsAttempts(t *testing.T) {
 
 	w.attempt()
 	w.attempt()
-	w.up()
+	w.up(0)
 
 	if got := w.attemptCount(); got != 2 {
 		t.Errorf("attemptCount() = %d, want 2", got)
@@ -1070,7 +1070,7 @@ func TestReconnectCyclesAndWaits(t *testing.T) {
 	go func() {
 		for range haConnections {
 			<-b.reconnected
-			b.edge.up()
+			b.edge.up(0)
 		}
 		close(served)
 	}()

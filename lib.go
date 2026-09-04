@@ -137,6 +137,23 @@ type TunnelV1 = v1.Tunnel
 // backend-specific setters (WithID and friends) stay reachable.
 type CloudflareV1 = v1.Backend[*cloudflare.Spec]
 
+// The tunnel lifecycle event types (see TunnelV1.WithEventListener) are
+// re-exported from v1 so callers can name them without importing v1.
+type (
+	Event     = v1.Event
+	EventKind = v1.EventKind
+)
+
+const (
+	EventHostnameReady = v1.EventHostnameReady // the hostname is expected to resolve
+	EventTunnelReady   = v1.EventTunnelReady   // reachable end to end
+	EventConnected     = v1.EventConnected     // an edge connection registered
+	EventDisconnected  = v1.EventDisconnected  // an edge connection ended
+	EventReconnected   = v1.EventReconnected   // an edge connection came back
+	EventError         = v1.EventError         // the tunnel failed; Err has the cause
+	EventDone          = v1.EventDone          // the tunnel ended, for any reason
+)
+
 // EdgeProtocol names the transport cloudflared uses to reach the tunnel edge,
 // re-exported from the cloudflare backend so a caller can pass one to
 // Cloudflare().WithEdgeProtocol without importing that package.

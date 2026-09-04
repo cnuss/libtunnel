@@ -97,6 +97,9 @@ type edgeWatcher struct {
 	ch          chan struct{}
 	attempts    uint64
 	disconnects uint64
+	// connected records which connection indexes have registered before, so a
+	// reconnect can be told from a first connect. HA keeps this to a handful.
+	connected map[uint8]bool
 }
 
 func newEdgeWatcher() *edgeWatcher { return &edgeWatcher{ch: make(chan struct{})} }
@@ -107,12 +110,20 @@ func (e *edgeWatcher) generation() (uint64, <-chan struct{}) {
 	return e.gen, e.ch
 }
 
-func (e *edgeWatcher) up() {
+// up records a Connected for index, reporting whether it is that connection's
+// first.
+func (e *edgeWatcher) up(index uint8) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.gen++
 	close(e.ch)
 	e.ch = make(chan struct{})
+	first := !e.connected[index]
+	if e.connected == nil {
+		e.connected = map[uint8]bool{}
+	}
+	e.connected[index] = true
+	return first
 }
 
 func (e *edgeWatcher) attempt() {
@@ -838,11 +849,18 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 				"location", e.Location, "edgeAddress", e.EdgeAddress, "url", e.URL)
 			switch e.EventType {
 			case connection.Connected:
-				b.edge.up()
+				// First time for this connection index is a connect; after
+				// that the edge has dropped it and taken it back.
+				kind := v1.EventReconnected
+				if b.edge.up(e.Index) {
+					kind = v1.EventConnected
+				}
+				t.Emit(v1.Event{Kind: kind})
 			case connection.Reconnecting:
 				b.edge.attempt()
 			case connection.Disconnected:
 				b.edge.disconnect()
+				t.Emit(v1.Event{Kind: v1.EventDisconnected})
 			}
 		}))
 
