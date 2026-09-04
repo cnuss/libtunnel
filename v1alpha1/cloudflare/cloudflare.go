@@ -152,10 +152,9 @@ type Backend struct {
 	// a scheme is used verbatim). Empty means the default (tunnel.pizza);
 	// v1.CloudflareProviderEnv supersedes either.
 	providerHost string
-	// edgeAddrs pins the cloudflared<->edge addresses (WithEdge), bypassing the
-	// SRV discovery that otherwise yields Cloudflare's edge on port 7844. Empty
-	// means discover; v1.CloudflareEdgeEnv supersedes either.
-	edgeAddrs []string
+	// edgeProtocol pins the edge transport (WithEdgeProtocol). Empty leaves the
+	// choice to cloudflared; v1.CloudflareEdgeProtocolEnv supersedes either.
+	edgeProtocol EdgeProtocol
 	// headers carries request headers added to the quick-tunnel mint call via
 	// WithHeader. Nil until the first WithHeader; overlaid by (and augmented
 	// with) v1.CloudflareHeadersEnv at mint time. Mint-only — adopted, replayed,
@@ -342,88 +341,56 @@ func (b *Backend) WithProvider(host string) *Backend {
 	return b
 }
 
-// WithEdge pins the addresses cloudflared dials to reach the tunnel edge,
-// bypassing SRV discovery (_v2-origintunneld._tcp.argotunnel.com), which
-// otherwise resolves to Cloudflare's edge on port 7844. Each address is
-// host:port, dialed over TCP (see edgeProtocol).
+// EdgeProtocol is a transport cloudflared can use to reach the tunnel edge.
+type EdgeProtocol string
+
+const (
+	// EdgeQUIC reaches the edge over UDP. The edge closes a QUIC connection
+	// when the tunnel behind it goes away, so a client learns in seconds what
+	// http2 leaves it to discover minutes later.
+	EdgeQUIC EdgeProtocol = "quic"
+	// EdgeHTTP2 reaches the edge over TCP, which works on networks that drop
+	// UDP.
+	EdgeHTTP2 EdgeProtocol = "http2"
+	// EdgeAuto leaves the choice, and the fallback, to cloudflared.
+	EdgeAuto EdgeProtocol = "auto"
+)
+
+// WithEdgeProtocol pins the edge transport. Unset, cloudflared chooses and
+// falls back on its own, which is the right default: it knows QUIC to http2,
+// and it is the thing holding the connection when a transport turns out not to
+// work.
 //
-// The intended use is a relay: a network that blocks outbound 7844 can still
-// reach the edge through a TCP relay on an allowed port (443), which splices
-// bytes to a real edge address. The connector's TLS to the edge is end-to-end
-// with a fixed server name (h2.cftunnel.com), so a relay that does not
-// terminate TLS keeps certificate verification intact — it cannot read the
-// traffic, and neither the tunnel nor its credentials change.
+// Pin EdgeHTTP2 on a network known to drop UDP, where the fallback would
+// otherwise cost a minute before landing there anyway. Pin EdgeQUIC to refuse
+// that fallback, keeping the signal http2 does not carry.
 //
-// A TCP relay can serve this because the edge transport is TCP for every tunnel,
-// pinned or not (see edgeProtocol) — nothing here has to opt out of QUIC.
-// Whatever is dialed must ultimately reach a real edge; nothing else speaks the
-// tunnel protocol. Env mirror: LIBTUNNEL__CLOUDFLARE_EDGE (comma-separated; env
-// beats code).
-func (b *Backend) WithEdge(addrs ...string) *Backend {
-	b.edgeAddrs = addrs
+// Not to be confused with WithHTTP2, which is about the other end of the
+// tunnel — whether the origin is dialed over HTTP/2.
+//
+// Env mirror: LIBTUNNEL__CLOUDFLARE_EDGE_PROTOCOL (env beats code). An
+// unrecognized protocol fails the tunnel at connect rather than falling back
+// silently — naming a transport means it.
+func (b *Backend) WithEdgeProtocol(p EdgeProtocol) *Backend {
+	b.edgeProtocol = p
 	return b
 }
 
-// edgeProtocol is the edge transport, fixed to TCP rather than left to
-// cloudflared's "auto" (QUIC, falling back to http2).
-//
-// QUIC needs egress UDP to 7844, which a great many networks drop — hotel and
-// guest wifi, corporate egress filters, CI runners — while carrying TCP to the
-// same port perfectly well. cloudflared does recover from that, but only after
-// exhausting six QUIC retries on a backoff capped at 1m4s, so the recovery costs
-// minutes during which the tunnel is simply not up. Choosing the transport that
-// works everywhere costs nothing this library uses: QUIC's advantages here are
-// datagram support for private-network routing (ICMP, UDP), which a quick tunnel
-// serving HTTP does not do.
-//
-// It also makes a pinned edge (WithEdge) work without a special case — a relay
-// on an allowed port is a TCP splice, and "auto" would have dialled QUIC over
-// UDP to it and stalled there first.
-const edgeProtocol = "http2"
-
-// defaultEdgeAddrs is where the edge is dialed when nothing pins it, replacing
-// cloudflared's SRV discovery of _v2-origintunneld._tcp.argotunnel.com.
-//
-// The SRV lookup is one more thing that has to work before a tunnel can start,
-// on the machine's own resolver, on a library whose entire premise is that that
-// resolver cannot be relied upon. These are that lookup's answer verbatim, in
-// its priority order, so naming them directly removes the step without changing
-// where the connection goes:
-//
-//	$ dig +short SRV _v2-origintunneld._tcp.argotunnel.com
-//	1 1 7844 region1.v2.argotunnel.com.
-//	2 1 7844 region2.v2.argotunnel.com.
-//
-// Names rather than addresses: the pool behind each region is renumbered at
-// Cloudflare's discretion, and a hardcoded address list is wrong the day that
-// happens. The cost is that cloudflared's ResolveAddrs keeps at most one address
-// per name (edgediscovery/allregions/discovery.go), so this yields two edge
-// addresses where SRV yielded twenty — enough for its rotation to have somewhere
-// to go, but thinner. A caller who needs the full spread, or who needs no DNS at
-// all, pins addresses with WithEdge.
-var defaultEdgeAddrs = []string{
-	"region1.v2.argotunnel.com:7844",
-	"region2.v2.argotunnel.com:7844",
-}
-
-// edgeAddresses resolves the edge addresses: the code value (WithEdge)
-// superseded wholesale by v1.CloudflareEdgeEnv, a comma-separated list, and
-// defaultEdgeAddrs when neither is set.
-func edgeAddresses(code []string) []string {
-	raw := os.Getenv(v1.CloudflareEdgeEnv)
-	if raw == "" {
-		if len(code) == 0 {
-			return defaultEdgeAddrs
-		}
-		return code
+// resolveEdgeProtocol reports the transport to hand cloudflared: the env
+// mirror over the code value, and EdgeAuto when neither is set.
+func (b *Backend) resolveEdgeProtocol() (EdgeProtocol, error) {
+	p := b.edgeProtocol
+	if raw := strings.TrimSpace(os.Getenv(v1.CloudflareEdgeProtocolEnv)); raw != "" {
+		p = EdgeProtocol(raw)
 	}
-	var out []string
-	for _, addr := range strings.Split(raw, ",") {
-		if addr = strings.TrimSpace(addr); addr != "" {
-			out = append(out, addr)
-		}
+	switch p {
+	case "":
+		return EdgeAuto, nil
+	case EdgeQUIC, EdgeHTTP2, EdgeAuto:
+		return p, nil
+	default:
+		return "", fmt.Errorf("unknown edge protocol %q, want one of %q, %q, %q", p, EdgeQUIC, EdgeHTTP2, EdgeAuto)
 	}
-	return out
 }
 
 // WithHeader adds a request header to the quick-tunnel mint call, so a provider
@@ -781,8 +748,11 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
 	}
 
-	edgeAddrs := edgeAddresses(b.edgeAddrs)
-	t.Logger().Info("edge addresses set, skipping SRV discovery", "addrs", edgeAddrs, "protocol", edgeProtocol)
+	protocol, err := b.resolveEdgeProtocol()
+	if err != nil {
+		return err
+	}
+	t.Logger().Info("edge transport selected", "protocol", protocol)
 
 	// The closure scopes the prometheus.DefaultRegisterer swap to supervisor
 	// construction: cloudflared registers collectors against the global
@@ -807,7 +777,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to create client config: %w", err)
 		}
-		protocolSelector, err := connection.NewProtocolSelector(edgeProtocol, spec.AccountTag, false, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
+		protocolSelector, err := connection.NewProtocolSelector(string(protocol), spec.AccountTag, false, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create protocol selector: %w", err)
 		}
@@ -836,8 +806,9 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			// bounds teardown after a cancel. Max accepted is 3m.
 			GracePeriod: 30 * time.Second,
 			Region:      "",
-			// Non-empty pins the edge and bypasses SRV discovery (WithEdge).
-			EdgeAddrs:     edgeAddrs,
+			// Empty: cloudflared discovers the edge by SRV, with its own DoT
+			// fallback when the machine's resolver cannot answer.
+			EdgeAddrs:     nil,
 			EdgeIPVersion: allregions.Auto,
 			HAConnections: haConnections,
 			// No tags, matching cloudflared's quick-tunnel default. (Tags never
@@ -956,16 +927,15 @@ func (b *Backend) credentialRejected() error {
 
 // edgeBlockedHint is cloudflared's own diagnosis of this failure, which it logs
 // at warn level from selectNextProtocol. Repeated verbatim so the error carries
-// the same guidance without the caller having to correlate it with a log line,
-// plus libtunnel's way around it.
+// the same guidance without the caller having to correlate it with a log line.
 //
 // It rides only the timeout branch. A credential the edge refuses leaves
 // through its own case above, so reaching this means nothing better is known
 // about why the edge never answered.
-const edgeBlockedHint = "your machine/network is getting its egress UDP to port 7844 (or others) " +
+const edgeBlockedHint = "your machine/network is getting its egress to the tunnel edge " +
 	"blocked or dropped. Make sure to allow egress connectivity as per " +
 	"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/ " +
-	"(WithEdge relays the edge through a port that is allowed)"
+	"(WithEdgeProtocol pins the transport when only one of UDP or TCP is allowed)"
 
 // newOriginProxy builds the reverse proxy that always fronts the origins (see
 // connect, which serves it on a plaintext listener cloudflared dials). When an

@@ -137,6 +137,17 @@ type TunnelV1 = v1.Tunnel
 // backend-specific setters (WithID and friends) stay reachable.
 type CloudflareV1 = v1.Backend[*cloudflare.Spec]
 
+// EdgeProtocol names the transport cloudflared uses to reach the tunnel edge,
+// re-exported from the cloudflare backend so a caller can pass one to
+// Cloudflare().WithEdgeProtocol without importing that package.
+type EdgeProtocol = cloudflare.EdgeProtocol
+
+const (
+	EdgeQUIC  = cloudflare.EdgeQUIC  // UDP; the edge closes it when the tunnel goes away
+	EdgeHTTP2 = cloudflare.EdgeHTTP2 // TCP; works where UDP is dropped
+	EdgeAuto  = cloudflare.EdgeAuto  // cloudflared chooses, and falls back
+)
+
 // The interceptor types (see TunnelV1.WithInterceptor) are re-exported from v1
 // so callers can name them without importing v1.
 type (

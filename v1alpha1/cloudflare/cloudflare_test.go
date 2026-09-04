@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -314,48 +313,6 @@ func TestExplicitHintRejectionStaysTerminal(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("API called %d times, want 1 (explicit-hint rejection must not retry)", got)
-	}
-}
-
-// TestWithEdgePinsAddresses pins WithEdge: the addresses are carried through to
-// the supervisor's static-edge list, which bypasses SRV discovery (and with it
-// Cloudflare's port 7844) so a relay on an allowed port can be dialed instead.
-func TestWithEdgePinsAddresses(t *testing.T) {
-	t.Setenv(v1.CloudflareEdgeEnv, "")
-
-	b := New().WithEdge("relay.example:443", "relay2.example:443")
-	got := edgeAddresses(b.edgeAddrs)
-	if len(got) != 2 || got[0] != "relay.example:443" || got[1] != "relay2.example:443" {
-		t.Errorf("edge addrs = %v, want both pinned addresses", got)
-	}
-}
-
-// TestEdgeDefaultsToTheRegions pins that the edge is never discovered by SRV:
-// unset falls back to the regions that lookup would have returned, so starting a
-// tunnel does not depend on an SRV query succeeding on the machine's resolver.
-func TestEdgeDefaultsToTheRegions(t *testing.T) {
-	t.Setenv(v1.CloudflareEdgeEnv, "")
-
-	got := edgeAddresses(nil)
-	if !slices.Equal(got, defaultEdgeAddrs) {
-		t.Errorf("edge addrs = %v, want the defaults %v", got, defaultEdgeAddrs)
-	}
-	for _, addr := range got {
-		if _, port, err := net.SplitHostPort(addr); err != nil || port != "7844" {
-			t.Errorf("default edge addr %q: want host:7844", addr)
-		}
-	}
-}
-
-// TestEdgeEnvBeatsCode pins the env mirror: LIBTUNNEL__CLOUDFLARE_EDGE replaces
-// the code value wholesale (it is one list, not a per-entry merge) and tolerates
-// whitespace around the commas.
-func TestEdgeEnvBeatsCode(t *testing.T) {
-	t.Setenv(v1.CloudflareEdgeEnv, " env1.example:443 , env2.example:443 ")
-
-	got := edgeAddresses([]string{"code.example:443"})
-	if len(got) != 2 || got[0] != "env1.example:443" || got[1] != "env2.example:443" {
-		t.Errorf("edge addrs = %v, want the env list to replace the code value", got)
 	}
 }
 
@@ -1081,11 +1038,8 @@ func TestEdgeUnreachableWrapsSentinel(t *testing.T) {
 	if !errors.Is(err, v1.ErrEdgeUnreachable) {
 		t.Errorf("errors.Is(err, ErrEdgeUnreachable) = false, want true")
 	}
-	if !strings.Contains(err.Error(), "7844") {
-		t.Errorf("Err() = %q, want the blocked port named", err)
-	}
-	if !strings.Contains(err.Error(), "WithEdge") {
-		t.Errorf("Err() = %q, want the WithEdge way around it", err)
+	if !strings.Contains(err.Error(), "egress") {
+		t.Errorf("Err() = %q, want the hint carried", err)
 	}
 }
 
@@ -1699,5 +1653,55 @@ func TestNoSpecStillFails(t *testing.T) {
 
 	if _, err := New().WithProvider(srv.URL).Provider().Spec(context.Background()); !errors.Is(err, v1.ErrRateLimited) {
 		t.Fatalf("err = %v, want errors.Is(_, ErrRateLimited)", err)
+	}
+}
+
+// TestEdgeProtocolDefaultsToAuto pins that libtunnel does not choose the
+// transport: cloudflared knows the QUIC-to-http2 fallback and is the thing
+// holding the connection when one turns out not to work.
+func TestEdgeProtocolDefaultsToAuto(t *testing.T) {
+	t.Setenv(v1.CloudflareEdgeProtocolEnv, "")
+
+	got, err := New().resolveEdgeProtocol()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != EdgeAuto {
+		t.Errorf("edge protocol = %q, want %q", got, EdgeAuto)
+	}
+}
+
+// TestEdgeProtocolEnvBeatsCode pins the mirror, and that a pin survives it.
+func TestEdgeProtocolEnvBeatsCode(t *testing.T) {
+	t.Setenv(v1.CloudflareEdgeProtocolEnv, "")
+	got, err := New().WithEdgeProtocol(EdgeQUIC).resolveEdgeProtocol()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != EdgeQUIC {
+		t.Errorf("edge protocol = %q, want the pinned %q", got, EdgeQUIC)
+	}
+
+	t.Setenv(v1.CloudflareEdgeProtocolEnv, " http2 ")
+	got, err = New().WithEdgeProtocol(EdgeQUIC).resolveEdgeProtocol()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != EdgeHTTP2 {
+		t.Errorf("edge protocol = %q, want the env value %q", got, EdgeHTTP2)
+	}
+}
+
+// TestEdgeProtocolRejectsNonsense pins that a transport cloudflared cannot
+// dial fails the tunnel rather than falling back quietly to auto.
+func TestEdgeProtocolRejectsNonsense(t *testing.T) {
+	t.Setenv(v1.CloudflareEdgeProtocolEnv, "")
+	if _, err := New().WithEdgeProtocol("h2mux").resolveEdgeProtocol(); err == nil {
+		t.Error("h2mux accepted in code, want it rejected")
+	}
+
+	t.Setenv(v1.CloudflareEdgeProtocolEnv, "tcp")
+	if _, err := New().resolveEdgeProtocol(); err == nil {
+		t.Error("tcp accepted from the env, want it rejected")
 	}
 }

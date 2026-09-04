@@ -172,7 +172,7 @@ case errors.Is(conn.Err(), libtunnel.ErrCredentialRejected):
     // the spec you replayed names a tunnel that no longer exists —
     // discard it and mint fresh
 case errors.Is(conn.Err(), libtunnel.ErrEdgeUnreachable):
-    // egress to port 7844 is blocked — WithEdge routes around it
+    // the edge never accepted a connection
 case errors.Is(conn.Err(), libtunnel.ErrFailed):
     // it will not come up, and the message says why
 }
@@ -451,7 +451,7 @@ minting fresh. Only fields the caller supplies become hints:
 | `LIBTUNNEL__CLOUDFLARE_SECRET` | `WithSecret()` (base64) |
 | `LIBTUNNEL__CLOUDFLARE_PROVIDER` | `WithProvider()` — quick-tunnel provider host, default `tunnel.pizza` (endpoint `https://<host>/tunnel` synthesized; a value with a scheme is used verbatim) |
 | `LIBTUNNEL__CLOUDFLARE_HEADERS` | `WithHeader()` — request headers on the mint call, comma-separated `K=V` (e.g. `X-Opaque=true`, or `X-Ephemeral=true` to mark the mint unreclaimable once reaped); entries beat code per key. No escaping — values can't contain `,` or `=`. Mint-only. |
-| `LIBTUNNEL__CLOUDFLARE_EDGE` | `WithEdge()` — comma-separated `host:port` list to dial for the tunnel edge instead of discovering it by SRV (which yields Cloudflare's edge on port 7844). Replaces the code value wholesale; forces the `http2` edge protocol. For reaching the edge through a relay on an allowed port. |
+| `LIBTUNNEL__CLOUDFLARE_EDGE_PROTOCOL` | `WithEdgeProtocol()` — pins the edge transport: `quic`, `http2`, or `auto`. Unset is `auto`, where cloudflared chooses and falls back on its own. Pin `http2` where UDP is dropped, `quic` to refuse the fallback. An unrecognized value fails the tunnel. |
 
 The Cloudflare backend also has a bare activation switch, `LIBTUNNEL__CLOUDFLARE=1`,
 used by the binary below to select it without a spec handoff.
