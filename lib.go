@@ -150,6 +150,7 @@ const (
 	EventConnected     = v1.EventConnected     // an edge connection registered
 	EventDisconnected  = v1.EventDisconnected  // an edge connection ended
 	EventReconnected   = v1.EventReconnected   // an edge connection came back
+	EventGone          = v1.EventGone          // the edge disowned the tunnel; discard the spec
 	EventError         = v1.EventError         // the tunnel failed; Err has the cause
 	EventDone          = v1.EventDone          // the tunnel ended, for any reason
 )

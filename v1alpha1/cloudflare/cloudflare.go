@@ -40,6 +40,7 @@ import (
 	"github.com/cloudflare/cloudflared/tlsconfig"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
@@ -220,6 +221,7 @@ type Backend struct {
 	reconnected  chan supervisor.ReconnectSignal
 	edge         *edgeWatcher
 	edgeReject   *edgeReject
+	gone         goneWatch
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
 	listener     net.Listener
@@ -864,12 +866,16 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 				if b.edge.up(e.Index) {
 					kind = v1.EventConnected
 				}
+				b.gone.up()
 				t.Emit(v1.Event{Kind: kind})
 			case connection.Reconnecting:
 				b.edge.attempt()
 			case connection.Disconnected:
 				b.edge.disconnect()
 				t.Emit(v1.Event{Kind: v1.EventDisconnected})
+				// The only trigger: nothing probes the edge unless it has
+				// already dropped us and stayed away for goneSettle.
+				b.gone.down(func() { b.probeGone(ctx, t, spec, log) })
 			}
 		}))
 
@@ -990,6 +996,22 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			v1.ErrEdgeUnreachable, b.edge.attemptCount(), b.edge.disconnectCount(), edgeBudget, edgeBlockedHint)
 	}
 	return nil
+}
+
+// probeGone asks the edge whether the tunnel still exists and reports it if
+// not. Reporting only: cloudflared keeps retrying either way, and ending the
+// tunnel on the strength of one probe is the caller's call to make.
+func (b *Backend) probeGone(ctx context.Context, t emitter, spec *Spec, log *zerolog.Logger) {
+	gone, known := tunnelGone(ctx, spec, log)
+	switch {
+	case !known:
+		// The edge never answered, so nothing was learned. Leave the watch
+		// fired: a second probe would ask the same unanswerable question.
+		return
+	case !gone:
+		return
+	}
+	t.Emit(v1.Event{Kind: v1.EventGone})
 }
 
 // credentialRejected is what a caller sees when the edge refuses these
