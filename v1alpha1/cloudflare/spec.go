@@ -9,6 +9,11 @@ import (
 // by libtunnel.Cloudflare(). The json tags match the tunnel.pizza
 // response and the LIBTUNNEL_SPEC handoff encoding.
 type Spec struct {
+	// RecordID resumes a hostname: the provider's handle on the DNS record
+	// that reserves it, returned by the mint and replayed to it. It is a
+	// bearer credential — replaying it yields the secret — and it is what
+	// keeps a retry from minting a second tunnel.
+	RecordID   string `json:"record_id,omitempty"`
 	ID         string `json:"id"`
 	Name       string `json:"name"`
 	Hostname   string `json:"hostname"`

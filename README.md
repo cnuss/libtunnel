@@ -389,11 +389,15 @@ What comes back decides the outcome:
 | a different hostname | it connects on that one, and says so at warn level |
 | nothing (the provider cannot be reached) | the spec is replayed as given |
 
-A provider reclaims by name — hand it the name and secret a spec was minted
-under and it answers on that hostname if the reservation still holds, whatever
-became of the tunnel behind it. If the reservation is gone it mints a fresh
-one, and libtunnel uses that: the tunnel exists by then either way, and
-refusing it would only cost a second mint for the same new name.
+A replay hands the provider the spec's **record id** — the handle on the DNS
+record reserving that hostname — and it answers on the same hostname while the
+reservation holds, whatever became of the tunnel behind it. If the reservation
+is gone it mints a fresh one, and libtunnel uses that: the tunnel exists by
+then either way, and refusing it would only cost a second mint for the same new
+name.
+
+The record id is a bearer credential and is part of the serialized spec, so
+storing a spec means storing it.
 
 **So a replay can come back on a different hostname.** Re-read the spec after
 the tunnel is up rather than trusting the one you stored — `LIBTUNNEL_SPEC`
@@ -434,8 +438,7 @@ Cloudflare, each mirrors a spec-field setter on the backend — env beats code,
 field by field, patched onto whatever spec the chain resolves; a complete
 credential set (id, hostname, account tag, secret) skips resolution entirely.
 When the chain does mint, the fields known beforehand also ride the mint
-request as reclaim hints — `X-Name` and `X-Secret` (base64), the pair that
-identifies a reservation — so a
+request as its record id — so a
 provider that reaps idle tunnels can hand the matching tunnel back instead of
 minting fresh. Only fields the caller supplies become hints:
 

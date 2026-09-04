@@ -293,84 +293,6 @@ func TestHeadersEnvBeatsCode(t *testing.T) {
 	}
 }
 
-// TestReclaimHintsSentToMint pins the reclaim hints: the name and secret a
-// tunnel was minted under ride the request as X-Name / X-Secret (base64), so a
-// provider that reaps idle tunnels can hand the matching hostname back.
-func TestReclaimHintsSentToMint(t *testing.T) {
-	clearSpecEnv(t)
-	var seen http.Header
-	srv := mintServer(t, &seen)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	b := New().WithID("id-1").WithName("pizza-1").WithSecret([]byte("secret")).WithProvider(srv.URL)
-	if _, err := b.Provider().Spec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := seen.Get("X-Name"); got != "pizza-1" {
-		t.Errorf("X-Name = %q, want %q", got, "pizza-1")
-	}
-	if got := seen.Get("X-Secret"); got != "c2VjcmV0" {
-		t.Errorf("X-Secret = %q, want %q (base64)", got, "c2VjcmV0")
-	}
-}
-
-// TestReclaimHintsAbsentByDefault pins the quiet default: a mint with no spec
-// fields set carries no reclaim hints.
-func TestReclaimHintsAbsentByDefault(t *testing.T) {
-	clearSpecEnv(t)
-	var seen http.Header
-	srv := mintServer(t, &seen)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := New().WithProvider(srv.URL).Provider().Spec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	for _, k := range []string{"X-Name", "X-Secret"} {
-		if _, ok := seen[k]; ok {
-			t.Errorf("%s = %q, want absent", k, seen.Get(k))
-		}
-	}
-}
-
-// TestReclaimHintEnvBeatsCode pins the mirror precedence inside the hints:
-// LIBTUNNEL__CLOUDFLARE_NAME beats WithName in the X-Name hint, matching the
-// field overlay's precedence.
-func TestReclaimHintEnvBeatsCode(t *testing.T) {
-	clearSpecEnv(t)
-	var seen http.Header
-	srv := mintServer(t, &seen)
-	t.Setenv(v1.CloudflareNameEnv, "env-name")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := New().WithName("code-name").WithProvider(srv.URL).Provider().Spec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := seen.Get("X-Name"); got != "env-name" {
-		t.Errorf("X-Name = %q, want the env value to beat code", got)
-	}
-}
-
-// TestWithHeaderBeatsReclaimHint pins the layer order: an explicit WithHeader
-// for a hint key replaces the hint.
-func TestWithHeaderBeatsReclaimHint(t *testing.T) {
-	clearSpecEnv(t)
-	var seen http.Header
-	srv := mintServer(t, &seen)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	b := New().WithName("from-setter").WithProvider(srv.URL).WithHeader("X-Name", "explicit")
-	if _, err := b.Provider().Spec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := seen.Values("X-Name"); len(got) != 1 || got[0] != "explicit" {
-		t.Errorf("X-Name = %v, want exactly [explicit] (WithHeader beats the hint)", got)
-	}
-}
-
 // TestExplicitHintRejectionStaysTerminal pins that only cache-derived hints
 // soften a rejection: with the hints coming from an explicit setter, a
 // refusal is the API's definitive no, exactly as before #142.
@@ -1592,25 +1514,6 @@ func TestReplayAcceptsAReplacedTunnel(t *testing.T) {
 	}
 }
 
-// TestMintHintsAreNameAndSecret pins the identity a replay sends: the pair the
-// provider reclaims by, taken from the spec being replayed.
-func TestMintHintsAreNameAndSecret(t *testing.T) {
-	clearSpecEnv(t)
-	var seen http.Header
-	srv := mintServer(t, &seen)
-
-	replayed := &Spec{ID: "stale", Name: "mine", Hostname: "minted.tunneled.pizza", Secret: []byte("secret")}
-	if _, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := seen.Get("X-Name"); got != "mine" {
-		t.Errorf("X-Name = %q, want the replayed name", got)
-	}
-	if got := seen.Get("X-Secret"); got != "c2VjcmV0" {
-		t.Errorf("X-Secret = %q, want the replayed secret (base64)", got)
-	}
-}
-
 // TestPartialIDDoesNotOverwriteResolvedSpec pins that a resolved spec keeps the
 // id whatever resolved it assigned. Overwriting it produces a spec whose id is
 // not its tunnel's, which is then what LIBTUNNEL_SPEC exports for a caller to
@@ -1626,5 +1529,122 @@ func TestPartialIDDoesNotOverwriteResolvedSpec(t *testing.T) {
 	}
 	if spec.ID == "stale" {
 		t.Errorf("ID = %q, want the id the mint assigned", spec.ID)
+	}
+}
+
+// TestRecordIDResumesAHostname pins the identity a replay sends. Without it
+// the provider mints a fresh record and tunnel, so a retry that drops it costs
+// a tunnel per attempt.
+func TestRecordIDResumesAHostname(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	replayed := &Spec{RecordID: "rec-1", Hostname: "minted.tunneled.pizza"}
+	if _, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("X-Record-Id"); got != "rec-1" {
+		t.Errorf("X-Record-Id = %q, want the replayed record", got)
+	}
+}
+
+// TestFreshMintSendsNoRecord pins the other half: with nothing to resume, the
+// request carries no record and the provider mints.
+func TestFreshMintSendsNoRecord(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	if _, err := New().WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Values("X-Record-Id"); len(got) != 0 {
+		t.Errorf("X-Record-Id = %v, want none", got)
+	}
+}
+
+// TestRecordIDIsStoredOnTheSpec pins that the record round-trips: it comes off
+// the response and onto the spec, which is what Serialize and LIBTUNNEL_SPEC
+// carry, so the next process can resume with it.
+func TestRecordIDIsStoredOnTheSpec(t *testing.T) {
+	clearSpecEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Record-Id", "rec-from-server")
+		fmt.Fprint(w, `{"success":true,"result":{"id":"t1","hostname":"minted.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	defer srv.Close()
+
+	spec, err := New().WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.RecordID != "rec-from-server" {
+		t.Errorf("RecordID = %q, want the one the provider returned", spec.RecordID)
+	}
+	if !strings.Contains(spec.Serialize(), "rec-from-server") {
+		t.Errorf("Serialize() dropped the record: %s", spec.Serialize())
+	}
+}
+
+// TestThrottledSpecWaitsForResolution pins the new contract's common case: a
+// 429 carrying success:true is a complete spec whose hostname does not resolve
+// yet, not a rate limit. Resuming the record is idempotent, so the wait costs
+// no extra tunnel — and the retry must carry the record or it would mint one.
+func TestThrottledSpecWaitsForResolution(t *testing.T) {
+	clearSpecEnv(t)
+	var calls atomic.Int32
+	var resumed atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if r.Header.Get("X-Record-Id") == "rec-1" {
+			resumed.Add(1)
+		}
+		w.Header().Set("X-Record-Id", "rec-1")
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}
+		fmt.Fprint(w, `{"success":true,"result":{"id":"t1","hostname":"settled.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	defer srv.Close()
+
+	spec, err := New().WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatalf("Spec() = %v, want the settled spec", err)
+	}
+	if spec.Hostname != "settled.tunneled.pizza" {
+		t.Errorf("Hostname = %q", spec.Hostname)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("API called %d times, want 2 (one unresolved, one settled)", got)
+	}
+	if got := resumed.Load(); got != 1 {
+		t.Errorf("the retry resumed the record %d times, want 1 — without it the provider mints again", got)
+	}
+}
+
+// TestThrottledFailureIsRetryable pins that a 429 carrying success:false is the
+// provider's own failure with the wait it wants, not a refusal: the old
+// success:false path made it terminal, which would strand a transient one.
+func TestThrottledFailureIsRetryable(t *testing.T) {
+	clearSpecEnv(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"success":false,"errors":[{"code":1002,"message":"tunnel create failed"}]}`)
+			return
+		}
+		fmt.Fprint(w, specJSON)
+	}))
+	defer srv.Close()
+
+	if _, err := New().WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
+		t.Fatalf("Spec() = %v, want the retry to succeed", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("API called %d times, want 2", got)
 	}
 }
