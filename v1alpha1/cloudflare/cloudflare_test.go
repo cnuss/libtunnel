@@ -1747,3 +1747,23 @@ func TestEdgeEventNames(t *testing.T) {
 		}
 	}
 }
+
+// TestEdgeEventLogOmitsUnsetFields pins #184: only Connected carries a
+// protocol, and connection.HTTP2 is the zero value, so logging it
+// unconditionally reported http2 for every event on a QUIC tunnel.
+func TestEdgeEventLogOmitsUnsetFields(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// The zero Event is what Disconnected and Reconnecting look like: no
+	// protocol, no location, no address.
+	var zero connection.Event
+	if zero.Protocol != connection.HTTP2 {
+		t.Fatalf("unset Protocol = %v, want it to be HTTP2 — the bug depends on that", zero.Protocol)
+	}
+
+	log.Debug("edge event", "event", edgeEventName(connection.Disconnected), "connIndex", zero.Index)
+	if strings.Contains(buf.String(), "protocol=") {
+		t.Errorf("a disconnected event named a protocol it does not carry: %s", buf.String())
+	}
+}
