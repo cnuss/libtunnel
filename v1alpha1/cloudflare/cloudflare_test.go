@@ -1648,3 +1648,56 @@ func TestThrottledFailureIsRetryable(t *testing.T) {
 		t.Errorf("API called %d times, want 2", got)
 	}
 }
+
+// TestSettleBudgetKeepsTheMintedSpec pins that a hostname which never confirms
+// costs latency, not a tunnel. The provider answered with a complete spec on
+// every attempt; discarding it at the budget would strand that tunnel and make
+// the caller mint a second one for a hostname it already holds.
+func TestSettleBudgetKeepsTheMintedSpec(t *testing.T) {
+	clearSpecEnv(t)
+	// Over the advertised Retry-After, so the budget expiring is what ends the
+	// loop rather than the provider asking for longer than it.
+	shortBudgets(t, 1500*time.Millisecond)
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("X-Record-Id", "rec-slow")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"t1","hostname":"slow.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	defer srv.Close()
+
+	spec, err := New().WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatalf("Spec() = %v, want the minted spec rather than a failure", err)
+	}
+	if spec.Hostname != "slow.tunneled.pizza" {
+		t.Errorf("Hostname = %q", spec.Hostname)
+	}
+	if spec.RecordID != "rec-slow" {
+		t.Errorf("RecordID = %q, want it carried so the caller can resume", spec.RecordID)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Errorf("API called %d times, want the budget to allow at least one retry", got)
+	}
+}
+
+// TestNoSpecStillFails pins the other side: a provider that never produced a
+// spec has nothing to hand back, so the budget expiring is a real failure.
+func TestNoSpecStillFails(t *testing.T) {
+	clearSpecEnv(t)
+	shortBudgets(t, 100*time.Millisecond)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"success":false,"errors":[{"code":1001,"message":"record create failed"}]}`)
+	}))
+	defer srv.Close()
+
+	if _, err := New().WithProvider(srv.URL).Provider().Spec(context.Background()); !errors.Is(err, v1.ErrRateLimited) {
+		t.Fatalf("err = %v, want errors.Is(_, ErrRateLimited)", err)
+	}
+}

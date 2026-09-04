@@ -273,14 +273,33 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	// backoff waits: three 15s timeouts cost 45s of real time but only 6s of
 	// ramp, and a hang is exactly what the budget exists to catch.
 	since := map[error]time.Time{}
+	// minted holds the last complete spec a response carried. A throttled
+	// answer carries one whenever the tunnel exists and only the hostname is
+	// still settling, so giving up after that would strand a real tunnel and
+	// cost the caller a second mint for a hostname it already has.
+	var minted *Spec
+	// abandon ends the loop. With a spec in hand the tunnel exists, so hand it
+	// back — the hostname may need a few more seconds, which is what the
+	// warning is for. Without one there is nothing to return but the failure.
+	abandon := func(err, named error) (*Spec, error) {
+		if minted == nil {
+			return nil, named
+		}
+		log.Warn("mint never confirmed the hostname resolves; using the tunnel it minted",
+			"error", err, "hostname", minted.GetHostname())
+		return minted, nil
+	}
 	for {
 		attempts++
 		res, err := fetch(record)
 		if res.record != "" {
 			record = res.record
 		}
-		if err == nil {
+		if res.spec != nil {
 			res.spec.RecordID = record
+			minted = res.spec
+		}
+		if err == nil {
 			return res.spec, nil
 		}
 		retryAfter := res.after
@@ -296,14 +315,14 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 		limit := budget(class)
 		if limit == 0 {
-			return nil, named
+			return abandon(err, named)
 		}
 		// A throttle that outlasts its own budget is reported now rather than
 		// slept on: a caller can act on "resets in 5m", where waiting it out
 		// just moves the hang somewhere the caller cannot see it.
 		if retryAfter > limit {
 			log.Warn("quick tunnel rate limited", "error", err, "resetsIn", retryAfter)
-			return nil, named
+			return abandon(err, named)
 		}
 		if _, seen := since[class]; !seen {
 			since[class] = time.Now()
@@ -312,8 +331,8 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		// attempt — a hung endpoint is reported at roughly budget + Timeout,
 		// not at the budget exactly.
 		if spent := time.Since(since[class]); spent > limit {
-			return nil, fmt.Errorf("no spec after %d attempts in %s: %w",
-				attempts, spent.Round(time.Second), named)
+			return abandon(err, fmt.Errorf("no spec after %d attempts in %s: %w",
+				attempts, spent.Round(time.Second), named))
 		}
 
 		// The server's Retry-After wins over the linear ramp when it asks for
