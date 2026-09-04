@@ -844,9 +844,18 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			// Every event, not only the two acted on: this is the only
 			// structured view of what the edge is doing, and cloudflared's own
 			// account of it is prose in a log line.
-			t.Logger().Debug("edge event", "event", edgeEventName(e.EventType),
-				"connIndex", e.Index, "protocol", e.Protocol.String(),
-				"location", e.Location, "edgeAddress", e.EdgeAddress, "url", e.URL)
+			// Only Connected carries a protocol, location and address; the
+			// rest leave them zero, and connection.HTTP2 is 0 — logging it
+			// unconditionally reports http2 for every event on a QUIC tunnel.
+			attrs := []any{"event", edgeEventName(e.EventType), "connIndex", e.Index}
+			if e.EventType == connection.Connected {
+				attrs = append(attrs, "protocol", e.Protocol.String(),
+					"location", e.Location, "edgeAddress", e.EdgeAddress)
+			}
+			if e.URL != "" {
+				attrs = append(attrs, "url", e.URL)
+			}
+			t.Logger().Debug("edge event", attrs...)
 			switch e.EventType {
 			case connection.Connected:
 				// First time for this connection index is a connect; after
