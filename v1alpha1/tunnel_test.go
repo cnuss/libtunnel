@@ -695,6 +695,31 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 	}
 }
 
+// TestReadyIsTunnelReady pins that Lifecycle.Ready is TunnelReady's channel,
+// not a parallel one: a caller waiting on either sees the same moment, and
+// there is one start trigger, not two.
+func TestReadyIsTunnelReady(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
+	conn := tun.WithListener(listen(t))
+
+	// Lifecycle alone, no Tunnel: what a supervisor holding mixed values sees.
+	var life v1.Lifecycle = conn
+
+	if life.Ready() != conn.TunnelReady() {
+		t.Fatal("Ready and TunnelReady are different channels")
+	}
+	select {
+	case <-life.Ready():
+	case <-life.Done():
+		t.Fatalf("tunnel ended before it was ready: %v", life.Err())
+	case <-time.After(15 * time.Second):
+		t.Fatal("Ready never closed after the engine connected")
+	}
+	if err := life.Err(); err != nil {
+		t.Fatalf("Err = %v while the tunnel is alive, want nil", err)
+	}
+}
+
 // TestHostnameReadyAtRegistration pins that readiness follows edge
 // registration with no client-side settle: the mint provider waits out the
 // record's spread before returning credentials, so holding the caller after

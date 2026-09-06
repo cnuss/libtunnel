@@ -704,6 +704,12 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 	return t.tunnelReady
 }
 
+// Ready implements v1.Lifecycle: the tunnel is serving end to end. The same
+// channel as TunnelReady, and the same start trigger.
+func (t *TunnelImpl[T]) Ready() <-chan struct{} {
+	return t.TunnelReady()
+}
+
 // HostnameReady returns the channel closed once the public hostname is
 // expected to resolve: when the edge connection registers — the record's
 // spread across the zone's nameservers was already waited out by the mint

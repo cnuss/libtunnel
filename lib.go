@@ -130,6 +130,11 @@ func vcsVersion(info *debug.BuildInfo) string {
 // Storable as a plain field — the backend spec type does not appear in it.
 type TunnelV1 = v1.Tunnel
 
+// LifecycleV1 is the shape of anything long-lived — Ready, Done, Err — which
+// TunnelV1 embeds. Re-exported so a supervisor holding tunnels alongside other
+// long-lived things can name the shared shape without importing v1.
+type LifecycleV1 = v1.Lifecycle
+
 // CloudflareV1 is the Cloudflare backend's contract type: an alias for
 // v1.Backend[*cloudflare.Spec], re-exported so callers can declare fields and
 // parameters without importing v1 or the cloudflare package. Cloudflare()

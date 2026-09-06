@@ -271,6 +271,24 @@ const (
 	CloudflareEdgeProtocolEnv = "LIBTUNNEL__CLOUDFLARE_EDGE_PROTOCOL"
 )
 
+// Lifecycle is the shape of anything long-lived: when it is up, when it is
+// over, and why. Tunnel embeds it, and so can anything else with the same
+// three verbs, so a supervisor can hold them uniformly.
+//
+// The channels are closed, never sent on, so any number of waiters in any
+// number of goroutines see them — the same contract as context.Done.
+type Lifecycle interface {
+	// Ready is closed once the value is serving. It is never closed on
+	// failure — select on Done alongside it.
+	Ready() <-chan struct{}
+	// Done is closed when the value ends, by failure or by choice. A wait on
+	// Ready should select on Done too, or a failure blocks it forever.
+	Done() <-chan struct{}
+	// Err reports why it ended: nil while it is alive, the cause once Done
+	// is closed.
+	Err() error
+}
+
 // Spec is the credential/identity set a Provider yields. Each backend defines
 // a concrete spec type (cloudflare.Spec for the Cloudflare backend); the core
 // only needs the public hostname the spec encodes — everything else is
@@ -346,6 +364,19 @@ type Backend[T Spec] interface {
 // does not outlive New, so callers can store a tunnel reference without
 // threading the spec type through their own code.
 type Tunnel interface {
+	// Ready is closed when the edge connection is up and the hostname
+	// resolves publicly — reachable end to end. Demand-driven, like URL: with
+	// no origin provided it mints a loopback listener and starts the edge
+	// connection before handing back the channel.
+	//
+	// Err reports a failure class for a tunnel that will not come up:
+	// errors.Is(err, ErrFailed) is the coarse check, and the class wrapping
+	// it — ErrCertificate, ErrRejected, ErrCredentialRejected,
+	// ErrProviderUnreachable, ErrEdgeUnreachable, ErrRateLimited — is what an
+	// operator can act on. A tunnel closed deliberately reports ErrClosed,
+	// which is terminal but not a failure.
+	Lifecycle
+
 	// LocalPort is the origin's local port: the listener's bound port, or for
 	// a URL origin (WithLocalURL) the URL's port — 443 for https and 80 for
 	// http when the URL has none. Blocks until an origin is provided.
@@ -411,18 +442,6 @@ type Tunnel interface {
 	// trigger: with no origin provided it mints a loopback listener and
 	// starts the edge connection before handing back the channel.
 	TunnelReady() <-chan struct{}
-	// Done is closed when the tunnel fails or shuts down. Waits on TunnelReady
-	// or HostnameReady should select on Done too, or a failed tunnel blocks
-	// them forever.
-	Done() <-chan struct{}
-	// Err reports why the tunnel ended (nil while it is alive). A tunnel that
-	// will not come up reports a failure class: errors.Is(err, ErrFailed) is
-	// the coarse check, and the class wrapping it — ErrCertificate,
-	// ErrRejected, ErrCredentialRejected, ErrProviderUnreachable,
-	// ErrEdgeUnreachable, ErrRateLimited
-	// — is what an operator can act on. A tunnel closed deliberately reports
-	// ErrClosed, which is terminal but not a failure.
-	Err() error
 
 	// WithEventListener registers a function to receive the tunnel's lifecycle
 	// events. Layerable, not write-once: every registered listener is called,
