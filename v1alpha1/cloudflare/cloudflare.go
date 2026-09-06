@@ -1026,6 +1026,13 @@ var goneSettle = 10 * time.Second
 // RPC. Past it nothing is claimed.
 const goneProbeTimeout = 15 * time.Second
 
+// probeHandshakeTimeout and probeIdleTimeout bound one edge address, keeping a
+// dead one cheap enough that the walk reaches the live ones.
+const (
+	probeHandshakeTimeout = 2 * time.Second
+	probeIdleTimeout      = 3 * time.Second
+)
+
 // probeConnIndex is the connection index the probe registers under. The
 // supervisor owns 0..haConnections-1, so this sits clear: registering an index
 // already in use answers EDUPCONN, which says the tunnel exists but is a
@@ -1183,10 +1190,18 @@ func anEdgeConn(ctx context.Context, tlsConfig *tls.Config, log *zerolog.Logger)
 		return nil, netip.AddrPort{}, fmt.Errorf("edge discovery: %w", err)
 	}
 
+	// Tighter than cloudflared's own (5s handshake, 5s idle). Those are tuned
+	// for a connector that must not give up on the address it has. This is a
+	// one-shot probe walking twenty-odd addresses inside goneProbeTimeout, so
+	// a slow address is one to abandon rather than wait on — at cloudflared's
+	// values three dead addresses would exhaust the whole budget.
 	quicConfig := &quic.Config{
-		HandshakeIdleTimeout: cfquic.HandshakeIdleTimeout,
-		MaxIdleTimeout:       cfquic.MaxIdleTimeout,
-		KeepAlivePeriod:      cfquic.MaxIdlePingPeriod,
+		HandshakeIdleTimeout: probeHandshakeTimeout,
+		MaxIdleTimeout:       probeIdleTimeout,
+		// Cloudflared's 1s, comfortably inside the idle timeout above so the
+		// connection survives the pause between dialing and the registration
+		// round trip.
+		KeepAlivePeriod: cfquic.MaxIdlePingPeriod,
 	}
 
 	var tried int
