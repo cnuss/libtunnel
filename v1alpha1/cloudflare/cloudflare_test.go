@@ -1776,81 +1776,57 @@ func TestProbeIndexIsClearOfTheSupervisor(t *testing.T) {
 	}
 }
 
-// shortProbeSettle shrinks the settle clock so a test exercises the trigger
-// rather than the wait.
-func shortProbeSettle(t *testing.T, d time.Duration) {
+// shortProbeInterval shrinks the poll so a test exercises the loop rather
+// than the wait.
+func shortProbeInterval(t *testing.T, d time.Duration) {
 	t.Helper()
-	prev := probeSettle
-	probeSettle = d
-	t.Cleanup(func() { probeSettle = prev })
+	prev := probeInterval
+	probeInterval = d
+	t.Cleanup(func() { probeInterval = prev })
 }
 
-// TestGoneProbeArmsOncePerSettle pins the trigger. Every connection index
-// reports Connected separately, so a burst has to collapse into one probe
-// rather than one per index.
-func TestGoneProbeArmsOncePerSettle(t *testing.T) {
-	shortProbeSettle(t, 100*time.Millisecond)
+// TestGoneProbeRunsContinuously pins that the probe keeps asking. A tunnel
+// reaped while its connections still look fine produces no edge event, so
+// waiting for one is waiting forever.
+func TestGoneProbeRunsContinuously(t *testing.T) {
+	shortProbeInterval(t, 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	b := New()
 	var probes atomic.Int32
 
-	for range 5 {
-		b.armProbe(func() { probes.Add(1) })
-	}
-	if got := probes.Load(); got != 0 {
-		t.Fatalf("probed %d times before the settle expired, want 0", got)
-	}
+	b.runProbe(ctx, func() { probes.Add(1) })
 
-	deadline := time.Now().Add(probeSettle + 5*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for probes.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := probes.Load(); got < 3 {
+		t.Errorf("probed %d times, want the loop to keep going", got)
+	}
+}
+
+// TestGoneProbeStopsWithTheTunnel pins that nothing outlives the tunnel: a
+// probe firing after close would dial the edge on behalf of something already
+// gone.
+func TestGoneProbeStopsWithTheTunnel(t *testing.T) {
+	shortProbeInterval(t, 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	b := New()
+	var probes atomic.Int32
+
+	b.runProbe(ctx, func() { probes.Add(1) })
+
+	deadline := time.Now().Add(5 * time.Second)
 	for probes.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-	if got := probes.Load(); got != 1 {
-		t.Fatalf("probed %d times for one burst of connections, want 1", got)
-	}
-}
+	cancel()
 
-// TestGoneProbeRearmsAfterAnswering pins that nothing remembers having
-// answered: a tunnel that goes away twice is reported twice, and deciding what
-// that means is the caller's job.
-func TestGoneProbeRearmsAfterAnswering(t *testing.T) {
-	shortProbeSettle(t, 100*time.Millisecond)
-	b := New()
-	var probes atomic.Int32
-	fire := func() { b.armProbe(func() { probes.Add(1) }) }
-
-	fire()
-	deadline := time.Now().Add(probeSettle + 5*time.Second)
-	for probes.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	fire()
-	deadline = time.Now().Add(probeSettle + 5*time.Second)
-	for probes.Load() < 2 && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-	}
-	if got := probes.Load(); got != 2 {
-		t.Errorf("probed %d times across two settles, want 2", got)
-	}
-}
-
-// TestGoneProbeFiresUnderAFastRetryLoop pins why arming is idle-only. The
-// supervisor reports Reconnecting once per retry and its early retries are
-// seconds apart, so restarting the clock on each would push the probe past
-// every outage short of a very long one — which is every outage worth asking
-// about.
-func TestGoneProbeFiresUnderAFastRetryLoop(t *testing.T) {
-	shortProbeSettle(t, 300*time.Millisecond)
-	b := New()
-	var probes atomic.Int32
-
-	stop := time.Now().Add(900 * time.Millisecond)
-	for time.Now().Before(stop) && probes.Load() == 0 {
-		b.armProbe(func() { probes.Add(1) })
-		time.Sleep(50 * time.Millisecond)
-	}
-	if got := probes.Load(); got != 1 {
-		t.Errorf("probed %d times under a retry loop faster than the settle, want 1", got)
+	settled := probes.Load()
+	time.Sleep(300 * time.Millisecond)
+	if got := probes.Load(); got > settled+1 {
+		t.Errorf("probed %d times after the tunnel ended, want the loop stopped", got-settled)
 	}
 }
 
