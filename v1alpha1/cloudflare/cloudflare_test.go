@@ -1776,37 +1776,36 @@ func TestProbeIndexIsClearOfTheSupervisor(t *testing.T) {
 	}
 }
 
-// shortGoneSettle shrinks the settle clock so a test exercises the trigger
+// shortProbeSettle shrinks the settle clock so a test exercises the trigger
 // rather than the wait.
-func shortGoneSettle(t *testing.T, d time.Duration) {
+func shortProbeSettle(t *testing.T, d time.Duration) {
 	t.Helper()
-	prev := goneSettle
-	goneSettle = d
-	t.Cleanup(func() { goneSettle = prev })
+	prev := probeSettle
+	probeSettle = d
+	t.Cleanup(func() { probeSettle = prev })
 }
 
-// TestGoneProbeArmsOncePerOutage pins the trigger. The supervisor emits a
-// Disconnected per serve attempt, and cloudflared's early retries are seconds
-// apart — restarting the clock on each would push the probe past every outage
-// short of a very long one, so arming is idempotent while one is pending.
-func TestGoneProbeArmsOncePerOutage(t *testing.T) {
-	shortGoneSettle(t, 100*time.Millisecond)
+// TestGoneProbeArmsOncePerSettle pins the trigger. Every connection index
+// reports Connected separately, so a burst has to collapse into one probe
+// rather than one per index.
+func TestGoneProbeArmsOncePerSettle(t *testing.T) {
+	shortProbeSettle(t, 100*time.Millisecond)
 	b := New()
 	var probes atomic.Int32
 
 	for range 5 {
-		b.armGoneProbe(func() { probes.Add(1) })
+		b.armProbe(func() { probes.Add(1) })
 	}
 	if got := probes.Load(); got != 0 {
 		t.Fatalf("probed %d times before the settle expired, want 0", got)
 	}
 
-	deadline := time.Now().Add(goneSettle + 5*time.Second)
+	deadline := time.Now().Add(probeSettle + 5*time.Second)
 	for probes.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if got := probes.Load(); got != 1 {
-		t.Fatalf("probed %d times for one outage, want 1", got)
+		t.Fatalf("probed %d times for one burst of connections, want 1", got)
 	}
 }
 
@@ -1814,39 +1813,44 @@ func TestGoneProbeArmsOncePerOutage(t *testing.T) {
 // answered: a tunnel that goes away twice is reported twice, and deciding what
 // that means is the caller's job.
 func TestGoneProbeRearmsAfterAnswering(t *testing.T) {
-	shortGoneSettle(t, 100*time.Millisecond)
+	shortProbeSettle(t, 100*time.Millisecond)
 	b := New()
 	var probes atomic.Int32
-	fire := func() { b.armGoneProbe(func() { probes.Add(1) }) }
+	fire := func() { b.armProbe(func() { probes.Add(1) }) }
 
 	fire()
-	deadline := time.Now().Add(goneSettle + 5*time.Second)
+	deadline := time.Now().Add(probeSettle + 5*time.Second)
 	for probes.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
 	fire()
-	deadline = time.Now().Add(goneSettle + 5*time.Second)
+	deadline = time.Now().Add(probeSettle + 5*time.Second)
 	for probes.Load() < 2 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if got := probes.Load(); got != 2 {
-		t.Errorf("probed %d times across two outages, want 2", got)
+		t.Errorf("probed %d times across two settles, want 2", got)
 	}
 }
 
-// TestGoneProbeCancelledByAReconnect pins the common case: a connection back
-// inside the settle window means there was never anything to ask.
-func TestGoneProbeCancelledByAReconnect(t *testing.T) {
+// TestGoneProbeFiresUnderAFastRetryLoop pins why arming is idle-only. The
+// supervisor reports Reconnecting once per retry and its early retries are
+// seconds apart, so restarting the clock on each would push the probe past
+// every outage short of a very long one — which is every outage worth asking
+// about.
+func TestGoneProbeFiresUnderAFastRetryLoop(t *testing.T) {
+	shortProbeSettle(t, 300*time.Millisecond)
 	b := New()
 	var probes atomic.Int32
 
-	b.armGoneProbe(func() { probes.Add(1) })
-	b.cancelGoneProbe()
-
-	time.Sleep(200 * time.Millisecond)
-	if got := probes.Load(); got != 0 {
-		t.Errorf("probed %d times after the edge came back, want 0", got)
+	stop := time.Now().Add(900 * time.Millisecond)
+	for time.Now().Before(stop) && probes.Load() == 0 {
+		b.armProbe(func() { probes.Add(1) })
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := probes.Load(); got != 1 {
+		t.Errorf("probed %d times under a retry loop faster than the settle, want 1", got)
 	}
 }
 
