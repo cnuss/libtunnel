@@ -1068,27 +1068,64 @@ func (b *Backend) cancelGoneProbe() {
 	}
 }
 
-// anEdgeAddr resolves one edge address to probe, through cloudflared's own
-// discovery so the probe reaches the edge the connector would.
-func anEdgeAddr(log *zerolog.Logger) (netip.AddrPort, bool) {
+// anEdgeConn dials the edge and returns the first address that answers, along
+// with the address it used — RegisterConnection wants to be told which edge it
+// is talking to.
+//
+// Discovery yields twenty-odd addresses per region and any one of them can be
+// unreachable while the edge as a whole is fine. Taking the first blind turns
+// a probe that would have got an answer into "no answer", and this probe only
+// ever runs when the network is already suspect, which is exactly when a
+// single dead address is most likely to be mistaken for a dead tunnel.
+//
+// Attempts are bounded by ctx rather than counted: the caller's deadline is
+// the budget, and a dial that outlives it fails on its own.
+func anEdgeConn(ctx context.Context, tlsConfig *tls.Config, log *zerolog.Logger) (cfquic.QUICConnection, netip.AddrPort, error) {
 	regions, err := allregions.EdgeDiscovery(log, edgeSRVService)
 	if err != nil {
-		return netip.AddrPort{}, false
+		return nil, netip.AddrPort{}, fmt.Errorf("edge discovery: %w", err)
 	}
+
+	quicConfig := &quic.Config{
+		HandshakeIdleTimeout: cfquic.HandshakeIdleTimeout,
+		MaxIdleTimeout:       cfquic.MaxIdleTimeout,
+		KeepAlivePeriod:      cfquic.MaxIdlePingPeriod,
+	}
+
+	var tried int
+	var lastErr error
 	for _, region := range regions {
-		for _, addr := range region {
-			if addr.UDP == nil {
+		for _, edge := range region {
+			if edge.UDP == nil {
 				continue
 			}
-			ip, ok := netip.AddrFromSlice(addr.UDP.IP)
+			ip, ok := netip.AddrFromSlice(edge.UDP.IP)
 			if !ok {
 				continue
 			}
 			// nolint: gosec // a port is uint16 by definition
-			return netip.AddrPortFrom(ip.Unmap(), uint16(addr.UDP.Port)), true
+			addr := netip.AddrPortFrom(ip.Unmap(), uint16(edge.UDP.Port))
+
+			conn, err := connection.DialQuic(ctx, quicConfig, tlsConfig, addr, nil, probeConnIndex, log,
+				// A probe must not share the connector's UDP port; cloudflared
+				// offers this flag for exactly that.
+				dialopts.DialOpts{SkipPortReuse: true})
+			if err == nil {
+				return conn, addr, nil
+			}
+			tried++
+			lastErr = err
+			log.Debug().Err(err).Stringer("edge", addr).Msg("gone probe: edge address did not answer")
+
+			if ctx.Err() != nil {
+				return nil, netip.AddrPort{}, fmt.Errorf("no edge answered in %d attempts: %w", tried, ctx.Err())
+			}
 		}
 	}
-	return netip.AddrPort{}, false
+	if lastErr == nil {
+		return nil, netip.AddrPort{}, errors.New("edge discovery returned no usable addresses")
+	}
+	return nil, netip.AddrPort{}, fmt.Errorf("no edge answered in %d attempts: %w", tried, lastErr)
 }
 
 // probeGone asks the edge whether the tunnel still exists and reports it if
@@ -1115,22 +1152,9 @@ func (b *Backend) probeGone(ctx context.Context, t emitter, spec *Spec, log *zer
 		return
 	}
 
-	addr, ok := anEdgeAddr(log)
-	if !ok {
-		log.Debug().Msg("gone probe: no edge address available")
-		return
-	}
-
-	conn, err := connection.DialQuic(ctx, &quic.Config{
-		HandshakeIdleTimeout: cfquic.HandshakeIdleTimeout,
-		MaxIdleTimeout:       cfquic.MaxIdleTimeout,
-		KeepAlivePeriod:      cfquic.MaxIdlePingPeriod,
-	}, tlsConfig, addr, nil, probeConnIndex, log,
-		// A probe must not share the connector's UDP port; cloudflared offers
-		// this flag for exactly that.
-		dialopts.DialOpts{SkipPortReuse: true})
+	conn, addr, err := anEdgeConn(ctx, tlsConfig, log)
 	if err != nil {
-		log.Debug().Err(err).Msg("gone probe: failed to dial the edge")
+		log.Debug().Err(err).Msg("gone probe: failed to reach any edge address")
 		return
 	}
 	defer conn.CloseWithError(quic.ApplicationErrorCode(quic.NoError), "probe complete")
