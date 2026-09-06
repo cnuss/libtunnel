@@ -111,13 +111,15 @@ type Tunnel interface {
     URL() *url.URL // blocks until the hostname resolves (end-to-end w/ WithContext);
                    // start trigger, like Listener
 
-    // Lifecycle — embedded; the three verbs a supervisor needs
-    Ready() <-chan struct{}         // serving end to end; start trigger, like Listener
-    Done() <-chan struct{}          // tunnel failed or shut down
+    // Lifecycle[Tunnel] — embedded; the three verbs a supervisor needs.
+    // Each call is a fresh channel that delivers the tunnel once, then closes.
+    Ready() <-chan Tunnel           // serving end to end; start trigger, like Listener;
+                                    // closes empty if the tunnel ends first
+    Done() <-chan Tunnel            // tunnel failed or shut down
     Err() error                     // why (nil while alive); see Failure classes
 
     HostnameReady() <-chan struct{} // hostname resolves on authoritative NS
-    TunnelReady() <-chan struct{}   // same channel as Ready
+    TunnelReady() <-chan struct{}   // closed when Ready would deliver
 
     // write-once mutators: first call wins, no-ops once the value is fixed
     WithLogger(log *slog.Logger) Tunnel      // default: silent

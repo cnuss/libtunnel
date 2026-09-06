@@ -275,17 +275,19 @@ const (
 // over, and why. Tunnel embeds it, and so can anything else with the same
 // three verbs, so a supervisor can hold them uniformly.
 //
-// The channels are closed, never sent on, so any number of waiters in any
-// number of goroutines see them — the same contract as context.Done.
-type Lifecycle interface {
-	// Ready is closed once the value is serving. It is never closed on
-	// failure — select on Done alongside it.
-	Ready() <-chan struct{}
-	// Done is closed when the value ends, by failure or by choice. A wait on
-	// Ready should select on Done too, or a failure blocks it forever.
-	Done() <-chan struct{}
+// Each call returns its own channel, which delivers the value once and then
+// closes — so any number of waiters see it, and a receive reads as
+// `v, ok := <-x.Ready()`. Hold the channel rather than calling in a loop:
+// every call is a new one.
+type Lifecycle[T any] interface {
+	// Ready delivers the value once it is serving. If it ends first the
+	// channel closes without delivering, so a receive with ok == false means
+	// it never came up — Err says why.
+	Ready() <-chan T
+	// Done delivers the value once it has ended, by failure or by choice.
+	Done() <-chan T
 	// Err reports why it ended: nil while it is alive, the cause once Done
-	// is closed.
+	// has delivered.
 	Err() error
 }
 
@@ -364,10 +366,10 @@ type Backend[T Spec] interface {
 // does not outlive New, so callers can store a tunnel reference without
 // threading the spec type through their own code.
 type Tunnel interface {
-	// Ready is closed when the edge connection is up and the hostname
-	// resolves publicly — reachable end to end. Demand-driven, like URL: with
-	// no origin provided it mints a loopback listener and starts the edge
-	// connection before handing back the channel.
+	// Ready delivers the tunnel when the edge connection is up and the
+	// hostname resolves publicly — reachable end to end. Demand-driven, like
+	// URL: with no origin provided it mints a loopback listener and starts
+	// the edge connection before handing back the channel.
 	//
 	// Err reports a failure class for a tunnel that will not come up:
 	// errors.Is(err, ErrFailed) is the coarse check, and the class wrapping
@@ -375,7 +377,7 @@ type Tunnel interface {
 	// ErrProviderUnreachable, ErrEdgeUnreachable, ErrRateLimited — is what an
 	// operator can act on. A tunnel closed deliberately reports ErrClosed,
 	// which is terminal but not a failure.
-	Lifecycle
+	Lifecycle[Tunnel]
 
 	// LocalPort is the origin's local port: the listener's bound port, or for
 	// a URL origin (WithLocalURL) the URL's port — 443 for https and 80 for

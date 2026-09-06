@@ -704,10 +704,10 @@ func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
 	return t.tunnelReady
 }
 
-// Ready implements v1.Lifecycle: the tunnel is serving end to end. The same
-// channel as TunnelReady, and the same start trigger.
-func (t *TunnelImpl[T]) Ready() <-chan struct{} {
-	return t.TunnelReady()
+// Ready implements v1.Lifecycle: delivers the tunnel once it is serving end
+// to end. Waits on TunnelReady, so it is the same start trigger.
+func (t *TunnelImpl[T]) Ready() <-chan v1.Tunnel {
+	return t.deliver(t.TunnelReady())
 }
 
 // HostnameReady returns the channel closed once the public hostname is
