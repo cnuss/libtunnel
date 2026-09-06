@@ -198,9 +198,43 @@ func (t *TunnelImpl[T]) Context() context.Context {
 	return t.ctx
 }
 
-// Done implements v1.Tunnel: closed when the tunnel fails or shuts down.
-func (t *TunnelImpl[T]) Done() <-chan struct{} {
-	return t.ctx.Done()
+// Done implements v1.Lifecycle: delivers the tunnel once it has ended.
+func (t *TunnelImpl[T]) Done() <-chan v1.Tunnel {
+	return t.deliver(t.ctx.Done())
+}
+
+// deliver hands t to whoever waits on signal. Each call gets its own channel:
+// a shared one could only broadcast by closing, and a closed channel carries
+// nil, not t.
+//
+// The channel always closes — on signal with t delivered, or on the tunnel
+// ending without it — so a waiter on a tunnel that never comes up is released
+// rather than stranded, and the goroutine behind it goes with the tunnel.
+func (t *TunnelImpl[T]) deliver(signal <-chan struct{}) <-chan v1.Tunnel {
+	ch := make(chan v1.Tunnel, 1)
+	select {
+	case <-signal:
+		ch <- t
+		close(ch)
+		return ch
+	default:
+	}
+	go func() {
+		defer close(ch)
+		select {
+		case <-signal:
+		case <-t.ctx.Done():
+		}
+		// Both arms fire together when signal is ctx.Done itself, and select
+		// picks either; what matters is whether signal has fired, not which
+		// arm woke us.
+		select {
+		case <-signal:
+			ch <- t
+		default:
+		}
+	}()
+	return ch
 }
 
 // Err implements v1.Tunnel: the cancellation cause, nil while alive.

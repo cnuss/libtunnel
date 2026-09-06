@@ -695,6 +695,67 @@ func TestTunnelReadyAfterEngineConnects(t *testing.T) {
 	}
 }
 
+// TestLifecycleDeliversTheTunnel pins the payload: Ready and Done each hand
+// back the tunnel itself, to every waiter — a closed channel would broadcast,
+// but carry nil.
+func TestLifecycleDeliversTheTunnel(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
+	conn := tun.WithListener(listen(t))
+
+	// Lifecycle alone, no Tunnel: what a supervisor holding mixed values sees.
+	var life v1.Lifecycle[v1.Tunnel] = conn
+
+	// Two waiters, taken before readiness, so neither is the fast path.
+	first, second := life.Ready(), life.Ready()
+	for i, ch := range []<-chan v1.Tunnel{first, second} {
+		select {
+		case got, ok := <-ch:
+			if !ok || got != v1.Tunnel(conn) {
+				t.Fatalf("waiter %d: Ready delivered (%v, %v), want the tunnel", i, got, ok)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatalf("waiter %d: Ready never delivered after the engine connected", i)
+		}
+	}
+	// And after the fact, without a goroutine behind it.
+	if got, ok := <-life.Ready(); !ok || got != v1.Tunnel(conn) {
+		t.Fatalf("late Ready delivered (%v, %v), want the tunnel", got, ok)
+	}
+	if err := life.Err(); err != nil {
+		t.Fatalf("Err = %v while the tunnel is alive, want nil", err)
+	}
+
+	tun.Cancel(v1.ErrClosed)
+	select {
+	case got, ok := <-life.Done():
+		if !ok || got != v1.Tunnel(conn) {
+			t.Fatalf("Done delivered (%v, %v), want the tunnel", got, ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never delivered after Cancel")
+	}
+}
+
+// TestReadyClosesEmptyOnFailure pins that a waiter on a tunnel that never
+// comes up is released, not stranded: the channel closes without a value, and
+// ok == false is how the receiver learns it.
+func TestReadyClosesEmptyOnFailure(t *testing.T) {
+	tun := v1alpha1.New(failingEngine{})
+	ready := tun.Ready() // start trigger; the spec fetch fails behind it
+
+	select {
+	case got, ok := <-ready:
+		if ok || got != nil {
+			t.Fatalf("Ready delivered (%v, %v) on a failed tunnel, want a bare close", got, ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ready stayed open on a failed tunnel")
+	}
+	if err := tun.Err(); err == nil {
+		t.Fatal("Err = nil after the failure, want the cause")
+	}
+}
+
 // TestHostnameReadyAtRegistration pins that readiness follows edge
 // registration with no client-side settle: the mint provider waits out the
 // record's spread before returning credentials, so holding the caller after
