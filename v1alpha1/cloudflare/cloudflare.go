@@ -45,6 +45,7 @@ import (
 	"github.com/cloudflare/cloudflared/tunnelrpc"
 	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	"github.com/google/uuid"
+	dns "github.com/ncruces/go-dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -1068,19 +1069,71 @@ func (b *Backend) cancelGoneProbe() {
 	}
 }
 
+// dohEndpoint is one DNS-over-HTTPS resolver the gone check can ask.
+//
+// The addresses are pinned so the check does not need the machine's resolver
+// to find its way to a resolver.
+type dohEndpoint struct {
+	uri       string
+	addresses []string
+}
+
+// dohEndpoints are asked in order. Public resolvers rather than the machine's:
+// a captive portal, a split-horizon corporate resolver, or a container that
+// lost its resolv.conf will happily report a perfectly good hostname as
+// nonexistent, and this check turns that answer into an event telling a caller
+// to discard its tunnel.
+//
+// Over HTTPS rather than port 53 because plenty of networks block or hijack
+// 53, which is the same failure the machine's resolver has.
+//
+// Two operators, so one having a bad day does not decide.
+var dohEndpoints = []dohEndpoint{
+	{"https://cloudflare-dns.com/dns-query", []string{"1.1.1.1", "1.0.0.1", "2606:4700:4700::1111"}},
+	{"https://dns.google/dns-query", []string{"8.8.8.8", "8.8.4.4", "2001:4860:4860::8888"}},
+}
+
+// dohTimeout bounds one endpoint. The whole check has to fit inside the
+// probe's budget alongside a handshake, and a resolver that has not answered
+// in two seconds is not the fast path this is meant to be.
+const dohTimeout = 2 * time.Second
+
+// goneResolvers builds the DoH resolvers once, dropping any that will not
+// construct. Lazily, so a process that never loses a connection never pays for
+// the TLS setup.
+var goneResolvers = sync.OnceValue(buildGoneResolvers)
+
+func buildGoneResolvers() []*net.Resolver {
+	// The trust set libtunnel ships, so a host with no CA bundle can still ask.
+	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: caCertPool()}}
+
+	resolvers := make([]*net.Resolver, 0, len(dohEndpoints))
+	for _, endpoint := range dohEndpoints {
+		resolver, err := dns.NewDoHResolver(endpoint.uri,
+			dns.DoHAddresses(endpoint.addresses...),
+			dns.DoHTransport(transport),
+		)
+		if err != nil {
+			continue
+		}
+		resolvers = append(resolvers, resolver)
+	}
+	return resolvers
+}
+
 // hostnameGone reports whether hostname has stopped existing, which is what a
 // provider leaves behind when it reaps a tunnel and deletes its record.
 //
-// Only NXDOMAIN counts. A SERVFAIL, a timeout or a refused query is this
-// machine's resolver having a bad day, and libtunnel stopped depending on that
-// resolver in #133/#134 for exactly that reason. A name it positively reports
-// as nonexistent is a different claim, and the only one acted on here.
+// Only NXDOMAIN counts. A SERVFAIL, a timeout, or every endpoint being
+// unreachable is a question that went unanswered, not an answer. A name
+// positively reported as nonexistent is a different claim, and the only one
+// acted on here.
 //
 // It is a supporting signal, not the arbiter: the registration probe below
-// answers the same question from the edge. This one just gets there without a
-// handshake when the record is already gone — and it catches the case the
-// handshake cannot, where the tunnel still exists but nothing can reach the
-// name in front of it.
+// asks the edge the same question. This one just gets there without a
+// handshake when the record is already gone — and it catches what the
+// handshake cannot, a tunnel that still exists behind a name nothing can
+// reach.
 func hostnameGone(ctx context.Context, hostname string) bool {
 	if hostname == "" {
 		return false
@@ -1089,9 +1142,25 @@ func hostnameGone(ctx context.Context, hostname string) bool {
 	if h, _, err := net.SplitHostPort(hostname); err == nil {
 		host = h
 	}
-	if _, err := net.DefaultResolver.LookupHost(ctx, host); err != nil {
+	for _, resolver := range goneResolvers() {
+		if ctx.Err() != nil {
+			return false
+		}
+		lookup, cancel := context.WithTimeout(ctx, dohTimeout)
+		_, err := resolver.LookupHost(lookup, host)
+		cancel()
+
+		// The first endpoint to answer at all decides. These are independent
+		// operators, so disagreement is not something to arbitrate, and a
+		// second opinion on a positive NXDOMAIN would only slow the common
+		// case where the name is simply still there.
 		var dnsErr *net.DNSError
-		return errors.As(err, &dnsErr) && dnsErr.IsNotFound
+		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			return true
+		}
+		if err == nil {
+			return false
+		}
 	}
 	return false
 }

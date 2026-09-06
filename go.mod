@@ -6,6 +6,7 @@ require (
 	github.com/breml/rootcerts v0.3.7
 	github.com/cloudflare/cloudflared v0.0.0-20260612062426-68620efbce4c
 	github.com/google/uuid v1.6.0
+	github.com/ncruces/go-dns v1.3.3
 	github.com/prometheus/client_golang v1.24.1
 	github.com/quic-go/quic-go v0.59.1
 	github.com/rs/zerolog v1.35.1
