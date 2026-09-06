@@ -226,13 +226,9 @@ type Backend struct {
 	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
 	// and listener is the loopback socket cloudflared dials to reach it. All nil
 	// until connect runs.
-	reconnected chan supervisor.ReconnectSignal
-	edge        *edgeWatcher
-	edgeReject  *edgeReject
-	// probeTimer is the settle clock between an edge event and the probe it
-	// arms. Nil when nothing is pending.
-	probeMu      sync.Mutex
-	probeTimer   *time.Timer
+	reconnected  chan supervisor.ReconnectSignal
+	edge         *edgeWatcher
+	edgeReject   *edgeReject
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
 	listener     net.Listener
@@ -848,15 +844,16 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 
 		originDialer := ingress.NewOriginDialer(ingress.OriginConfig{}, log)
 
+		// For the life of the tunnel rather than off an edge event: the reap
+		// worth catching leaves the connections looking fine, so there is no
+		// event to hang it on.
+		b.runProbe(ctx, func() { b.probeGone(ctx, t, spec, log) })
+
 		// The observer fans connection lifecycle events out to sinks; wire one
 		// that feeds edge, so the Reconnect lever can block until the edge is
 		// back up and the ErrEdgeUnreachable bound can report how many attempts
 		// it took.
 		observer := connection.NewObserver(log, log)
-		// Armed from both Connected and Reconnecting because neither alone
-		// covers a reap: a reaped tunnel never reports Connected again, and a
-		// healthy one never reports Reconnecting.
-		armGone := func() { b.armProbe(func() { b.probeGone(ctx, t, spec, log) }) }
 		observer.RegisterSink(connection.EventSinkFunc(func(e connection.Event) {
 			// Every event, not only the two acted on: this is the only
 			// structured view of what the edge is doing, and cloudflared's own
@@ -881,11 +878,9 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 				if b.edge.up(e.Index) {
 					kind = v1.EventConnected
 				}
-				armGone()
 				t.Emit(v1.Event{Kind: kind})
 			case connection.Reconnecting:
 				b.edge.attempt()
-				armGone()
 			case connection.Disconnected:
 				b.edge.disconnect()
 				t.Emit(v1.Event{Kind: v1.EventDisconnected})
@@ -1011,16 +1006,15 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	return nil
 }
 
-// probeSettle is how long the edge must hold steady before the probe runs.
-// Asking costs a registration, so the delay is what stops an edge still
-// settling its connections from spending one per event.
+// probeInterval is how often the probe asks whether the tunnel still exists.
+// Asking costs a registration, so this is the standing price of knowing.
 //
 // #182 measured a client noticing a deleted tunnel at 12s over QUIC and 188s
 // over http2, which brackets the useful range: shorter than either, and the
 // probe is what finds out rather than a straggling log line.
 // A var, not a const, so a test can shorten it rather than sleep through it —
 // the same seam shape the retry budgets use.
-var probeSettle = 10 * time.Second
+var probeInterval = 10 * time.Second
 
 // goneProbeTimeout bounds one probe end to end — discovery, dial, handshake,
 // RPC. Past it nothing is claimed.
@@ -1045,25 +1039,30 @@ const edgeSRVService = "v2-origintunneld"
 // emitter is the half of the tunnel the probe needs: somewhere to report.
 type emitter interface{ Emit(v1.Event) }
 
-// armProbe starts the settle clock, unless it is already running. Both
-// triggers repeat — one Connected per connection index, one Reconnecting per
-// retry — and restarting on each would push the probe past every outage short
-// of a very long one.
+// runProbe calls probe every probeInterval until ctx ends.
+//
+// On a ticker rather than off edge events, because the reap worth catching is
+// the one the edge says nothing about: a tunnel deleted while its connections
+// still look fine produces no event to hang a probe on.
 //
 // Nothing here remembers having answered. A tunnel that goes away twice is
 // reported twice, and what to do about it is the caller's to decide.
-func (b *Backend) armProbe(probe func()) {
-	b.probeMu.Lock()
-	defer b.probeMu.Unlock()
-	if b.probeTimer != nil {
-		return
-	}
-	b.probeTimer = time.AfterFunc(probeSettle, func() {
-		b.probeMu.Lock()
-		b.probeTimer = nil
-		b.probeMu.Unlock()
-		probe()
-	})
+//
+// A slow probe delays the next tick rather than stacking on top of it: the
+// call is synchronous and a ticker holds at most one pending tick.
+func (b *Backend) runProbe(ctx context.Context, probe func()) {
+	go func() {
+		ticker := time.NewTicker(probeInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				probe()
+			}
+		}
+	}()
 }
 
 // dohEndpoint is one DNS-over-HTTPS resolver the gone check can ask.
