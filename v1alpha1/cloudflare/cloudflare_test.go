@@ -1768,22 +1768,39 @@ func TestEdgeEventLogOmitsUnsetFields(t *testing.T) {
 	}
 }
 
-// TestGoneWatchProbesOncePerOutage pins the trigger: the supervisor emits a
-// Disconnected per serve attempt, so a flapping edge would otherwise spend a
-// credentialed registration on each one.
-func TestGoneWatchProbesOncePerOutage(t *testing.T) {
-	var g goneWatch
+// TestProbeIndexIsClearOfTheSupervisor pins that the probe cannot collide with
+// a real connection, which would answer EDUPCONN instead of the question.
+func TestProbeIndexIsClearOfTheSupervisor(t *testing.T) {
+	if probeConnIndex < haConnections {
+		t.Errorf("probe index %d is inside the supervisor's range 0..%d", probeConnIndex, haConnections-1)
+	}
+}
+
+// shortGoneSettle shrinks the settle clock so a test exercises the trigger
+// rather than the wait.
+func shortGoneSettle(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := goneSettle
+	goneSettle = d
+	t.Cleanup(func() { goneSettle = prev })
+}
+
+// TestGoneProbeArmsOncePerOutage pins the trigger. The supervisor emits a
+// Disconnected per serve attempt, and cloudflared's early retries are seconds
+// apart — restarting the clock on each would push the probe past every outage
+// short of a very long one, so arming is idempotent while one is pending.
+func TestGoneProbeArmsOncePerOutage(t *testing.T) {
+	shortGoneSettle(t, 100*time.Millisecond)
+	b := New()
 	var probes atomic.Int32
-	probe := func() { probes.Add(1) }
 
 	for range 5 {
-		g.down(probe)
+		b.armGoneProbe(func() { probes.Add(1) })
 	}
 	if got := probes.Load(); got != 0 {
 		t.Fatalf("probed %d times before the settle expired, want 0", got)
 	}
 
-	// The timer is the real one, so wait it out rather than reaching inside.
 	deadline := time.Now().Add(goneSettle + 5*time.Second)
 	for probes.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
@@ -1791,25 +1808,41 @@ func TestGoneWatchProbesOncePerOutage(t *testing.T) {
 	if got := probes.Load(); got != 1 {
 		t.Fatalf("probed %d times for one outage, want 1", got)
 	}
+}
 
-	// Further disconnects after the answer must not re-probe.
-	for range 3 {
-		g.down(probe)
+// TestGoneProbeRearmsAfterAnswering pins that nothing remembers having
+// answered: a tunnel that goes away twice is reported twice, and deciding what
+// that means is the caller's job.
+func TestGoneProbeRearmsAfterAnswering(t *testing.T) {
+	shortGoneSettle(t, 100*time.Millisecond)
+	b := New()
+	var probes atomic.Int32
+	fire := func() { b.armGoneProbe(func() { probes.Add(1) }) }
+
+	fire()
+	deadline := time.Now().Add(goneSettle + 5*time.Second)
+	for probes.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
 	}
-	time.Sleep(200 * time.Millisecond)
-	if got := probes.Load(); got != 1 {
-		t.Errorf("probed %d times, want the answer to stand", got)
+
+	fire()
+	deadline = time.Now().Add(goneSettle + 5*time.Second)
+	for probes.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Errorf("probed %d times across two outages, want 2", got)
 	}
 }
 
-// TestGoneWatchCancelsWhenTheEdgeReturns pins the common case: a reconnect
-// inside the settle window means there was nothing to ask about.
-func TestGoneWatchCancelsWhenTheEdgeReturns(t *testing.T) {
-	var g goneWatch
+// TestGoneProbeCancelledByAReconnect pins the common case: a connection back
+// inside the settle window means there was never anything to ask.
+func TestGoneProbeCancelledByAReconnect(t *testing.T) {
+	b := New()
 	var probes atomic.Int32
 
-	g.down(func() { probes.Add(1) })
-	g.up()
+	b.armGoneProbe(func() { probes.Add(1) })
+	b.cancelGoneProbe()
 
 	time.Sleep(200 * time.Millisecond)
 	if got := probes.Load(); got != 0 {
@@ -1817,30 +1850,38 @@ func TestGoneWatchCancelsWhenTheEdgeReturns(t *testing.T) {
 	}
 }
 
-// TestRegistrationRefused pins what counts as the edge disowning a tunnel, and
-// what does not. The strings come from the #182 captures.
-func TestRegistrationRefused(t *testing.T) {
-	for _, tc := range []struct {
-		err  string
-		want bool
-	}{
-		{"Unauthorized: Tunnel not found", true},
-		{"Tunnel not found", true},
-		{"Application error 0x0 (remote)", false},
-		{"control stream encountered a failure while serving", false},
-		{"failed to dial to edge with quic: sendmsg: network is unreachable", false},
-		{"EDUPCONN", false},
-	} {
-		if got := registrationRefused(errors.New(tc.err)); got != tc.want {
-			t.Errorf("registrationRefused(%q) = %t, want %t", tc.err, got, tc.want)
-		}
+// TestHostnameGoneOnlyAcceptsNXDOMAIN pins the narrow reading. A provider that
+// reaps a tunnel deletes its record, so a name that positively does not exist
+// answers the question — but a resolver that is merely unhappy does not, and
+// treating the two alike would report a healthy tunnel gone every time the
+// machine's DNS wobbled.
+func TestHostnameGoneOnlyAcceptsNXDOMAIN(t *testing.T) {
+	ctx := context.Background()
+
+	// RFC 2606 reserves .invalid, so no resolver will ever answer for it.
+	if !hostnameGone(ctx, "libtunnel-reaped.invalid") {
+		t.Skip("resolver does not return NXDOMAIN here (captive portal or wildcard DNS)")
+	}
+	// A name that resolves is not gone.
+	if hostnameGone(ctx, "one.one.one.one") {
+		t.Error("a resolving hostname reported gone")
+	}
+	// Nothing to ask about.
+	if hostnameGone(ctx, "") {
+		t.Error("an empty hostname reported gone")
+	}
+	// A cancelled lookup is the resolver being unavailable, not an answer.
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	if hostnameGone(dead, "libtunnel-reaped.invalid") {
+		t.Error("a cancelled lookup reported gone; only NXDOMAIN is an answer")
 	}
 }
 
-// TestProbeIndexIsClearOfTheSupervisor pins that the probe cannot collide with
-// a real connection, which would answer EDUPCONN instead of the question.
-func TestProbeIndexIsClearOfTheSupervisor(t *testing.T) {
-	if probeConnIndex < haConnections {
-		t.Errorf("probe index %d is inside the supervisor's range 0..%d", probeConnIndex, haConnections-1)
+// TestHostnameGoneStripsAPort pins that a spec hostname carrying :port still
+// resolves — GetHostname may include one and the resolver will not take it.
+func TestHostnameGoneStripsAPort(t *testing.T) {
+	if hostnameGone(context.Background(), "one.one.one.one:443") {
+		t.Error("a resolving host:port reported gone; the port was not stripped")
 	}
 }

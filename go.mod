@@ -6,7 +6,9 @@ require (
 	github.com/breml/rootcerts v0.3.7
 	github.com/cloudflare/cloudflared v0.0.0-20260612062426-68620efbce4c
 	github.com/google/uuid v1.6.0
+	github.com/ncruces/go-dns v1.3.3
 	github.com/prometheus/client_golang v1.24.1
+	github.com/quic-go/quic-go v0.59.1
 	github.com/rs/zerolog v1.35.1
 	golang.org/x/net v0.58.0
 )
@@ -49,7 +51,6 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
-	github.com/quic-go/quic-go v0.59.1 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.3 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
