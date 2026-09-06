@@ -1068,6 +1068,34 @@ func (b *Backend) cancelGoneProbe() {
 	}
 }
 
+// hostnameGone reports whether hostname has stopped existing, which is what a
+// provider leaves behind when it reaps a tunnel and deletes its record.
+//
+// Only NXDOMAIN counts. A SERVFAIL, a timeout or a refused query is this
+// machine's resolver having a bad day, and libtunnel stopped depending on that
+// resolver in #133/#134 for exactly that reason. A name it positively reports
+// as nonexistent is a different claim, and the only one acted on here.
+//
+// It is a supporting signal, not the arbiter: the registration probe below
+// answers the same question from the edge. This one just gets there without a
+// handshake when the record is already gone — and it catches the case the
+// handshake cannot, where the tunnel still exists but nothing can reach the
+// name in front of it.
+func hostnameGone(ctx context.Context, hostname string) bool {
+	if hostname == "" {
+		return false
+	}
+	host := hostname
+	if h, _, err := net.SplitHostPort(hostname); err == nil {
+		host = h
+	}
+	if _, err := net.DefaultResolver.LookupHost(ctx, host); err != nil {
+		var dnsErr *net.DNSError
+		return errors.As(err, &dnsErr) && dnsErr.IsNotFound
+	}
+	return false
+}
+
 // anEdgeConn dials the edge and returns the first address that answers, along
 // with the address it used — RegisterConnection wants to be told which edge it
 // is talking to.
@@ -1138,6 +1166,15 @@ func (b *Backend) probeGone(ctx context.Context, t emitter, spec *Spec, log *zer
 	tunnelID, err := uuid.Parse(spec.ID)
 	if err != nil {
 		log.Debug().Err(err).Msg("gone probe: invalid tunnel id in spec")
+		return
+	}
+
+	// The cheap answer first. A provider that reaps a tunnel deletes the DNS
+	// record with it, so a hostname that has stopped existing settles the
+	// question without dialing anything.
+	if host := spec.GetHostname(); hostnameGone(ctx, host) {
+		log.Info().Str("hostname", host).Msg("gone probe: hostname no longer resolves, tunnel is gone")
+		t.Emit(v1.Event{Kind: v1.EventGone})
 		return
 	}
 

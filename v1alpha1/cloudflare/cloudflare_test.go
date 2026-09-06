@@ -1849,3 +1849,39 @@ func TestGoneProbeCancelledByAReconnect(t *testing.T) {
 		t.Errorf("probed %d times after the edge came back, want 0", got)
 	}
 }
+
+// TestHostnameGoneOnlyAcceptsNXDOMAIN pins the narrow reading. A provider that
+// reaps a tunnel deletes its record, so a name that positively does not exist
+// answers the question — but a resolver that is merely unhappy does not, and
+// treating the two alike would report a healthy tunnel gone every time the
+// machine's DNS wobbled.
+func TestHostnameGoneOnlyAcceptsNXDOMAIN(t *testing.T) {
+	ctx := context.Background()
+
+	// RFC 2606 reserves .invalid, so no resolver will ever answer for it.
+	if !hostnameGone(ctx, "libtunnel-reaped.invalid") {
+		t.Skip("resolver does not return NXDOMAIN here (captive portal or wildcard DNS)")
+	}
+	// A name that resolves is not gone.
+	if hostnameGone(ctx, "one.one.one.one") {
+		t.Error("a resolving hostname reported gone")
+	}
+	// Nothing to ask about.
+	if hostnameGone(ctx, "") {
+		t.Error("an empty hostname reported gone")
+	}
+	// A cancelled lookup is the resolver being unavailable, not an answer.
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	if hostnameGone(dead, "libtunnel-reaped.invalid") {
+		t.Error("a cancelled lookup reported gone; only NXDOMAIN is an answer")
+	}
+}
+
+// TestHostnameGoneStripsAPort pins that a spec hostname carrying :port still
+// resolves — GetHostname may include one and the resolver will not take it.
+func TestHostnameGoneStripsAPort(t *testing.T) {
+	if hostnameGone(context.Background(), "one.one.one.one:443") {
+		t.Error("a resolving host:port reported gone; the port was not stripped")
+	}
+}
