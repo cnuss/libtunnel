@@ -1007,14 +1007,16 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 }
 
 // probeInterval is how often the probe asks whether the tunnel still exists.
-// Asking costs a registration, so this is the standing price of knowing.
+// Every tick on a healthy tunnel spends a registration, so this is a standing
+// cost for the life of the tunnel rather than a timeout to tune down.
 //
 // #182 measured a client noticing a deleted tunnel at 12s over QUIC and 188s
-// over http2, which brackets the useful range: shorter than either, and the
-// probe is what finds out rather than a straggling log line.
+// over http2. This sits between them: behind what QUIC notices on its own, well
+// ahead of http2, and cheap enough to leave running.
+//
 // A var, not a const, so a test can shorten it rather than sleep through it —
 // the same seam shape the retry budgets use.
-var probeInterval = 10 * time.Second
+var probeInterval = 30 * time.Second
 
 // goneProbeTimeout bounds one probe end to end — discovery, dial, handshake,
 // RPC. Past it nothing is claimed.
