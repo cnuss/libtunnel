@@ -1,6 +1,6 @@
 module github.com/cnuss/libtunnel
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/breml/rootcerts v0.3.7
@@ -8,7 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/ncruces/go-dns v1.3.3
 	github.com/prometheus/client_golang v1.24.1
-	github.com/quic-go/quic-go v0.59.1
+	github.com/quic-go/quic-go v0.62.0
 	github.com/rs/zerolog v1.35.1
 	golang.org/x/net v0.58.0
 )
