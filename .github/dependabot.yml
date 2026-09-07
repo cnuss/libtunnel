@@ -34,6 +34,14 @@ updates:
       - dependency-type: direct
     patterns: ["*"]
     multi-ecosystem-group: deps
+    # Patch bumps are not worth a PR: the floor a library declares is its
+    # compatibility promise, and a patch moves it for nothing a consumer can
+    # see. `update-types` under `ignore` gates version updates only —
+    # security updates still fire for any version, so a patched CVE is not
+    # silenced by this.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]
     # Batch security updates (which run outside the version-update stream and
     # ignore `allow`) into one PR per ecosystem — cross-ecosystem security
     # grouping isn't supported.
@@ -46,6 +54,11 @@ updates:
     directory: "/"
     patterns: ["*"]
     multi-ecosystem-group: deps
+    # Same as gomod: a pinned action's patch bump is a SHA churn for no
+    # behavior change. Security updates are unaffected.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]
     groups:
       security:
         applies-to: security-updates
