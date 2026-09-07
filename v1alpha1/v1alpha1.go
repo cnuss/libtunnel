@@ -72,6 +72,7 @@ func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	t := &TunnelImpl[T]{
 		ctx:            ctx,
 		cancel:         cancel,
+		userCtx:        context.Background(),
 		backend:        backend,
 		originProvided: make(chan struct{}),
 		tunnelReady:    make(chan struct{}),
@@ -159,9 +160,12 @@ type TunnelImpl[T v1.Spec] struct {
 	// beside localURLs, so originProvided is its happens-before edge too.
 	wsOrigin int
 
-	// userCtxOnce fixes userCtx: the first WithContext wins; a URL read
-	// before any WithContext fixes it to nil (unset). Nil means URL waits on
-	// DNS alone; set, URL waits for full readiness.
+	// userCtx is the caller's context, Background until WithContext replaces
+	// it — so URL always has one to wait on, and Background's nil Done never
+	// fires. userCtxOnce fixes it: the first WithContext wins, and a URL read
+	// before any WithContext fixes the default. Cancellation is chained into
+	// ctx by WithContext's watcher, since ctx exists before the caller's does
+	// and cannot be re-parented under it.
 	userCtxOnce sync.Once
 	userCtx     context.Context
 

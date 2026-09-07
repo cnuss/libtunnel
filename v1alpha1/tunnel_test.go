@@ -771,30 +771,44 @@ func TestHostnameReadyAtRegistration(t *testing.T) {
 	}
 }
 
-// TestWithContextURLWaitsForTunnelReady pins WithContext's upgrade: with a
-// caller context set, URL blocks until TunnelReady (not DNS alone) and then
-// returns the public URL.
-func TestWithContextURLWaitsForTunnelReady(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})).
-		WithContext(context.Background())
-	conn := tun.WithListener(listen(t))
+// TestURLWaitsForTunnelReady pins that URL blocks until the tunnel is
+// reachable end to end, with or without a caller context. WithContext adds a
+// cancellation source; it does not change what URL waits for.
+func TestURLWaitsForTunnelReady(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		with func(v1.Tunnel) v1.Tunnel
+	}{
+		{"without WithContext", func(tun v1.Tunnel) v1.Tunnel { return tun }},
+		{"with WithContext", func(tun v1.Tunnel) v1.Tunnel { return tun.WithContext(context.Background()) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tun := tc.with(v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})))
+			conn := tun.WithListener(listen(t))
 
-	got := make(chan string, 1)
-	go func() {
-		if u := conn.URL(); u != nil {
-			got <- u.String()
-		} else {
-			got <- ""
-		}
-	}()
+			got := make(chan string, 1)
+			go func() {
+				if u := conn.URL(); u != nil {
+					got <- u.String()
+				} else {
+					got <- ""
+				}
+			}()
 
-	select {
-	case u := <-got:
-		if u != "https://www.cloudflare.com/" {
-			t.Errorf("URL() = %q, want https://www.cloudflare.com/", u)
-		}
-	case <-time.After(15 * time.Second):
-		t.Fatal("URL never returned after the engine connected")
+			select {
+			case u := <-got:
+				if u != "https://www.cloudflare.com/" {
+					t.Errorf("URL() = %q, want https://www.cloudflare.com/", u)
+				}
+				select {
+				case <-conn.TunnelReady():
+				default:
+					t.Error("URL returned before TunnelReady closed")
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatal("URL never returned after the engine connected")
+			}
+		})
 	}
 }
 

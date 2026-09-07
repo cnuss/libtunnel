@@ -53,7 +53,7 @@ func main() {
 		fmt.Fprint(w, "hello from libtunnel")
 	}))
 
-	url := conn.URL() // blocks until reachable end to end (see WithContext)
+	url := conn.URL() // blocks until reachable end to end
 	if url == nil {
 		log.Fatal(conn.Err())
 	}
@@ -108,7 +108,7 @@ type Tunnel interface {
     CACerts() []*x509.Certificate
 
     Listener() net.Listener // start trigger: mints a loopback listener if none provided
-    URL() *url.URL // blocks until the hostname resolves (end-to-end w/ WithContext);
+    URL() *url.URL // blocks until reachable end to end; nil if canceled first;
                    // start trigger, like Listener
 
     // Lifecycle[Tunnel] — embedded; the three verbs a supervisor needs.
