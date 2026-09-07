@@ -18,6 +18,7 @@ Deep-link by filename; line numbers will drift.
 | Generic providers (`Static`, `Env`) + handoff helpers | [`v1alpha1/provider.go`](./v1alpha1/provider.go)          |
 | Cloudflare engine (cloudflared supervisor wiring) | [`v1alpha1/cloudflare/cloudflare.go`](./v1alpha1/cloudflare/cloudflare.go) |
 | Quick-tunnel provider (tunnel.pizza)  | [`v1alpha1/cloudflare/quicktunnel.go`](./v1alpha1/cloudflare/quicktunnel.go) |
+| Network error reporting (NEL + Report-To client) | [`v1alpha1/nel/nel.go`](./v1alpha1/nel/nel.go) |
 | Unit tests + fuzz target                       | [`v1alpha1/tunnel_test.go`](./v1alpha1/tunnel_test.go)           |
 | Live e2e scenarios + helpers                   | [`e2e/live_test.go`](./e2e/live_test.go), [`e2e/util_test.go`](./e2e/util_test.go) |
 | Subprocess handoff unit tests                  | [`lib_test.go`](./lib_test.go)                                   |
@@ -47,6 +48,9 @@ github.com/cnuss/libtunnel/v1alpha1             — lazy tunnel core + generic
                                                   alpha revisions.
 github.com/cnuss/libtunnel/v1alpha1/cloudflare  — the cloudflared quick-tunnel
                                                   engine + its Spec type.
+github.com/cnuss/libtunnel/v1alpha1/nel         — a NEL client: reports the
+                                                  mint path's network errors
+                                                  the way a browser does.
 github.com/cnuss/libtunnel/cmd/libtunnel        — env-only launcher binary
                                                   (main package, not imported).
 ```

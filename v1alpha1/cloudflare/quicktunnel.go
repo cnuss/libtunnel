@@ -16,6 +16,7 @@ import (
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/nel"
 )
 
 // quickTunnelURL is the public endpoint that mints anonymous quick tunnels.
@@ -136,7 +137,12 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	}
 
 	client := http.Client{
-		Transport: &http.Transport{
+		// Reported to the provider the way a browser would: a 429, a
+		// timeout, a name that did not resolve, a certificate it would not
+		// trust — each posted to whatever collector the provider's NEL and
+		// Report-To headers name, so the operator sees client-side failures
+		// without anyone filing them.
+		Transport: nel.Transport(&http.Transport{
 			// The trust set libtunnel ships, not the host's alone: an image
 			// with no ca-certificates package still verifies the mint
 			// endpoint. Without this the edge connection would have verified
@@ -153,7 +159,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			// real per-attempt bound.
 			TLSHandshakeTimeout:   5 * time.Second,
 			ResponseHeaderTimeout: 15 * time.Second,
-		},
+		}, userAgent, log),
 		Timeout: 15 * time.Second,
 	}
 
