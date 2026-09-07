@@ -570,6 +570,78 @@ func TestMultiOriginRedirect(t *testing.T) {
 	}
 }
 
+// TestNoRefererCookieRoutingIsLogged pins the visibility #211 asked for: a
+// subresource that arrives without a Referer and routes by the sticky cookie
+// says so at debug — and only that case does. A Referer-routed request, a
+// parameter-routed one, and a request with neither signal are silent.
+func TestNoRefererCookieRoutingIsLogged(t *testing.T) {
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer a.Close()
+	defer b.Close()
+	var origins []*url.URL
+	for _, srv := range []*httptest.Server{a, b} {
+		u, _ := url.Parse(srv.URL)
+		origins = append(origins, u)
+	}
+
+	var buf strings.Builder
+	var mu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(&lockedWriter{w: &buf, mu: &mu}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	proxy := httptest.NewServer(newOriginProxy(origins, -1, logger, originTransport(origins)))
+	defer proxy.Close()
+
+	get := func(path string, headers map[string]string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, proxy.URL+path, nil)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	logged := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		got := strings.Contains(buf.String(), "no Referer; routing by cookie")
+		buf.Reset()
+		return got
+	}
+
+	get("/js/Client.js", map[string]string{"Cookie": originCookie + "=1"})
+	if !logged() {
+		t.Error("no Referer + cookie: the fallback was not logged")
+	}
+	get("/js/Client.js", map[string]string{"Cookie": originCookie + "=1", "Referer": proxy.URL + "/?0"})
+	if logged() {
+		t.Error("Referer present: logged as a cookie fallback")
+	}
+	get("/js/Client.js?1", map[string]string{"Cookie": originCookie + "=0"})
+	if logged() {
+		t.Error("explicit parameter: logged as a cookie fallback")
+	}
+	get("/js/Client.js", nil)
+	if logged() {
+		t.Error("no cookie either: logged as a cookie fallback when no cookie decided")
+	}
+}
+
+// lockedWriter serializes a strings.Builder for a logger shared across the
+// proxy's goroutines.
+type lockedWriter struct {
+	w  io.Writer
+	mu *sync.Mutex
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
 // TestSingleOriginIgnoresRoutingParams pins the single-URL fast path: no
 // query inspection, no cookie — a bare numeric param is application data and
 // forwards verbatim, exactly the pre-multi-URL behavior.

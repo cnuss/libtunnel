@@ -1666,7 +1666,11 @@ const edgeBlockedHint = "your machine/network is getting its egress to the tunne
 // own WebSockets (wsOrigin, the +ws scheme marker, -1 for none), else a
 // same-host Referer carrying one (an iframe's or page's subresources follow
 // their document URL — per-tab, no shared state), else the sticky
-// originCookie, else originURLs[0]. The declaration sits above the cookie
+// originCookie, else originURLs[0]. An origin can remove the Referer rung
+// itself, with Referrer-Policy: no-referrer or its meta-tag and attribute
+// forms; its subresources then route by the cookie, which is wrong whenever
+// another origin was picked more recently, and the proxy says so at debug
+// rather than second-guessing a security header. The declaration sits above the cookie
 // deliberately: the cookie is a per-browser guess, the declaration an
 // operator-stated fact, and a fact beats a guess. It sits below an explicit
 // parameter so a page carrying its own index — and every tile of a multiview
@@ -1713,6 +1717,19 @@ func newOriginProxy(originURLs []*url.URL, wsOrigin int, log *slog.Logger, trans
 						if err == nil {
 							if n, err := strconv.Atoi(cookie.Value); err == nil {
 								ix = n
+							}
+							// The cookie is a per-browser guess — the last
+							// origin picked in any tab — and a subresource
+							// arriving without a Referer is exactly the case
+							// it guesses wrong: an origin sending
+							// Referrer-Policy: no-referrer (or a meta tag, or
+							// a referrerpolicy attribute) strips the signal
+							// that would have routed it. The 404 that comes
+							// back is honest, from an origin that does not
+							// have the file, and nothing else records that a
+							// decision was made on missing information (#211).
+							if !upgrade && r.In.Header.Get("Referer") == "" {
+								log.Debug("no Referer; routing by cookie", "path", r.In.URL.Path, "index", ix)
 							}
 						}
 						if upgrade && err != nil {
