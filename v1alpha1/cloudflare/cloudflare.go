@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/breml/rootcerts/embedded"
@@ -147,11 +148,12 @@ func (e *edgeWatcher) generation() (uint64, <-chan struct{}) {
 	return e.gen, e.ch
 }
 
-// up records a Connected for index. full reports that this registration
-// brought every HA connection up — the transition, not the state, so a
-// listener hears it once per time the set fills rather than once per
-// registration.
-func (e *edgeWatcher) up(index uint8) (full bool) {
+// up records a Connected for index. Both results are transitions, not
+// states: alive reports that this registration is the first live connection
+// — at startup, or after every connection had dropped — and full that it
+// brought every HA connection up. A listener hears each once per time it
+// happens rather than once per registration.
+func (e *edgeWatcher) up(index uint8) (alive, full bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.gen++
@@ -160,9 +162,10 @@ func (e *edgeWatcher) up(index uint8) (full bool) {
 	if e.live == nil {
 		e.live = map[uint8]bool{}
 	}
+	wasEmpty := len(e.live) == 0
 	wasFull := len(e.live) >= haConnections
 	e.live[index] = true
-	return !wasFull && len(e.live) >= haConnections
+	return wasEmpty, !wasFull && len(e.live) >= haConnections
 }
 
 func (e *edgeWatcher) attempt(index uint8) {
@@ -299,6 +302,10 @@ type Backend struct {
 	// the same reason as probeInterval.
 	establishInterval time.Duration
 	establishBudget   time.Duration
+	// establishing is set while a loop-through is in flight, so a second
+	// trigger while one runs does not double it — the one running will
+	// succeed on the new connection anyway.
+	establishing atomic.Bool
 }
 
 // Proxy returns the origin reverse proxy (nil before connect). Implements the
@@ -961,10 +968,20 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			t.Logger().Debug("edge event", attrs...)
 			switch e.EventType {
 			case connection.Connected:
-				// Every connection up is the tunnel's news; one of several
-				// registering is not — TunnelReady already said the edge
-				// answered.
-				if b.edge.up(e.Index) {
+				// The first live connection — at startup, or after every
+				// one had dropped — is when routing has to be verified
+				// again: the edge may be fanning a new location out. Every
+				// connection up is the tunnel's news; one of several
+				// registering is neither — TunnelReady already said the
+				// edge answered.
+				alive, full := b.edge.up(e.Index)
+				if alive && b.establishing.CompareAndSwap(false, true) {
+					go func() {
+						defer b.establishing.Store(false)
+						b.establish(ctx, t, loopThroughClient(), "https://"+spec.GetHostname()+"/", loop, t.Logger())
+					}()
+				}
+				if full {
 					t.Emit(v1.Event{Kind: v1.EventConnected})
 				}
 			case connection.Reconnecting:
@@ -1096,10 +1113,6 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		return fmt.Errorf("%w: no connection after %d attempts (%d ended) in %s: %s",
 			v1.ErrEdgeUnreachable, b.edge.attemptCount(), b.edge.disconnectCount(), edgeBudget, edgeBlockedHint)
 	}
-
-	// Only now: nothing sent before the edge has a connection could come
-	// back, and the wait it measures starts here.
-	go b.establish(ctx, t, loopThroughClient(), "https://"+spec.GetHostname()+"/", loop, t.Logger())
 	return nil
 }
 
