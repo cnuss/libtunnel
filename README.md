@@ -220,6 +220,14 @@ the sticky `libtunnel-origin` cookie set by an explicit top-level pick, then
 `u[0]`. A document navigation resolved via `Referer` is redirected to carry the
 parameter, so routing survives link clicks.
 
+An origin can remove the `Referer` rung itself: `Referrer-Policy: no-referrer`
+(or `origin`, a `<meta name="referrer">`, a `referrerpolicy` attribute) strips
+it from that page's subresources, which then route by the cookie — wrong
+whenever another origin was picked more recently, and the 404 comes honestly
+from an origin that does not have the file. libtunnel does not override the
+header; it logs `no Referer; routing by cookie` at debug so the cause is a
+glance rather than a devtools session.
+
 **WebSockets are the exception.** A handshake carries no `Referer` — it is not
 in the handshake header set — so a socket opened without the parameter falls
 through to the cookie, which is per-browser, not per-tab or per-iframe. A page
