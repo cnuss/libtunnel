@@ -78,7 +78,7 @@ func TestBudgets(t *testing.T) {
 		{v1.ErrCredentialRejected, 0},
 		{v1.ErrProviderUnreachable, 45 * time.Second},
 		{v1.ErrEdgeUnreachable, 30 * time.Second},
-		{v1.ErrRateLimited, 45 * time.Second},
+		{v1.ErrRateLimited, 90 * time.Second},
 		{v1.ErrClosed, 0},
 		{errors.New("not a class"), 0},
 		{nil, 0},
@@ -95,7 +95,7 @@ func TestBudgets(t *testing.T) {
 func TestBudgetThroughWrapping(t *testing.T) {
 	err := fmt.Errorf("unable to fetch tunnel spec: %w",
 		fmt.Errorf("%w: resets in 12s", v1.ErrRateLimited))
-	if got, want := v1.Budget(err), 45*time.Second; got != want {
+	if got, want := v1.Budget(err), v1.Budget(v1.ErrRateLimited); got != want {
 		t.Errorf("Budget(wrapped) = %s, want %s", got, want)
 	}
 }

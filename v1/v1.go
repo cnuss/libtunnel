@@ -157,10 +157,12 @@ var (
 	// than the budget — which is reported immediately rather than waited out,
 	// so a caller can act on "resets in 5m" instead of blocking on it.
 	//
-	// The budget matches ErrProviderUnreachable for want of better evidence:
-	// it only governs a 429 that carries no reset at all, since one that names
-	// its reset is decided by that number instead.
-	ErrRateLimited error = &class{ErrFailed, "rate limited", 45 * time.Second}
+	// The budget has to clear the provider's own Retry-After, or no throttle
+	// is ever honored: tunnel.pizza answers every 429 with 60s, whether its
+	// edge refused the request or its zone needs an eviction cycle to free a
+	// record. 90s waits out one such cycle with margin and still reports a
+	// reset measured in minutes rather than sleeping on it.
+	ErrRateLimited error = &class{ErrFailed, "rate limited", 90 * time.Second}
 
 	// ErrClosed is the Err result of a tunnel shut down deliberately — by
 	// closing the listener returned from Tunnel.Listener. It is terminal but
