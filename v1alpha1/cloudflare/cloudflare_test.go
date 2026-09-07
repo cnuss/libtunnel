@@ -1832,25 +1832,36 @@ func TestEstablishGivesUpAtTheBudget(t *testing.T) {
 	}
 }
 
-// TestEdgeWatcherTransitions pins what Connected and Disconnected mean: the
-// set of live connections filling and emptying. Each is reported on the
-// registration or drop that makes the transition, and on nothing else — not a
-// registration short of full, not a drop that leaves others up, not a serve
-// attempt ending that never registered.
+// TestEdgeWatcherTransitions pins what the events mean: the set of live
+// connections going from none to some (alive — verify routing again), to
+// all (full — Connected), and back to none (empty — Disconnected). Each is
+// reported on the registration or drop that makes the transition and on
+// nothing else: not a registration short of full, not a drop that leaves
+// others up, not a serve attempt ending that never registered.
 func TestEdgeWatcherTransitions(t *testing.T) {
 	w := newEdgeWatcher()
 
-	if w.up(0) {
-		t.Fatalf("up(0) reported full with one of %d", haConnections)
+	alive, full := w.up(0)
+	if !alive || full {
+		t.Fatalf("up(0) = alive %v full %v, want the first live connection and not full", alive, full)
 	}
-	if !w.up(1) {
-		t.Fatal("up(1) did not report full: the set is complete")
+	alive, full = w.up(1)
+	if alive || !full {
+		t.Fatalf("up(1) = alive %v full %v, want full and not alive again", alive, full)
 	}
 	if got := w.liveCount(); got != haConnections {
 		t.Errorf("liveCount = %d, want %d", got, haConnections)
 	}
-	if w.up(1) {
-		t.Error("up(1) on a full set reported full again")
+	if alive, full = w.up(1); alive || full {
+		t.Error("up(1) on a full set reported a transition")
+	}
+
+	if w.disconnect(0) {
+		t.Error("disconnect(0) with 1 still up reported empty")
+	}
+	// One back while the other held: routing never lapsed, nothing to verify.
+	if alive, full = w.up(0); alive || !full {
+		t.Errorf("up(0) refilling the set = alive %v full %v, want full only", alive, full)
 	}
 
 	if w.disconnect(0) {
@@ -1866,10 +1877,13 @@ func TestEdgeWatcherTransitions(t *testing.T) {
 		t.Error("disconnect of an index that never registered reported empty")
 	}
 
-	// The set refilling after an outage is Connected again.
-	w.up(0)
-	if !w.up(1) {
-		t.Error("the set refilling after an outage did not report full")
+	// After a full outage the first one back is alive again — routing has
+	// to be verified over — and the set refilling is Connected again.
+	if alive, full = w.up(0); !alive || full {
+		t.Errorf("up(0) after an outage = alive %v full %v, want alive only", alive, full)
+	}
+	if alive, full = w.up(1); alive || !full {
+		t.Errorf("up(1) after an outage = alive %v full %v, want full only", alive, full)
 	}
 }
 

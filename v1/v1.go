@@ -56,7 +56,9 @@ const (
 	// nothing. It is the moment a visitor would get through, which
 	// EventConnected is not: after every edge connection registers,
 	// Cloudflare still has to tell its other colos where the tunnel lives,
-	// and until it has a visitor gets the edge's 530. Once per tunnel.
+	// and until it has a visitor gets the edge's 530. Fires again after a
+	// full outage heals: new connections may be at new colos, and the
+	// fan-out happens over.
 	EventEstablished EventKind = "established"
 	// EventGone fires when the edge says the tunnel no longer exists.
 	// Reconnecting will not bring it back: the spec that names it is dead and
