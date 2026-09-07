@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1728,6 +1729,72 @@ func TestEdgeWatcherCountsDisconnects(t *testing.T) {
 	if got := w.attemptCount(); got != 0 {
 		t.Errorf("attempts = %d, want disconnects not to be counted as attempts", got)
 	}
+}
+
+// TestServingFiresOnceTheProxyServes pins the local half of readiness: the
+// reverse proxy has begun serving before any edge connection is attempted,
+// so a listener hears EventServing after the mint and ahead of everything
+// the edge reports, with no hostname on it yet. The listener cancels the
+// tunnel on the spot, which is what keeps this off the edge and fast.
+func TestServingFiresOnceTheProxyServes(t *testing.T) {
+	clearSpecEnv(t)
+	var seenHeaders http.Header
+	t.Setenv(v1.CloudflareProviderEnv, mintServer(t, &seenHeaders).URL)
+
+	tun := v1alpha1.New(New())
+	var mu sync.Mutex
+	var seen []v1.Event
+	stop := errors.New("stop at serving")
+	tun.WithEventListener(func(e v1.Event) {
+		mu.Lock()
+		seen = append(seen, e)
+		mu.Unlock()
+		if e.Kind == v1.EventServing {
+			tun.Cancel(stop)
+		}
+	})
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	tun.WithListener(l)
+
+	select {
+	case <-tun.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("tunnel never ended after the listener canceled it")
+	}
+	if !errors.Is(tun.Err(), stop) {
+		t.Fatalf("Err = %v, want the listener's cancel", tun.Err())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	got := kinds(seen)
+	if len(got) == 0 || got[0] != v1.EventServing {
+		t.Fatalf("events %v, want serving first", got)
+	}
+	if seen[0].Hostname != "" {
+		t.Errorf("EventServing carried hostname %q, want empty until the edge registers", seen[0].Hostname)
+	}
+	for _, k := range got {
+		if k == v1.EventConnected || k == v1.EventTunnelReady {
+			t.Errorf("events %v: %s reported after the tunnel was canceled at serving", got, k)
+		}
+	}
+	if seenHeaders == nil {
+		t.Error("the mint never ran, so serving cannot have followed it")
+	}
+}
+
+func kinds(events []v1.Event) []v1.EventKind {
+	out := make([]v1.EventKind, len(events))
+	for i, e := range events {
+		out[i] = e.Kind
+	}
+	return out
 }
 
 // TestEdgeEventNames pins the log rendering, including that an event this
