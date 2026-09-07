@@ -189,7 +189,7 @@ case errors.Is(conn.Err(), libtunnel.ErrFailed):
 | `ErrCredentialRejected` | the edge refused these credentials — the tunnel is gone | never |
 | `ErrProviderUnreachable` | the mint endpoint refuses, times out or 5xxs | 45s |
 | `ErrEdgeUnreachable` | the edge never accepted a connection | 30s |
-| `ErrRateLimited` | throttled past its budget, or past its advertised reset | 90s |
+| `ErrRateLimited` | throttled past its budget, or past its advertised reset | 180s |
 | `ErrClosed` | shut down deliberately — terminal, but not a failure | n/a |
 
 A tunnel can also stop existing while it is running — reaped by the provider,
