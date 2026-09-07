@@ -124,14 +124,17 @@ const haConnections = 2
 // the count says how many serve attempts ended — not how many live connections
 // were lost, and not why.
 type edgeWatcher struct {
-	mu          sync.Mutex
-	gen         uint64
-	ch          chan struct{}
-	attempts    uint64
-	disconnects uint64
-	// connected records which connection indexes have registered before, so a
-	// reconnect can be told from a first connect. HA keeps this to a handful.
-	connected map[uint8]bool
+	mu  sync.Mutex
+	gen uint64
+	ch  chan struct{}
+	// Per connection index, so the watcher knows which connections are up
+	// now and not only which have ever been. HA keeps every map to a
+	// handful.
+	attempts    map[uint8]uint64
+	disconnects map[uint8]uint64
+	// live is the connection indexes registered right now, so "every
+	// connection is up" and "none is" are each a count.
+	live map[uint8]bool
 }
 
 func newEdgeWatcher() *edgeWatcher { return &edgeWatcher{ch: make(chan struct{})} }
@@ -142,44 +145,74 @@ func (e *edgeWatcher) generation() (uint64, <-chan struct{}) {
 	return e.gen, e.ch
 }
 
-// up records a Connected for index, reporting whether it is that connection's
-// first.
-func (e *edgeWatcher) up(index uint8) bool {
+// up records a Connected for index. full reports that this registration
+// brought every HA connection up — the transition, not the state, so a
+// listener hears it once per time the set fills rather than once per
+// registration.
+func (e *edgeWatcher) up(index uint8) (full bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.gen++
 	close(e.ch)
 	e.ch = make(chan struct{})
-	first := !e.connected[index]
-	if e.connected == nil {
-		e.connected = map[uint8]bool{}
+	if e.live == nil {
+		e.live = map[uint8]bool{}
 	}
-	e.connected[index] = true
-	return first
+	wasFull := len(e.live) >= haConnections
+	e.live[index] = true
+	return !wasFull && len(e.live) >= haConnections
 }
 
-func (e *edgeWatcher) attempt() {
+func (e *edgeWatcher) attempt(index uint8) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.attempts++
+	if e.attempts == nil {
+		e.attempts = map[uint8]uint64{}
+	}
+	e.attempts[index]++
 }
 
-func (e *edgeWatcher) disconnect() {
+// disconnect records that index's connection ended, freeing its slot in the
+// live set. empty reports that this was the last one — the transition to no
+// connection at all, so a drop that leaves others up is not reported, and
+// neither is an attempt ending that never registered to begin with.
+func (e *edgeWatcher) disconnect(index uint8) (empty bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.disconnects++
+	if e.disconnects == nil {
+		e.disconnects = map[uint8]uint64{}
+	}
+	e.disconnects[index]++
+	wasEmpty := len(e.live) == 0
+	delete(e.live, index)
+	return !wasEmpty && len(e.live) == 0
+}
+
+// liveCount is how many connections are registered right now.
+func (e *edgeWatcher) liveCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.live)
 }
 
 func (e *edgeWatcher) disconnectCount() uint64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.disconnects
+	var n uint64
+	for _, c := range e.disconnects {
+		n += c
+	}
+	return n
 }
 
 func (e *edgeWatcher) attemptCount() uint64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.attempts
+	var n uint64
+	for _, c := range e.attempts {
+		n += c
+	}
+	return n
 }
 
 // edgeEventName renders an Observer event for a log line. cloudflared's Status
@@ -910,18 +943,22 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			t.Logger().Debug("edge event", attrs...)
 			switch e.EventType {
 			case connection.Connected:
-				// First time for this connection index is a connect; after
-				// that the edge has dropped it and taken it back.
-				kind := v1.EventReconnected
+				// Every connection up is the tunnel's news; one of several
+				// registering is not — TunnelReady already said the edge
+				// answered.
 				if b.edge.up(e.Index) {
-					kind = v1.EventConnected
+					t.Emit(v1.Event{Kind: v1.EventConnected})
 				}
-				t.Emit(v1.Event{Kind: kind})
 			case connection.Reconnecting:
-				b.edge.attempt()
+				b.edge.attempt(e.Index)
 			case connection.Disconnected:
-				b.edge.disconnect()
-				t.Emit(v1.Event{Kind: v1.EventDisconnected})
+				// The last connection going is the tunnel's news; one of
+				// several is not, and neither is a serve attempt ending that
+				// never registered — which is most of what the supervisor
+				// reports here during an outage.
+				if b.edge.disconnect(e.Index) {
+					t.Emit(v1.Event{Kind: v1.EventDisconnected})
+				}
 			}
 		}))
 

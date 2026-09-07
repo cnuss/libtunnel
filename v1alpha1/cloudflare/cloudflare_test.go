@@ -1024,8 +1024,8 @@ func TestEdgeWatcherCountsAttempts(t *testing.T) {
 		t.Fatalf("initial attemptCount() = %d, want 0", got)
 	}
 
-	w.attempt()
-	w.attempt()
+	w.attempt(0)
+	w.attempt(0)
 	w.up(0)
 
 	if got := w.attemptCount(); got != 2 {
@@ -1712,6 +1712,47 @@ func TestEdgeProtocolRejectsNonsense(t *testing.T) {
 	}
 }
 
+// TestEdgeWatcherTransitions pins what Connected and Disconnected mean: the
+// set of live connections filling and emptying. Each is reported on the
+// registration or drop that makes the transition, and on nothing else — not a
+// registration short of full, not a drop that leaves others up, not a serve
+// attempt ending that never registered.
+func TestEdgeWatcherTransitions(t *testing.T) {
+	w := newEdgeWatcher()
+
+	if w.up(0) {
+		t.Fatalf("up(0) reported full with one of %d", haConnections)
+	}
+	if !w.up(1) {
+		t.Fatal("up(1) did not report full: the set is complete")
+	}
+	if got := w.liveCount(); got != haConnections {
+		t.Errorf("liveCount = %d, want %d", got, haConnections)
+	}
+	if w.up(1) {
+		t.Error("up(1) on a full set reported full again")
+	}
+
+	if w.disconnect(0) {
+		t.Error("disconnect(0) with 1 still up reported empty")
+	}
+	if !w.disconnect(1) {
+		t.Error("disconnect(1) as the last one up did not report empty")
+	}
+	if w.disconnect(1) {
+		t.Error("disconnect(1) on an already-empty set reported empty again")
+	}
+	if w.disconnect(7) {
+		t.Error("disconnect of an index that never registered reported empty")
+	}
+
+	// The set refilling after an outage is Connected again.
+	w.up(0)
+	if !w.up(1) {
+		t.Error("the set refilling after an outage did not report full")
+	}
+}
+
 // TestEdgeWatcherCountsDisconnects pins what the count means. The supervisor
 // defers Disconnected around each serve attempt, so it fires whether or not
 // that attempt connected — the number is serve attempts that ended, not live
@@ -1721,8 +1762,8 @@ func TestEdgeWatcherCountsDisconnects(t *testing.T) {
 	if got := w.disconnectCount(); got != 0 {
 		t.Errorf("disconnects = %d, want 0", got)
 	}
-	w.disconnect()
-	w.disconnect()
+	w.disconnect(0)
+	w.disconnect(0)
 	if got := w.disconnectCount(); got != 2 {
 		t.Errorf("disconnects = %d, want 2", got)
 	}

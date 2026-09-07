@@ -31,7 +31,11 @@ const (
 	// EventTunnelReady fires when the tunnel is reachable end to end, the same
 	// moment TunnelReady closes.
 	EventTunnelReady EventKind = "tunnel-ready"
-	// EventConnected fires the first time each edge connection registers.
+	// EventConnected fires when every edge connection is registered — the
+	// tunnel is connected with the redundancy it was configured for. It fires
+	// again when a partial outage heals: a connection dropping frees its
+	// slot, and the registration that fills the set again is the tunnel back
+	// at full strength. First contact with the edge is EventTunnelReady.
 	EventConnected EventKind = "connected"
 	// EventServing fires when the tunnel's own side is up: the in-process
 	// reverse proxy has begun serving, with the interceptor pipeline and the
@@ -41,14 +45,11 @@ const (
 	// Hostname is empty on it: the hostname is reported once the edge
 	// registers, which comes after.
 	EventServing EventKind = "serving"
-	// EventDisconnected fires when an edge connection ends. The engine reports
-	// one for every connection attempt that finishes, whether or not it ever
-	// carried traffic, so this counts attempts ending rather than live
-	// connections lost.
+	// EventDisconnected fires when the last edge connection ends — the tunnel
+	// has no connection to the edge. One connection dropping while others hold
+	// is not reported: the tunnel is degraded, not down, and the engine is
+	// already redialing.
 	EventDisconnected EventKind = "disconnected"
-	// EventReconnected fires when an edge connection registers again after a
-	// disconnect.
-	EventReconnected EventKind = "reconnected"
 	// EventGone fires when the edge says the tunnel no longer exists.
 	// Reconnecting will not bring it back: the spec that names it is dead and
 	// a caller holding one should discard it and mint fresh.
