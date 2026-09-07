@@ -78,7 +78,7 @@ func TestBudgets(t *testing.T) {
 		{v1.ErrCredentialRejected, 0},
 		{v1.ErrProviderUnreachable, 45 * time.Second},
 		{v1.ErrEdgeUnreachable, 30 * time.Second},
-		{v1.ErrRateLimited, 90 * time.Second},
+		{v1.ErrRateLimited, 180 * time.Second},
 		{v1.ErrClosed, 0},
 		{errors.New("not a class"), 0},
 		{nil, 0},
