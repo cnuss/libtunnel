@@ -6,9 +6,11 @@ package cloudflare
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -293,6 +295,10 @@ type Backend struct {
 	// moved on, and a test shortening the package default for the next
 	// tunnel must not race a goroutine the last one left behind.
 	probeInterval time.Duration
+	// establishInterval and establishBudget are fixed at construction for
+	// the same reason as probeInterval.
+	establishInterval time.Duration
+	establishBudget   time.Duration
 }
 
 // Proxy returns the origin reverse proxy (nil before connect). Implements the
@@ -307,7 +313,11 @@ func (b *Backend) Listener() net.Listener { return b.listener }
 // the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set. The first
 // unparsable value wins and is surfaced at connect.
 func New() *Backend {
-	b := &Backend{probeInterval: probeInterval}
+	b := &Backend{
+		probeInterval:     probeInterval,
+		establishInterval: establishInterval,
+		establishBudget:   establishBudget,
+	}
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
 	if b.envErr == nil {
 		b.http2, b.http2Fixed, b.envErr = v1alpha1.EnvBool(v1.HTTP2Env)
@@ -842,9 +852,17 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	wsOrigin, _ := t.WebSocketOrigin()
 	b.proxy = newOriginProxy(originURLs, wsOrigin, t.Logger(), transport)
 	b.listener = l
-	handler := originRedirect(len(originURLs), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// The loop-through's nonce: random per tunnel, so only this proxy's own
+	// verification requests short-circuit here and anything else carrying
+	// the header is forwarded like any request.
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return fmt.Errorf("loop-through nonce: %w", err)
+	}
+	loop := hex.EncodeToString(nonce)
+	handler := loopThrough(loop, originRedirect(len(originURLs), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Intercept(v1alpha1.NewInterceptCtx(b, w, r))(w, r)
-	}))
+	})))
 	srv := &http.Server{
 		Handler: handler,
 		// Called once, on the serving goroutine, as Serve begins on l and
@@ -1078,7 +1096,114 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		return fmt.Errorf("%w: no connection after %d attempts (%d ended) in %s: %s",
 			v1.ErrEdgeUnreachable, b.edge.attemptCount(), b.edge.disconnectCount(), edgeBudget, edgeBlockedHint)
 	}
+
+	// Only now: nothing sent before the edge has a connection could come
+	// back, and the wait it measures starts here.
+	go b.establish(ctx, t, loopThroughClient(), "https://"+spec.GetHostname()+"/", loop, t.Logger())
 	return nil
+}
+
+// loopThrough answers the tunnel's own verification requests before anything
+// else sees them: the exact nonce gets a 204 that echoes it, so the prober
+// can tell the proxy's answer from anything the edge might say in its place.
+// The origin is never asked.
+func loopThrough(nonce string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(establishHeader) == nonce {
+			w.Header().Set(establishHeader, nonce)
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loopThroughClient is the client the verification goes out on. It resolves
+// over DoH and dials the address itself, so the machine's resolver is never
+// asked: this is the first request for the name from this host, and a
+// resolver asked a beat early caches the NXDOMAIN for the zone's SOA.
+func loopThroughClient() *http.Client {
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: caCertPool()},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				ip, err := lookupHost(ctx, host)
+				if err != nil {
+					return nil, err
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(ip, port))
+			},
+		},
+	}
+}
+
+// establish sends the loop-through to url until the proxy answers it, then
+// reports EventEstablished. Bounded by establishBudget: past it the tunnel
+// is connected but unverified, which is what the caller already had.
+func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client, url, nonce string, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(ctx, b.establishBudget)
+	defer cancel()
+
+	start := time.Now()
+	attempts := 0
+	for {
+		attempts++
+		if verify(ctx, client, url, nonce) {
+			log.Info("tunnel established", "url", url, "attempts", attempts, "after", time.Since(start).Round(time.Millisecond))
+			t.Emit(v1.Event{Kind: v1.EventEstablished})
+			return
+		}
+		select {
+		case <-ctx.Done():
+			log.Warn("tunnel connected but not verified from here", "url", url, "attempts", attempts, "after", time.Since(start).Round(time.Second))
+			return
+		case <-time.After(b.establishInterval):
+		}
+	}
+}
+
+// verify makes one loop-through and reports whether the proxy answered it —
+// the nonce back on a 204 — rather than the edge answering in its place.
+func verify(ctx context.Context, client *http.Client, url, nonce string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set(establishHeader, nonce)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusNoContent && resp.Header.Get(establishHeader) == nonce
+}
+
+// lookupHost resolves host through the DoH resolvers, first to answer wins.
+func lookupHost(ctx context.Context, host string) (string, error) {
+	var lastErr error
+	for _, resolver := range goneResolvers() {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		lookup, cancel := context.WithTimeout(ctx, dohTimeout)
+		addrs, err := resolver.LookupHost(lookup, host)
+		cancel()
+		if err == nil && len(addrs) > 0 {
+			return addrs[0], nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no DoH resolver answered")
+	}
+	return "", lastErr
 }
 
 // probeInterval is how often the probe asks whether the tunnel still exists.
@@ -1103,6 +1228,26 @@ const (
 	probeHandshakeTimeout = 2 * time.Second
 	probeIdleTimeout      = 3 * time.Second
 )
+
+// The loop-through that verifies the public URL. Every establishInterval a
+// request goes to the URL with a nonce only this tunnel's proxy recognizes;
+// the proxy answers 204 itself, so the origin never sees it. Until the edge
+// has fanned the tunnel's location out to its colos it answers 530 in the
+// proxy's place, and the loop tries again. establishBudget bounds the wait:
+// past it the tunnel is connected but unverified, which is what the caller
+// already had.
+//
+// Vars, not consts, so a test can shorten them rather than sleep through
+// them — captured on the Backend at construction, the same way as
+// probeInterval.
+var (
+	establishInterval = 1 * time.Second
+	establishBudget   = 60 * time.Second
+)
+
+// establishHeader carries the loop-through nonce. Any other value is an
+// ordinary request.
+const establishHeader = "X-Libtunnel-Loop"
 
 // probeConnIndex is the connection index the probe registers under. The
 // supervisor owns 0..haConnections-1, so this sits clear: registering an index
