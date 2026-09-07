@@ -157,10 +157,14 @@ var (
 	// than the budget — which is reported immediately rather than waited out,
 	// so a caller can act on "resets in 5m" instead of blocking on it.
 	//
-	// The budget matches ErrProviderUnreachable for want of better evidence:
-	// it only governs a 429 that carries no reset at all, since one that names
-	// its reset is decided by that number instead.
-	ErrRateLimited error = &class{ErrFailed, "rate limited", 45 * time.Second}
+	// The budget has to clear the provider's own Retry-After, or no throttle
+	// is ever honored: tunnel.pizza answers every 429 with 60s, whether its
+	// edge refused the request or its zone needs an eviction cycle to free a
+	// record. 180s is three of those waits — attempts at 0, 60, 120 and 180s,
+	// with the fourth reporting — which outlasts a burst at the edge and a
+	// slow eviction alike, while a reset measured in minutes is still
+	// reported rather than slept on.
+	ErrRateLimited error = &class{ErrFailed, "rate limited", 180 * time.Second}
 
 	// ErrClosed is the Err result of a tunnel shut down deliberately — by
 	// closing the listener returned from Tunnel.Listener. It is terminal but
@@ -425,11 +429,12 @@ type Tunnel interface {
 	// listener handed to WithListener instead and rebind the same address; a
 	// minted listener has no separate owner, so closing it is terminal.
 	Listener() net.Listener
-	// URL is https://<Hostname>/. It blocks until the hostname is expected
-	// to resolve publicly (see HostnameReady). URL demands public
-	// reachability, so like Listener it is a start trigger: with no origin
-	// provided it mints a loopback listener and starts the edge connection,
-	// instead of waiting on readiness that could never arrive.
+	// URL is https://<Hostname>/. It blocks until the tunnel is reachable end
+	// to end (TunnelReady), or returns nil if the tunnel — or a WithContext
+	// caller context — ends first. URL demands public reachability, so like
+	// Listener it is a start trigger: with no origin provided it mints a
+	// loopback listener and starts the edge connection, instead of waiting on
+	// readiness that could never arrive.
 	URL() *url.URL
 
 	// HostnameReady is closed once the hostname is expected to resolve
@@ -466,10 +471,8 @@ type Tunnel interface {
 	// carries a level, not a sink.
 	WithLogger(log *slog.Logger) Tunnel
 	// WithContext threads a caller context into the tunnel, once. It does two
-	// things. First, URL waits for the tunnel to be reachable end to end
-	// (TunnelReady), honoring the context, instead of only for the hostname to
-	// resolve — and returns nil if the context is done first. Unset (or nil),
-	// URL waits on DNS alone. Second, the context is the tunnel's shutdown
+	// things. First, URL honors it: a wait on readiness returns nil if the
+	// context is done first. Second, the context is the tunnel's shutdown
 	// handle: canceling it tears the tunnel down (Done fires, Err reports the
 	// context's cause) — the teardown a WithLocalURL origin otherwise lacks.
 	WithContext(ctx context.Context) Tunnel

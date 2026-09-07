@@ -960,6 +960,9 @@ func TestQuickTunnelHonorsContext(t *testing.T) {
 }
 
 func TestQuickTunnelSurfacesRateLimit(t *testing.T) {
+	// A reset past the budget is reported at once; shortening the budget is
+	// what keeps this a test of the message rather than of the wait.
+	shortBudgets(t, 100*time.Millisecond)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "120")
 		w.WriteHeader(http.StatusTooManyRequests)

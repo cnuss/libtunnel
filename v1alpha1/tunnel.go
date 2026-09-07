@@ -30,14 +30,13 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel {
 	return t
 }
 
-// WithContext threads a caller context into the tunnel: once set, URL upgrades
-// from "the hostname resolves" to "the tunnel is reachable end to end" — it
-// waits for TunnelReady, honoring this context, and returns nil if the context
-// is done first. It is also the tunnel's shutdown handle: canceling the
-// context tears the tunnel down (Done fires, Err reports the context's cause),
-// which is the only teardown a WithLocalURL origin has. Write-once: the first
-// call wins, a nil ctx is ignored, and a URL call that already fixed the field
-// (to nil, unset) makes this a no-op.
+// WithContext threads a caller context into the tunnel: URL honors it,
+// returning nil if the context is done before the tunnel is reachable. It is
+// also the tunnel's shutdown handle: canceling the context tears the tunnel
+// down (Done fires, Err reports the context's cause), which is the only
+// teardown a WithLocalURL origin has. Write-once: the first call wins, a nil
+// ctx is ignored, and a URL call that already fixed the field (to its
+// Background default) makes this a no-op.
 func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 	if ctx != nil {
 		t.userCtxOnce.Do(func() {
@@ -638,9 +637,9 @@ func (t *TunnelImpl[T]) Port() int {
 	return portOf(t.Hostname())
 }
 
-// URL is https://<Hostname>/. It blocks until the hostname is expected to
-// resolve publicly (see HostnameReady). Returns nil if the tunnel is canceled
-// before that happens, per the v1 contract's zero-value-on-cancel rule.
+// URL is https://<Hostname>/. It blocks until the tunnel is reachable end to
+// end (TunnelReady). Returns nil if the tunnel, or a WithContext caller
+// context, is canceled first, per the v1 contract's zero-value-on-cancel rule.
 //
 // URL demands public reachability, so like Listener it is a start trigger:
 // with no origin provided it mints a loopback listener and starts the edge
@@ -652,25 +651,16 @@ func (t *TunnelImpl[T]) URL() *url.URL {
 	t.ensureOrigin()
 	hostname := t.Hostname()
 
-	// Fix the userCtx field before reading it: an unset field freezes to nil
-	// (URL waits on DNS alone), and a later WithContext becomes a no-op
-	// instead of a mutation under this read.
+	// Fix the userCtx field before reading it, so a later WithContext becomes
+	// a no-op instead of a mutation under this read. A raw three-way select on
+	// purpose: it waits on two cancellation sources, which the single-ctx
+	// await helper does not model.
 	t.userCtxOnce.Do(func() {})
-	if t.userCtx != nil {
-		// A caller context set via WithContext upgrades URL from "the hostname
-		// resolves" to "the tunnel is reachable end to end": wait for
-		// TunnelReady (which implies the hostname has resolved), honoring both
-		// the tunnel's lifetime and the caller's context. A raw three-way
-		// select on purpose — it waits on two cancellation sources, which the
-		// single-ctx await helper does not model.
-		select {
-		case <-t.TunnelReady():
-		case <-t.ctx.Done():
-			return nil
-		case <-t.userCtx.Done():
-			return nil
-		}
-	} else if !await(t.ctx, t.HostnameReady()) {
+	select {
+	case <-t.TunnelReady():
+	case <-t.ctx.Done():
+		return nil
+	case <-t.userCtx.Done():
 		return nil
 	}
 
