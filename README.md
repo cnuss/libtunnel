@@ -440,6 +440,7 @@ rebuild. (The one exception is noted below.)
 | `LIBTUNNEL_TLS` | `WithTLS()` | Bool (`strconv.ParseBool`). Fixed at backend construction; later `WithTLS` calls are no-ops. Unparsable value fails at connect. |
 | `LIBTUNNEL_HTTP2` | `WithHTTP2()` | Same rules as `LIBTUNNEL_TLS`. |
 | `LIBTUNNEL_LOG` | `WithLogger()` | `debug`\|`info`\|`warn`\|`error`: the default logger becomes a stderr text logger at that level instead of silent. *The exception:* an explicit `WithLogger` keeps its handler — env carries a level, not a sink. |
+| `LIBTUNNEL_NO_REPORT` | — | Set to anything to stop the mint client reporting network errors to the provider. On by default: like a browser, it honors the provider's `NEL` + `Report-To` headers and posts a 4xx, timeout, DNS or TLS failure to the collector they name (for tunnel.pizza, Cloudflare's, into the zone's NEL analytics). Never carries credentials. |
 | `LIBTUNNEL_HOSTNAME` | — | Export-only mirror of the minted spec's hostname, for tooling; never adopted. |
 
 Backend-scoped variables follow `LIBTUNNEL__<BACKEND>_<FIELD>` (double

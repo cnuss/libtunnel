@@ -70,6 +70,27 @@ var cloudflaredVersion = func() string {
 	return "unknown"
 }()
 
+// userAgent identifies this client in the reports it posts to a provider's
+// NEL collector — the field the Reporting API reserves for the browser's
+// User-Agent. The module version from the build info, so it tracks releases
+// rather than a constant.
+var userAgent = func() string {
+	version := "devel"
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, dep := range bi.Deps {
+			if dep.Path == "github.com/cnuss/libtunnel" {
+				if dep.Replace != nil {
+					dep = dep.Replace
+				}
+				if dep.Version != "" {
+					version = dep.Version
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("libtunnel/%s (%s/%s; %s)", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+}()
+
 // promMu serializes the prometheus.DefaultRegisterer swap below: cloudflared
 // registers metrics against the global registerer at construction, which
 // would collide across tunnels (and pollute the host application's metrics).

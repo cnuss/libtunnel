@@ -163,11 +163,12 @@ var (
 
 func preflight() error {
 	preflightOnce.Do(func() {
-		// 30s: a mint attempt is bounded at 15s (the endpoint holds the
-		// request while it waits out DNS propagation), so this budget fits a
-		// retry against a briefly saturated mint endpoint instead of dying on
-		// the first hang.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// The mint honors the provider's Retry-After for as long as the
+		// rate-limit budget allows, so the deadline has to outlast the
+		// budget or a throttled provider fails the preflight while the
+		// library is still correctly waiting. Plus one attempt's 15s bound
+		// and margin. A healthy path returns in seconds regardless.
+		ctx, cancel := context.WithTimeout(context.Background(), v1.Budget(v1.ErrRateLimited)+30*time.Second)
 		defer cancel()
 		// Hand the provider the suite's debug logger, or a throttled
 		// preflight fails with nothing but a deadline in the CI log.

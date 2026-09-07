@@ -228,6 +228,15 @@ const (
 	// WithLogger keeps its handler — the environment carries a level, not a
 	// sink. An unknown value reads as info, with a warning.
 	LogEnv = "LIBTUNNEL_LOG"
+
+	// NoReportEnv, set to anything, stops the mint client from reporting
+	// network errors to the provider. On by default: the client does what a
+	// browser does with a provider's NEL and Report-To headers, posting a
+	// 4xx, a timeout, an unresolved name or an untrusted certificate to the
+	// collector those headers name — a collector the provider the caller is
+	// already talking to chose, so no new party learns anything. This is the
+	// switch for a caller that wants a library that never phones out.
+	NoReportEnv = "LIBTUNNEL_NO_REPORT"
 )
 
 // The Cloudflare backend's variables, following the backend-scoped
