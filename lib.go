@@ -153,6 +153,7 @@ type (
 const (
 	EventHostnameReady = v1.EventHostnameReady // the hostname is expected to resolve
 	EventTunnelReady   = v1.EventTunnelReady   // reachable end to end
+	EventServing       = v1.EventServing       // the local side is up: proxy listening, origin wired
 	EventConnected     = v1.EventConnected     // an edge connection registered
 	EventDisconnected  = v1.EventDisconnected  // an edge connection ended
 	EventReconnected   = v1.EventReconnected   // an edge connection came back

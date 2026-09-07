@@ -255,6 +255,11 @@ type Backend struct {
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
 	listener     net.Listener
+	// probeInterval is fixed at construction rather than read by the probe
+	// loop: the loop is a goroutine that may start after the caller has
+	// moved on, and a test shortening the package default for the next
+	// tunnel must not race a goroutine the last one left behind.
+	probeInterval time.Duration
 }
 
 // Proxy returns the origin reverse proxy (nil before connect). Implements the
@@ -269,7 +274,7 @@ func (b *Backend) Listener() net.Listener { return b.listener }
 // the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set. The first
 // unparsable value wins and is surfaced at connect.
 func New() *Backend {
-	b := &Backend{}
+	b := &Backend{probeInterval: probeInterval}
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
 	if b.envErr == nil {
 		b.http2, b.http2Fixed, b.envErr = v1alpha1.EnvBool(v1.HTTP2Env)
@@ -807,7 +812,17 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	handler := originRedirect(len(originURLs), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Intercept(v1alpha1.NewInterceptCtx(b, w, r))(w, r)
 	}))
-	srv := &http.Server{Handler: handler}
+	srv := &http.Server{
+		Handler: handler,
+		// Called once, on the serving goroutine, as Serve begins on l and
+		// before its first Accept — the one hook net/http offers for "now
+		// serving". The tunnel's context as the base means every request
+		// ends with the tunnel, not just the listener.
+		BaseContext: func(net.Listener) context.Context {
+			t.Emit(v1.Event{Kind: v1.EventServing})
+			return t.Context()
+		},
+	}
 	context.AfterFunc(t.Context(), func() { srv.Close() })
 	go srv.Serve(l)
 	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origins", originURLs)
@@ -1077,7 +1092,7 @@ type emitter interface{ Emit(v1.Event) }
 // call is synchronous and a ticker holds at most one pending tick.
 func (b *Backend) runProbe(ctx context.Context, probe func()) {
 	go func() {
-		ticker := time.NewTicker(probeInterval)
+		ticker := time.NewTicker(b.probeInterval)
 		defer ticker.Stop()
 		for {
 			select {

@@ -33,6 +33,14 @@ const (
 	EventTunnelReady EventKind = "tunnel-ready"
 	// EventConnected fires the first time each edge connection registers.
 	EventConnected EventKind = "connected"
+	// EventServing fires when the tunnel's own side is up: the in-process
+	// reverse proxy has begun serving, with the interceptor pipeline and the
+	// origin dial behind it, so a request that reached it would be answered.
+	// It follows the mint and precedes any edge connection registering — the
+	// local half is ready, the public half follows with EventConnected.
+	// Hostname is empty on it: the hostname is reported once the edge
+	// registers, which comes after.
+	EventServing EventKind = "serving"
 	// EventDisconnected fires when an edge connection ends. The engine reports
 	// one for every connection attempt that finishes, whether or not it ever
 	// carried traffic, so this counts attempts ending rather than live
