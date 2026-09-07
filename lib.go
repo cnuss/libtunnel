@@ -156,6 +156,7 @@ const (
 	EventServing       = v1.EventServing       // the local side is up: proxy listening, origin wired
 	EventConnected     = v1.EventConnected     // every edge connection is up
 	EventDisconnected  = v1.EventDisconnected  // no edge connection is up
+	EventEstablished   = v1.EventEstablished   // the public URL works from here; origin untouched
 	EventGone          = v1.EventGone          // the edge disowned the tunnel; discard the spec
 	EventError         = v1.EventError         // the tunnel failed; Err has the cause
 	EventDone          = v1.EventDone          // the tunnel ended, for any reason

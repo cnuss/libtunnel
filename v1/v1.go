@@ -50,6 +50,14 @@ const (
 	// is not reported: the tunnel is degraded, not down, and the engine is
 	// already redialing.
 	EventDisconnected EventKind = "disconnected"
+	// EventEstablished fires when the public URL is verified to work from
+	// here: a request sent to it came back through the edge, the tunnel and
+	// the reverse proxy — which answered it itself, so the origin saw
+	// nothing. It is the moment a visitor would get through, which
+	// EventConnected is not: after every edge connection registers,
+	// Cloudflare still has to tell its other colos where the tunnel lives,
+	// and until it has a visitor gets the edge's 530. Once per tunnel.
+	EventEstablished EventKind = "established"
 	// EventGone fires when the edge says the tunnel no longer exists.
 	// Reconnecting will not bring it back: the spec that names it is dead and
 	// a caller holding one should discard it and mint fresh.

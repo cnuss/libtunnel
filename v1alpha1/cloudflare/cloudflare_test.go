@@ -1712,6 +1712,126 @@ func TestEdgeProtocolRejectsNonsense(t *testing.T) {
 	}
 }
 
+// recorder is an emitter that keeps what it was told.
+type recorder struct {
+	mu     sync.Mutex
+	events []v1.Event
+}
+
+func (r *recorder) Emit(e v1.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+func (r *recorder) kinds() []v1.EventKind {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return kinds(r.events)
+}
+
+// TestLoopThroughAnswersOnlyItsNonce pins the whole reason the loop-through
+// is acceptable: the exact nonce is answered by the proxy and the origin sees
+// nothing, while any other value — or none — is an ordinary request that the
+// origin does see.
+func TestLoopThroughAnswersOnlyItsNonce(t *testing.T) {
+	var origin atomic.Int32
+	h := loopThrough("secret-nonce", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin.Add(1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+
+	do := func(header string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		if header != "" {
+			req.Header.Set(establishHeader, header)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := do("secret-nonce")
+	if rec.Code != http.StatusNoContent || rec.Header().Get(establishHeader) != "secret-nonce" {
+		t.Errorf("exact nonce: %d with echo %q, want 204 echoing the nonce", rec.Code, rec.Header().Get(establishHeader))
+	}
+	if got := origin.Load(); got != 0 {
+		t.Fatalf("the origin saw %d requests for the exact nonce, want 0", got)
+	}
+
+	if rec := do("wrong"); rec.Code != http.StatusTeapot {
+		t.Errorf("wrong nonce: %d, want the origin's answer", rec.Code)
+	}
+	if rec := do(""); rec.Code != http.StatusTeapot {
+		t.Errorf("no header: %d, want the origin's answer", rec.Code)
+	}
+	if got := origin.Load(); got != 2 {
+		t.Errorf("the origin saw %d ordinary requests, want 2", got)
+	}
+}
+
+// TestEstablishRidesOutTheEdge pins the loop against what the edge does
+// before the route is live: it answers in the proxy's place. Two of those,
+// then the proxy's own 204, and the event fires once — with the origin never
+// asked at any point.
+func TestEstablishRidesOutTheEdge(t *testing.T) {
+	var origin, hits atomic.Int32
+	proxy := loopThrough("n", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin.Add(1)
+	}))
+	edge := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) <= 2 {
+			// Cloudflare's own page for a tunnel it cannot route yet.
+			w.WriteHeader(530)
+			fmt.Fprint(w, "<html>error code: 1033</html>")
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer edge.Close()
+
+	b := New()
+	b.establishInterval = 10 * time.Millisecond
+	b.establishBudget = 5 * time.Second
+	rec := &recorder{}
+	log := slog.New(slog.DiscardHandler)
+
+	b.establish(context.Background(), rec, edge.Client(), edge.URL+"/", "n", log)
+
+	if got := rec.kinds(); len(got) != 1 || got[0] != v1.EventEstablished {
+		t.Fatalf("events %v, want exactly [established]", got)
+	}
+	if got := hits.Load(); got != 3 {
+		t.Errorf("edge saw %d requests, want 3: two refused, one through", got)
+	}
+	if got := origin.Load(); got != 0 {
+		t.Errorf("the origin saw %d requests, want 0", got)
+	}
+}
+
+// TestEstablishGivesUpAtTheBudget pins the bound: an edge that never routes
+// leaves the tunnel connected but unverified, with no event and no hang.
+func TestEstablishGivesUpAtTheBudget(t *testing.T) {
+	edge := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(530)
+	}))
+	defer edge.Close()
+
+	b := New()
+	b.establishInterval = 10 * time.Millisecond
+	b.establishBudget = 100 * time.Millisecond
+	rec := &recorder{}
+
+	start := time.Now()
+	b.establish(context.Background(), rec, edge.Client(), edge.URL+"/", "n", slog.New(slog.DiscardHandler))
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("establish ran %v past a 100ms budget", elapsed)
+	}
+	if got := rec.kinds(); len(got) != 0 {
+		t.Errorf("events %v, want none from an edge that never routed", got)
+	}
+}
+
 // TestEdgeWatcherTransitions pins what Connected and Disconnected mean: the
 // set of live connections filling and emptying. Each is reported on the
 // registration or drop that makes the transition, and on nothing else — not a
