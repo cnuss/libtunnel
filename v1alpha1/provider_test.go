@@ -275,14 +275,15 @@ type loggerEngine struct {
 	provider v1.Provider[*cloudflare.Spec]
 }
 
-func (e loggerEngine) Name() string                                { return "logger-fake" }
-func (e loggerEngine) Provider() v1.Provider[*cloudflare.Spec]     { return e.provider }
-func (e loggerEngine) CACerts() []*x509.Certificate                { return nil }
-func (e loggerEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
-func (e loggerEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
-func (loggerEngine) Reconnect(context.Context) error               { return nil }
-func (loggerEngine) Proxy() *httputil.ReverseProxy                 { return nil }
-func (loggerEngine) Listener() net.Listener                        { return nil }
+func (e loggerEngine) Name() string                                  { return "logger-fake" }
+func (e loggerEngine) Provider() v1.Provider[*cloudflare.Spec]       { return e.provider }
+func (e loggerEngine) CACerts() []*x509.Certificate                  { return nil }
+func (e loggerEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]     { return e }
+func (e loggerEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return e }
+func (e loggerEngine) WithToken(string) v1.Backend[*cloudflare.Spec] { return e }
+func (loggerEngine) Reconnect(context.Context) error                 { return nil }
+func (loggerEngine) Proxy() *httputil.ReverseProxy                   { return nil }
+func (loggerEngine) Listener() net.Listener                          { return nil }
 func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }

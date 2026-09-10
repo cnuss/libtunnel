@@ -30,6 +30,21 @@ func (t *TunnelImpl[T]) WithLogger(log *slog.Logger) v1.Tunnel {
 	return t
 }
 
+// WithToken forwards the mint credential to the backend, once: the first
+// non-empty call wins. The spec fetch fixes the field, so a token set after
+// the provider chain has been built is a no-op rather than a value the mint
+// never saw.
+func (t *TunnelImpl[T]) WithToken(token string) v1.Tunnel {
+	if token != "" {
+		t.tokenOnce.Do(func() {
+			if t.backend != nil {
+				t.backend.WithToken(token)
+			}
+		})
+	}
+	return t
+}
+
 // WithContext threads a caller context into the tunnel: URL honors it,
 // returning nil if the context is done before the tunnel is reachable. It is
 // also the tunnel's shutdown handle: canceling the context tears the tunnel
@@ -594,6 +609,9 @@ func (t *TunnelImpl[T]) Spec() T {
 			// canceled; there is nothing to resolve.
 			return
 		}
+		// The provider is built from the backend's knobs right here, so a
+		// WithToken after this point has nothing to land on.
+		t.tokenOnce.Do(func() {})
 		provider := t.backend.Provider()
 		// Providers that can log (retry warnings, rate limits) pick up the
 		// tunnel's logger here — they're built by the backend before any

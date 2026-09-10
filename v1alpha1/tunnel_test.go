@@ -31,6 +31,8 @@ type fakeEngine struct {
 	proxy       *httputil.ReverseProxy
 	listener    net.Listener
 	reconnected bool
+	// tokens records every WithToken the tunnel forwarded, in order.
+	tokens []string
 }
 
 func newFakeEngine(spec *cloudflare.Spec) *fakeEngine {
@@ -42,9 +44,13 @@ func (e *fakeEngine) Provider() v1.Provider[*cloudflare.Spec]     { return v1alp
 func (e *fakeEngine) CACerts() []*x509.Certificate                { return []*x509.Certificate{} }
 func (e *fakeEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e *fakeEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
-func (e *fakeEngine) Reconnect(context.Context) error             { e.reconnected = true; return nil }
-func (e *fakeEngine) Proxy() *httputil.ReverseProxy               { return e.proxy }
-func (e *fakeEngine) Listener() net.Listener                      { return e.listener }
+func (e *fakeEngine) WithToken(token string) v1.Backend[*cloudflare.Spec] {
+	e.tokens = append(e.tokens, token)
+	return e
+}
+func (e *fakeEngine) Reconnect(context.Context) error { e.reconnected = true; return nil }
+func (e *fakeEngine) Proxy() *httputil.ReverseProxy   { return e.proxy }
+func (e *fakeEngine) Listener() net.Listener          { return e.listener }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
 	return nil
@@ -82,9 +88,10 @@ func (foreignBackend) Name() string { return "foreign" }
 func (foreignBackend) Provider() v1.Provider[*cloudflare.Spec] {
 	return v1alpha1.Static(&cloudflare.Spec{})
 }
-func (f foreignBackend) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return f }
-func (f foreignBackend) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return f }
-func (foreignBackend) Reconnect(context.Context) error               { return nil }
+func (f foreignBackend) WithTLS(bool) v1.Backend[*cloudflare.Spec]     { return f }
+func (f foreignBackend) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return f }
+func (f foreignBackend) WithToken(string) v1.Backend[*cloudflare.Spec] { return f }
+func (foreignBackend) Reconnect(context.Context) error                 { return nil }
 
 var (
 	_ v1alpha1.Engine[*cloudflare.Spec] = (*fakeEngine)(nil)
@@ -933,12 +940,13 @@ func (failingEngine) Name() string { return "failing" }
 func (failingEngine) Provider() v1.Provider[*cloudflare.Spec] {
 	return failingProvider{}
 }
-func (failingEngine) CACerts() []*x509.Certificate                  { return nil }
-func (failingEngine) Proxy() *httputil.ReverseProxy                 { return nil }
-func (failingEngine) Listener() net.Listener                        { return nil }
-func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]   { return e }
-func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec] { return e }
-func (failingEngine) Reconnect(context.Context) error               { return nil }
+func (failingEngine) CACerts() []*x509.Certificate                    { return nil }
+func (failingEngine) Proxy() *httputil.ReverseProxy                   { return nil }
+func (failingEngine) Listener() net.Listener                          { return nil }
+func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]     { return e }
+func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return e }
+func (e failingEngine) WithToken(string) v1.Backend[*cloudflare.Spec] { return e }
+func (failingEngine) Reconnect(context.Context) error                 { return nil }
 func (failingEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }
@@ -1427,5 +1435,29 @@ func TestFailedTunnelEmitsErrorThenDone(t *testing.T) {
 		if !errors.Is(err, v1.ErrCertificate) {
 			t.Errorf("event %d carried %v, want the cause", i, err)
 		}
+	}
+}
+
+// TestWithTokenForwardsOnce pins the Tunnel-level knob: the first non-empty
+// WithToken reaches the backend, a repeat is a no-op, and once the spec has
+// been fetched — the provider built from the backend's knobs — a later call
+// has nothing to land on and forwards nothing.
+func TestWithTokenForwardsOnce(t *testing.T) {
+	eng := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	tun := v1alpha1.New(eng)
+
+	tun.WithToken("").WithToken("first").WithToken("second")
+	if got := eng.tokens; len(got) != 1 || got[0] != "first" {
+		t.Fatalf("backend saw tokens %v, want exactly [first]", got)
+	}
+
+	late := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	lateTun := v1alpha1.New(late)
+	if got := lateTun.Hostname(); got != "demo.tunneled.pizza" {
+		t.Fatalf("Hostname = %q", got)
+	}
+	lateTun.WithToken("too-late")
+	if got := late.tokens; len(got) != 0 {
+		t.Errorf("backend saw tokens %v after the spec fetch, want none", got)
 	}
 }

@@ -281,6 +281,10 @@ type Backend struct {
 	// with) v1.CloudflareHeadersEnv at mint time. Mint-only — adopted, replayed,
 	// and pinned specs never hit the API, so these never apply to them.
 	headers http.Header
+	// token is the mint request credential (WithToken), sent as
+	// "Authorization: token <value>". Empty sends none; v1.TokenEnv
+	// supersedes either. Mint-only, like headers.
+	token string
 	// Runtime state wired at connect. reconnected feeds the supervisor's
 	// external-control channel, edge tracks edge connections, edgeReject
 	// carries a refused registration back from the log bridge, and reconnectCtx
@@ -549,6 +553,19 @@ func (b *Backend) WithHeader(key, value string) *Backend {
 	return b
 }
 
+// WithToken sets the credential the mint request carries, as "Authorization:
+// token <value>", so a provider that gates minting can tell who is asking.
+// Applied with the mint's own defaults (Content-Type, User-Agent), so an
+// explicit WithHeader("Authorization", …) or the LIBTUNNEL__CLOUDFLARE_HEADERS
+// mirror replaces it, the way they replace every default. Env mirror:
+// LIBTUNNEL_TOKEN (env beats code). Mint-only, following the WithProvider
+// boundary: adopted, replayed, and pinned specs never hit the API. Never part
+// of the spec or its handoff.
+func (b *Backend) WithToken(token string) v1.Backend[*Spec] {
+	b.token = token
+	return b
+}
+
 var (
 	_ v1.Backend[*Spec]      = (*Backend)(nil)
 	_ v1alpha1.Engine[*Spec] = (*Backend)(nil)
@@ -576,6 +593,7 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 			qt.URL = providerEndpoint(host)
 		}
 		qt.Headers = mintHeaders(b.headers)
+		qt.Token = b.token
 		qt.record = b.recordHint()
 		next = qt
 	}
