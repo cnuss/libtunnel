@@ -241,6 +241,11 @@ const (
 	// HTTP2Env fixes Backend.WithHTTP2 from the environment, under the same
 	// rules as TLSEnv.
 	HTTP2Env = "LIBTUNNEL_HTTP2"
+	// TokenEnv mirrors Tunnel.WithToken: the credential sent on the mint
+	// request as "Authorization: token <value>" (env beats code). Only the
+	// mint path uses it — adopted, replayed, and pinned specs never hit the
+	// API — and it is never part of the spec or its handoff.
+	TokenEnv = "LIBTUNNEL_TOKEN"
 	// LogEnv names the level (debug|info|warn|error) of the default logger:
 	// set, a tunnel with no WithLogger call logs to stderr at that level
 	// instead of staying silent. The env-beats-code exception: an explicit
@@ -371,6 +376,13 @@ type Backend[T Spec] interface {
 	// negotiates HTTP/2 over TLS. Default false. Chainable. LIBTUNNEL_HTTP2
 	// fixes it from the environment under the same rules as WithTLS.
 	WithHTTP2(bool) Backend[T]
+	// WithToken sets the credential the mint request carries, as
+	// "Authorization: token <value>". Mint-only: adopted, replayed, and
+	// pinned specs never hit the API, so a token never applies to them, and
+	// it is never part of the spec or its handoff. A backend whose provider
+	// has no notion of a token accepts and ignores it. Chainable. The
+	// LIBTUNNEL_TOKEN environment variable beats it.
+	WithToken(token string) Backend[T]
 	// Reconnect forcefully cycles the engine's connection(s) to the tunnel edge
 	// and blocks until the edge is re-established or ctx is done (returning
 	// ctx.Err()); pass a ctx with a deadline to bound the wait. It also returns
@@ -504,6 +516,14 @@ type Tunnel interface {
 	// handle: canceling it tears the tunnel down (Done fires, Err reports the
 	// context's cause) — the teardown a WithLocalURL origin otherwise lacks.
 	WithContext(ctx context.Context) Tunnel
+	// WithToken sets the credential the backend sends when it mints
+	// credentials, once — as "Authorization: token <value>" on the mint
+	// request (see Backend.WithToken). It must be called before the first
+	// spec fetch; the fetch fixes the value, so a later call is a no-op. An
+	// empty token is ignored. Mint-only, and never part of the spec: an
+	// adopted or replayed spec never uses it, and a handoff never carries
+	// it. The LIBTUNNEL_TOKEN environment variable beats it.
+	WithToken(token string) Tunnel
 	// WithListener provides the local origin as a listener and lazily starts
 	// the edge connection. The origin scheme is not inferred from the
 	// listener — declare it on the backend with WithTLS / WithHTTP2 (both

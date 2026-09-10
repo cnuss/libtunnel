@@ -141,7 +141,11 @@ type TunnelImpl[T v1.Spec] struct {
 	// WithLogger fixes the silent default.
 	logOnce sync.Once
 	log     *slog.Logger
-	backend v1.Backend[T]
+	// tokenOnce fixes the mint token: the first WithToken wins and forwards
+	// it to the backend; the spec fetch fixes the empty default so nothing
+	// lands on a provider already built.
+	tokenOnce sync.Once
+	backend   v1.Backend[T]
 	// engine is backend asserted to the alpha contract, established once in
 	// New. Nil means a foreign backend — the tunnel is born canceled.
 	engine Engine[T]

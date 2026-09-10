@@ -2110,3 +2110,79 @@ func TestHostnameGoneStripsAPort(t *testing.T) {
 		t.Error("a resolving host:port reported gone; the port was not stripped")
 	}
 }
+
+// TestWithTokenSentToMint pins the wire form: WithToken lands on the mint
+// request as "Authorization: token <value>", and an unset token sends none.
+func TestWithTokenSentToMint(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithProvider(srv.URL).WithToken("s3cret").Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Values("Authorization"); len(got) != 1 || got[0] != "token s3cret" {
+		t.Errorf("Authorization = %v, want exactly [token s3cret]", got)
+	}
+
+	if _, err := New().WithProvider(srv.URL).Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Values("Authorization"); len(got) != 0 {
+		t.Errorf("Authorization = %v without WithToken, want none", got)
+	}
+}
+
+// TestWithHeaderBeatsWithToken pins that WithToken is a mint default like
+// User-Agent: an explicit Authorization header, from code or the env mirror,
+// replaces it rather than stacking a second value.
+func TestWithHeaderBeatsWithToken(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b := New().WithProvider(srv.URL).WithHeader("Authorization", "Bearer x")
+	if _, err := b.WithToken("s3cret").Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Values("Authorization"); len(got) != 1 || got[0] != "Bearer x" {
+		t.Errorf("Authorization = %v, want exactly [Bearer x] (WithHeader replaces the token)", got)
+	}
+
+	t.Setenv(v1.CloudflareHeadersEnv, "Authorization=Bearer env")
+	if _, err := New().WithProvider(srv.URL).WithToken("s3cret").Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Values("Authorization"); len(got) != 1 || got[0] != "Bearer env" {
+		t.Errorf("Authorization = %v, want exactly [Bearer env] (env headers replace the token)", got)
+	}
+}
+
+// TestTokenEnvBeatsCode pins the env mirror, on a backend-built provider and
+// on a QuickTunnel built directly: LIBTUNNEL_TOKEN replaces the code value.
+func TestTokenEnvBeatsCode(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+	t.Setenv(v1.TokenEnv, "from-env")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithProvider(srv.URL).WithToken("from-code").Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("Authorization"); got != "token from-env" {
+		t.Errorf("Authorization = %q, want the env token to beat code", got)
+	}
+
+	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("Authorization"); got != "token from-env" {
+		t.Errorf("Authorization = %q on a direct QuickTunnel, want the env token", got)
+	}
+}

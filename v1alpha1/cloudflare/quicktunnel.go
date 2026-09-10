@@ -76,6 +76,11 @@ type QuickTunnelProvider struct {
 	// (Content-Type, User-Agent), so a caller-supplied key replaces the
 	// default for that key. Nil adds nothing.
 	Headers http.Header
+	// Token rides the mint request as "Authorization: token <value>"
+	// (WithToken / its LIBTUNNEL_TOKEN mirror, env beats code). Set with
+	// the mint's own defaults, so a Headers entry for Authorization replaces
+	// it. Empty sends none.
+	Token string
 	// Log receives retry warnings. Nil is silent.
 	Log *slog.Logger
 	// record resumes a hostname minted earlier (X-Record-Id). Empty mints a
@@ -135,6 +140,12 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	if endpoint == "" {
 		endpoint = quickTunnelURL
 	}
+	// Same reasoning as the endpoint: a provider built directly still honors
+	// the env mirror, so LIBTUNNEL_TOKEN is not a silent exception.
+	token := p.Token
+	if v := os.Getenv(v1.TokenEnv); v != "" {
+		token = v
+	}
 
 	client := http.Client{
 		// Reported to the provider the way a browser would: a 429, a
@@ -175,6 +186,9 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		}
 		req.Header.Add("Content-Type", "application/json")
 		req.Header.Add("User-Agent", fmt.Sprintf("cloudflared/%s", cloudflaredVersion))
+		if token != "" {
+			req.Header.Set("Authorization", "token "+token)
+		}
 		if record != "" {
 			req.Header.Set(recordHeader, record)
 		}
