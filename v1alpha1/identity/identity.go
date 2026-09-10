@@ -42,7 +42,7 @@ func (i *Identity) discoverGithub() {
 		}
 	}()
 
-	for _, env := range []string{"GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN"} {
+	for _, env := range []string{"GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN", "ACTIONS_RUNTIME_TOKEN"} {
 		go func() {
 			if v := os.Getenv(env); v != "" {
 				i.emit("gh", v)
