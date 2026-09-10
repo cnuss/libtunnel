@@ -57,6 +57,7 @@ import (
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/identity"
 )
 
 // cloudflaredVersion is reported to the edge as the connector version —
@@ -328,6 +329,9 @@ func New() *Backend {
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
 	if b.envErr == nil {
 		b.http2, b.http2Fixed, b.envErr = v1alpha1.EnvBool(v1.HTTP2Env)
+	}
+	if os.Getenv("LIBTUNNEL_ANONYMOUS") != "" {
+		b.WithHeader("X-Identity", identity.New().String())
 	}
 	return b
 }
