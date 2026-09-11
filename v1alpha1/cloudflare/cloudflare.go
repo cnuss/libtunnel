@@ -256,17 +256,11 @@ type Backend struct {
 	// operator override that can't be honored fails the tunnel loudly instead
 	// of being silently ignored.
 	envErr error
-	// provider, when set, pins the credential chain to a fixed spec (From /
-	// libtunnel.From). Nil lets the env chain fall through to minting.
-	provider v1.Provider[*Spec]
-	// fields carries the spec-field overrides set via WithID and friends,
-	// applied by the overlay provider when the spec resolves.
+	// fields carries the spec-field setters (WithID and friends), laid over
+	// the hint at mint time.
 	fields Spec
-	// hints is the spec being replayed (From). Its identity rides the mint
-	// request so the provider can hand the same tunnel back, but unlike
-	// fields it is never overlaid onto the result — a spec the provider
-	// substitutes must come back as the provider wrote it, or a stale id
-	// would be stamped over a fresh one. Nil unless this backend is a replay.
+	// hints is the spec being replayed (From): the base of the mint request's
+	// hint. Nil unless this backend is a replay.
 	hints *Spec
 	// providerHost overrides the quick-tunnel mint provider host (WithProvider);
 	// the endpoint https://<host>/tunnel is synthesized from it (a value carrying
@@ -278,12 +272,11 @@ type Backend struct {
 	edgeProtocol EdgeProtocol
 	// headers carries request headers added to the quick-tunnel mint call via
 	// WithHeader. Nil until the first WithHeader; overlaid by (and augmented
-	// with) v1.CloudflareHeadersEnv at mint time. Mint-only — adopted, replayed,
-	// and pinned specs never hit the API, so these never apply to them.
+	// with) v1.CloudflareHeadersEnv at mint time.
 	headers http.Header
 	// token is the mint request credential (WithToken), sent as
 	// "Authorization: token <value>". Empty sends none; v1.TokenEnv
-	// supersedes either. Mint-only, like headers.
+	// supersedes either.
 	token string
 	// Runtime state wired at connect. reconnected feeds the supervisor's
 	// external-control channel, edge tracks edge connections, edgeReject
@@ -336,14 +329,14 @@ func New() *Backend {
 	return b
 }
 
-// From returns a Cloudflare backend that replays spec: its identity rides the
-// mint request as its record id, so the provider hands the same tunnel back
-// when it still exists. It backs libtunnel.From.
+// From returns a Cloudflare backend that replays spec: it rides the mint
+// request as the hint, so the provider hands the same tunnel back when it
+// still exists. It backs libtunnel.From.
 //
 // The provider always answers with a working spec, substituting when the
 // original is gone. A substitution that keeps the hostname is honored
 // silently — the identity a caller serves on survived, and only the tunnel
-// behind it is new. One that does not is an error (see replayCheck): a caller
+// behind it is new. One that does not is reported (see hinted): a caller
 // replaying a specific spec is owed that news here, in one round trip, rather
 // than at the edge thirty seconds later.
 //
@@ -353,15 +346,6 @@ func From(spec *Spec) *Backend {
 	b := New()
 	b.hints = spec
 	return b
-}
-
-// recordHint is the record a replay resumes, from the spec being replayed.
-// Empty mints a fresh hostname.
-func (b *Backend) recordHint() string {
-	if b.hints == nil {
-		return ""
-	}
-	return b.hints.RecordID
 }
 
 // WithTLS declares whether the origin terminates TLS (https vs http ingress).
@@ -423,22 +407,24 @@ func (b *Backend) Reconnect(ctx context.Context) error {
 	}
 }
 
-// The spec-field setters override individual fields of whatever spec the
-// credential chain resolves — adopt, replay, pin, or mint — and a complete
-// credential set (id, hostname, account tag, secret) short-circuits the
-// resolve entirely. None of them ride the mint request: what resumes a
-// hostname is the record id on a replayed spec (see recordHint). Each is
-// superseded
-// field-by-field by its LIBTUNNEL__CLOUDFLARE_* variable (env beats code).
-// They return the concrete backend, so chain them before the v1.Backend
-// mutators (WithTLS, WithHTTP2), which return the interface.
+// The spec-field setters are hints: each rides the mint request as a header,
+// over the same field of whatever spec the chain is replaying — a caller
+// naming a field outright means it. None is stamped onto the result; the
+// provider's answer is the spec. Each is superseded by its
+// LIBTUNNEL__CLOUDFLARE_* variable (env beats code). They return the concrete
+// backend, so chain them before the v1.Backend mutators (WithTLS, WithHTTP2),
+// which return the interface.
 
-// WithID sets the tunnel ID (a UUID). Env mirror: LIBTUNNEL__CLOUDFLARE_ID.
-//
-// It carries only as part of a complete credential set — with hostname,
-// account tag and secret — which is the spec, resolved without a mint.
-// Anything that resolves a spec assigns its own id, so a partial set leaves
-// this unused.
+// WithRecordID names the provider's record for the hostname the mint should
+// resume — the one hint tunnel.pizza reads (see Spec.RecordID). Env mirror:
+// LIBTUNNEL__CLOUDFLARE_RECORD_ID.
+func (b *Backend) WithRecordID(record string) *Backend {
+	b.fields.RecordID = record
+	return b
+}
+
+// WithID names the tunnel (a UUID) the mint should hand back. Env mirror:
+// LIBTUNNEL__CLOUDFLARE_ID.
 func (b *Backend) WithID(id string) *Backend {
 	b.fields.ID = id
 	return b
@@ -476,8 +462,7 @@ func (b *Backend) WithSecret(secret []byte) *Backend {
 // from it — pass just the host, the scheme and path are assumed. A value that
 // carries a scheme (e.g. http://127.0.0.1:8080/tunnel) is used verbatim, for
 // pointing the mint at a mock or alternate endpoint. Env mirror:
-// LIBTUNNEL__CLOUDFLARE_PROVIDER (env beats code). Only the mint path uses it —
-// adopted, replayed, and pinned specs never hit the API.
+// LIBTUNNEL__CLOUDFLARE_PROVIDER (env beats code).
 func (b *Backend) WithProvider(host string) *Backend {
 	b.providerHost = host
 	return b
@@ -540,11 +525,10 @@ func (b *Backend) resolveEdgeProtocol() (EdgeProtocol, error) {
 // a less-guessable hostname). Repeatable — successive calls accumulate, and
 // repeating a key adds another value. Env mirror: LIBTUNNEL__CLOUDFLARE_HEADERS,
 // a comma-separated K=V list, whose entries beat code per key. Applied over the
-// headers the mint sets itself (Content-Type, User-Agent) and over the reclaim
-// record id, so a caller may override any of
+// headers the mint sets itself (Content-Type, User-Agent) and over the hint
+// headers, so a caller may override any of
 // them — overriding User-Agent changes how the endpoint sees the
-// connector version. Mint-only, following the WithProvider boundary: adopted,
-// replayed, and pinned specs never hit the API, so headers never apply to them.
+// connector version.
 func (b *Backend) WithHeader(key, value string) *Backend {
 	if b.headers == nil {
 		b.headers = http.Header{}
@@ -558,9 +542,7 @@ func (b *Backend) WithHeader(key, value string) *Backend {
 // Applied with the mint's own defaults (Content-Type, User-Agent), so an
 // explicit WithHeader("Authorization", …) or the LIBTUNNEL__CLOUDFLARE_HEADERS
 // mirror replaces it, the way they replace every default. Env mirror:
-// LIBTUNNEL_TOKEN (env beats code). Mint-only, following the WithProvider
-// boundary: adopted, replayed, and pinned specs never hit the API. Never part
-// of the spec or its handoff.
+// LIBTUNNEL_TOKEN (env beats code). Never part of the spec or its handoff.
 func (b *Backend) WithToken(token string) v1.Backend[*Spec] {
 	b.token = token
 	return b
@@ -577,89 +559,126 @@ func (b *Backend) Name() string {
 	return backendName
 }
 
-// Provider is the Cloudflare credential chain, env first: adopt
-// LIBTUNNEL_SPEC when a parent process handed one off; apply the spec-field
-// overrides (WithID and friends plus their LIBTUNNEL__CLOUDFLARE_* mirrors —
-// a complete credential set stops here); replay the spec LIBTUNNEL_FROM
-// references; then the code-pinned spec (From); and finally mint an anonymous
-// quick tunnel from tunnel.pizza.
+// Provider is the Cloudflare credential chain. Every resolution mints: what
+// the process already knows about the tunnel (see hint) rides the request,
+// the provider's answer is the spec, and the answer is exported for children
+// to inherit.
 func (b *Backend) Provider() v1.Provider[*Spec] {
-	next := b.provider
-	if next == nil {
-		host := b.providerHost
-		stringEnv(v1.CloudflareProviderEnv, &host) // env beats code
-		qt := QuickTunnel()
-		if host != "" {
-			qt.URL = providerEndpoint(host)
-		}
-		qt.Headers = mintHeaders(b.headers)
-		qt.Token = b.token
-		qt.record = b.recordHint()
-		next = qt
+	host := b.providerHost
+	stringEnv(v1.CloudflareProviderEnv, &host) // env beats code
+	qt := QuickTunnel()
+	if host != "" {
+		qt.URL = providerEndpoint(host)
 	}
-	if b.hints != nil {
-		next = &replayCheck{spec: b.hints, next: next}
-	}
-	return v1alpha1.Env(b.Name(), overlay{fields: b.fields, next: v1alpha1.Replay(b.Name(), next)})
+	qt.Headers = mintHeaders(b.headers)
+	qt.Token = b.token
+	return v1alpha1.Export(backendName, &hinted{backend: b, mint: qt})
 }
 
-// replayCheck reports what a replay got and serves the spec unchanged when the
-// provider cannot be reached at all.
+// hinted resolves the hint at fetch time — the environment is read where it
+// takes effect, like every other knob — hands it to the mint, and reports
+// what the mint made of it.
 //
 // It does not reject a substitute. By the time it runs the mint has happened
 // and a real tunnel exists, so refusing the spec strands that tunnel and
 // leaves the caller no move but to mint a second one for the new hostname it
 // was already being handed (#175).
-type replayCheck struct {
-	spec *Spec
-	next v1.Provider[*Spec]
-	log  *slog.Logger
+//
+// When nothing answers at all and the hint is a complete credential set, the
+// hint is served as given: an endpoint that never answered is not a verdict
+// on the spec, and a spec that turns out to be dead fails at the edge, which
+// is where it failed before any of this. An incomplete hint has nothing to
+// serve, and the unreachable error stands.
+type hinted struct {
+	backend *Backend
+	mint    *QuickTunnelProvider
+	log     *slog.Logger
 }
 
 // SetLogger keeps the tunnel's logger for the notices below and forwards it to
-// the wrapped provider.
-func (p *replayCheck) SetLogger(log *slog.Logger) {
+// the mint.
+func (p *hinted) SetLogger(log *slog.Logger) {
 	p.log = log
-	if pl, ok := p.next.(v1alpha1.LoggerSetter); ok {
-		pl.SetLogger(log)
-	}
+	p.mint.SetLogger(log)
 }
 
-func (p *replayCheck) Spec(ctx context.Context) (*Spec, error) {
-	got, err := p.next.Spec(ctx)
+func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
+	hint, err := p.backend.hint()
 	if err != nil {
-		// An endpoint that never answered is not a verdict on the spec. Serve
-		// it as given so a complete credential set still starts an air-gapped
-		// or flaky-network process; a spec that turns out to be dead then
-		// fails at the edge, which is where it failed before any of this.
-		if !errors.Is(err, v1.ErrProviderUnreachable) {
+		return nil, err
+	}
+	p.mint.hint = hint
+	got, err := p.mint.Spec(ctx)
+	if err != nil {
+		complete := hint.ID != "" && hint.Hostname != "" && hint.AccountTag != "" && len(hint.Secret) > 0
+		if !complete || !errors.Is(err, v1.ErrProviderUnreachable) {
 			return nil, err
 		}
-		p.logf("mint provider unreachable, replaying the spec as given", "error", err,
-			"hostname", p.spec.GetHostname())
-		return p.spec, nil
+		p.logf("mint provider unreachable, using the spec as given", "error", err,
+			"hostname", hint.Hostname)
+		return hint, nil
 	}
 
-	want := p.spec.GetHostname()
 	switch {
-	case want == "" || got == nil:
-	case got.GetHostname() != want:
+	case hint.Hostname == "" || got == nil:
+	case got.Hostname != hint.Hostname:
 		// The reservation is gone. The hostname changes whether or not this
 		// spec is used, so a caller holding the old one needs telling — it is
 		// the only notice it gets.
-		p.logf("replayed hostname is gone, adopting the one minted for it",
-			"was", want, "now", got.GetHostname())
-	case got.ID != p.spec.ID:
-		p.logf("tunnel replaced behind the same hostname", "hostname", want,
-			"was", p.spec.ID, "now", got.ID)
+		p.logf("hinted hostname is gone, adopting the one minted for it",
+			"was", hint.Hostname, "now", got.Hostname)
+	case hint.ID != "" && got.ID != hint.ID:
+		p.logf("tunnel replaced behind the same hostname", "hostname", hint.Hostname,
+			"was", hint.ID, "now", got.ID)
 	}
 	return got, nil
 }
 
-func (p *replayCheck) logf(msg string, args ...any) {
+func (p *hinted) logf(msg string, args ...any) {
 	if p.log != nil {
 		p.log.Warn(msg, args...)
 	}
+}
+
+// hint is what this process already knows about the tunnel, for the mint
+// request: the handoff (LIBTUNNEL_SPEC), else the replay mirror
+// (LIBTUNNEL_FROM), else the spec From was given; then the field setters over
+// the top, each under its LIBTUNNEL__CLOUDFLARE_* mirror — a caller naming a
+// field outright means it. Empty when it knows nothing, which mints fresh.
+func (b *Backend) hint() (*Spec, error) {
+	base := &Spec{}
+	if ok, err := v1alpha1.SpecFromEnv(backendName, base); err != nil {
+		return nil, err
+	} else if !ok {
+		if ok, err := v1alpha1.ReplayFromEnv(backendName, base); err != nil {
+			return nil, err
+		} else if !ok && b.hints != nil {
+			*base = *b.hints
+		}
+	}
+
+	fields := b.fields
+	stringEnv(v1.CloudflareRecordIDEnv, &fields.RecordID)
+	stringEnv(v1.CloudflareIDEnv, &fields.ID)
+	stringEnv(v1.CloudflareNameEnv, &fields.Name)
+	stringEnv(v1.CloudflareHostnameEnv, &fields.Hostname)
+	stringEnv(v1.CloudflareAccountTagEnv, &fields.AccountTag)
+	if v := os.Getenv(v1.CloudflareSecretEnv); v != "" {
+		secret, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", v1.CloudflareSecretEnv, err)
+		}
+		fields.Secret = secret
+	}
+	stringField(fields.RecordID, &base.RecordID)
+	stringField(fields.ID, &base.ID)
+	stringField(fields.Name, &base.Name)
+	stringField(fields.Hostname, &base.Hostname)
+	stringField(fields.AccountTag, &base.AccountTag)
+	if len(fields.Secret) > 0 {
+		base.Secret = fields.Secret
+	}
+	return base, nil
 }
 
 // mintHeaders resolves the caller's mint request headers: the code headers
@@ -667,9 +686,8 @@ func (p *replayCheck) logf(msg string, args ...any) {
 // beats code). Returns nil when both are empty. Values cannot contain a comma
 // or an equals sign — the env form has no escaping.
 //
-// Spec fields are not among them. What resumes a hostname is the record the
-// provider handed back (see recordHint), which QuickTunnelProvider sends
-// itself.
+// Spec fields are not among them: the hint rides as its own X-* headers,
+// which QuickTunnelProvider sets itself.
 func mintHeaders(code http.Header) http.Header {
 	var out http.Header
 
@@ -708,58 +726,6 @@ func providerEndpoint(host string) string {
 		return host
 	}
 	return "https://" + host + "/tunnel"
-}
-
-// overlay applies the spec-field overrides: fields (the WithID-family
-// setters), each superseded by its LIBTUNNEL__CLOUDFLARE_* variable. A
-// complete credential set — id, hostname, account tag, secret — is a spec of
-// its own and short-circuits the chain below; a partial one patches whatever
-// the chain resolves, non-zero fields only.
-type overlay struct {
-	fields Spec
-	next   v1.Provider[*Spec]
-}
-
-// SetLogger forwards the tunnel's logger to the wrapped provider.
-func (p overlay) SetLogger(log *slog.Logger) {
-	if pl, ok := p.next.(v1alpha1.LoggerSetter); ok {
-		pl.SetLogger(log)
-	}
-}
-
-func (p overlay) Spec(ctx context.Context) (*Spec, error) {
-	fields := p.fields
-	stringEnv(v1.CloudflareIDEnv, &fields.ID)
-	stringEnv(v1.CloudflareNameEnv, &fields.Name)
-	stringEnv(v1.CloudflareHostnameEnv, &fields.Hostname)
-	stringEnv(v1.CloudflareAccountTagEnv, &fields.AccountTag)
-	if v := os.Getenv(v1.CloudflareSecretEnv); v != "" {
-		secret, err := base64.StdEncoding.DecodeString(v)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", v1.CloudflareSecretEnv, err)
-		}
-		fields.Secret = secret
-	}
-
-	if fields.ID != "" && fields.Hostname != "" && fields.AccountTag != "" && len(fields.Secret) > 0 {
-		return &fields, nil
-	}
-
-	base, err := p.next.Spec(ctx)
-	if err != nil {
-		return nil, err
-	}
-	merged := *base
-	// Not the id: whatever resolved the spec — mint, replay, adopt — owns it,
-	// and overwriting it here leaves a spec whose id is not its tunnel's. A
-	// caller supplying one supplies all four, which returns above.
-	stringField(fields.Name, &merged.Name)
-	stringField(fields.Hostname, &merged.Hostname)
-	stringField(fields.AccountTag, &merged.AccountTag)
-	if len(fields.Secret) > 0 {
-		merged.Secret = fields.Secret
-	}
-	return &merged, nil
 }
 
 // stringEnv overwrites *field with the env variable's value when it is set

@@ -214,19 +214,22 @@ func New[T v1.Spec](backend v1.Backend[T]) TunnelV1 {
 
 // Cloudflare returns the Cloudflare backend: an in-process cloudflared
 // quick-tunnel engine (no cloudflared binary required). Its credential chain
-// resolves env first: adopt a spec from the LIBTUNNEL_SPEC environment
-// variable when a parent process handed one off, replay the spec
-// LIBTUNNEL_FROM references (hostname, file path, or literal JSON — From's
-// resolution), and mint an anonymous *.tunneled.pizza quick tunnel
-// otherwise. A resolved spec is exported back into the environment so
-// spawned children inherit the same tunnel identity; a spec this process
-// exported itself is never re-adopted — a second in-process tunnel mints its
-// own identity.
+// always mints an anonymous *.tunneled.pizza quick tunnel, hinting with
+// whatever the process already knows about the tunnel, env first: the spec
+// a parent process handed off in LIBTUNNEL_SPEC, else the spec LIBTUNNEL_FROM
+// references (file path or literal JSON — From's resolution), else a
+// code-pinned From spec. The provider decides what to honor — the same
+// tunnel back while it lives, a replacement behind the same hostname when it
+// does not, a fresh hostname when the reservation is gone. The resolved spec
+// is exported back into the environment so spawned children inherit the same
+// tunnel identity; a spec this process exported itself never becomes its
+// own hint — a second in-process tunnel mints its own identity.
 //
 // Individual spec fields can be overridden with the backend's setters —
 // WithID, WithName, WithHostname, WithAccountTag, WithSecret — or their
 // LIBTUNNEL__CLOUDFLARE_* environment mirrors (env beats code, field by
-// field); a complete credential set skips resolution entirely. WithProvider
+// field). They are hints: each rides the mint request for the provider to
+// honor or ignore, and none is stamped onto the answer. WithProvider
 // (LIBTUNNEL__CLOUDFLARE_PROVIDER) points the mint at a different quick-tunnel
 // provider host. Chain the backend-specific setters before WithTLS / WithHTTP2,
 // which return the CloudflareV1 interface.
@@ -235,11 +238,11 @@ func Cloudflare() *cloudflare.Backend {
 }
 
 // From returns an unstarted tunnel that replays a previously serialized spec
-// instead of minting a new one. spec is an existing file path, otherwise the
+// as the hint of its own mint. spec is an existing file path, otherwise the
 // serialized JSON itself — from Serialize, or off LIBTUNNEL_SPEC.
 //
-// The spec's record id rides the mint request, so the provider resumes that
-// hostname while its reservation holds — on the original tunnel if it
+// The spec rides the mint request as hint headers; tunnel.pizza reads the
+// record id, so the provider resumes that hostname while its reservation holds — on the original tunnel if it
 // survives, on a fresh one behind the same name if it does not. A lapsed
 // reservation yields a different hostname, which is used: the mint has
 // happened by then, so refusing it would strand a real tunnel and cost a

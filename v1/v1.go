@@ -211,22 +211,23 @@ func Budget(err error) time.Duration {
 // effect, so the pure-lazy contract holds.
 const (
 	// SpecEnv carries a JSON-encoded spec across a process boundary — the
-	// parent→child handoff channel. A parent that mints a spec exports it
-	// here; a child adopts it at construction and connects under the same
-	// hostname and credentials. The value is a tagged envelope (the backend
-	// that minted it plus its spec), so a child running a different backend
-	// fails loudly. First in the credential chain: it beats FromEnv and a
-	// code-pinned From spec.
+	// parent→child handoff channel. A parent that resolves a spec exports it
+	// here; a child sends it as the hint of its own mint, so the provider
+	// hands the same tunnel back and it connects under the same hostname.
+	// The value is a tagged envelope (the backend that minted it plus its
+	// spec), so a child running a different backend fails loudly. First in
+	// the hint order: it beats FromEnv and a code-pinned From spec.
 	SpecEnv = "LIBTUNNEL_SPEC"
 	// HostnameEnv is a plain-text mirror of the exported spec's hostname, set
 	// alongside SpecEnv for tooling that wants the public hostname without
-	// parsing the envelope. Export-only: libtunnel never adopts it.
+	// parsing the envelope. Export-only: libtunnel never reads it.
 	HostnameEnv = "LIBTUNNEL_HOSTNAME"
-	// FromEnv replays a serialized spec by reference — hostname, file path,
-	// or literal JSON, resolved exactly like libtunnel.From — as From's
-	// environment mirror. Second in the credential chain: after SpecEnv,
-	// before a code-pinned From spec and minting. An unresolvable or
-	// foreign-backend reference is an error, not a fallthrough.
+	// FromEnv replays a serialized spec by reference — file path or literal
+	// JSON, resolved exactly like libtunnel.From — as From's environment
+	// mirror: the spec is the hint of this process's own mint. Second in the
+	// hint order: after SpecEnv, before a code-pinned From spec. An
+	// unresolvable or foreign-backend reference is an error, not a
+	// fallthrough.
 	FromEnv = "LIBTUNNEL_FROM"
 	// LocalURLEnv overrides the local origin with a URL — WithLocalURL's
 	// environment mirror. Consulted at origin-provide time (WithListener,
@@ -242,9 +243,9 @@ const (
 	// rules as TLSEnv.
 	HTTP2Env = "LIBTUNNEL_HTTP2"
 	// TokenEnv mirrors Tunnel.WithToken: the credential sent on the mint
-	// request as "Authorization: token <value>" (env beats code). Only the
-	// mint path uses it — adopted, replayed, and pinned specs never hit the
-	// API — and it is never part of the spec or its handoff.
+	// request as "Authorization: token <value>" (env beats code). Every
+	// resolution mints, so it always rides; it is never part of the spec or
+	// its handoff.
 	TokenEnv = "LIBTUNNEL_TOKEN"
 	// LogEnv names the level (debug|info|warn|error) of the default logger:
 	// set, a tunnel with no WithLogger call logs to stderr at that level
@@ -266,10 +267,10 @@ const (
 // The Cloudflare backend's variables, following the backend-scoped
 // LIBTUNNEL__<BACKEND>_<FIELD> pattern (double underscore namespaces the
 // backend). Each mirrors a spec-field setter on the Cloudflare backend —
-// WithID, WithName, WithHostname, WithAccountTag, WithSecret — and env beats
-// code, field by field, applied when the spec resolves: a complete credential
-// set (id, hostname, account tag, secret) is a spec of its own and skips
-// resolution, a partial one patches whatever the chain resolves.
+// WithRecordID, WithID, WithName, WithHostname, WithAccountTag, WithSecret —
+// and env beats code, field by field. They are hints: each rides the mint
+// request as a header for the provider to honor or ignore, over the same
+// field of whatever spec is being replayed; none is stamped onto the result.
 const (
 	// CloudflareEnv activates the Cloudflare backend in an env-only launcher
 	// (cmd/libtunnel): set it to "1" to select Cloudflare when no spec
@@ -280,6 +281,10 @@ const (
 	// Cloudflare, since the handoff envelope already names its backend.
 	CloudflareEnv = "LIBTUNNEL__CLOUDFLARE"
 
+	// CloudflareRecordIDEnv names the provider's record for the hostname a
+	// pinned credential set wants back — the one handle tunnel.pizza resumes
+	// a hostname by (see Spec.RecordID).
+	CloudflareRecordIDEnv   = "LIBTUNNEL__CLOUDFLARE_RECORD_ID"
 	CloudflareIDEnv         = "LIBTUNNEL__CLOUDFLARE_ID"
 	CloudflareNameEnv       = "LIBTUNNEL__CLOUDFLARE_NAME"
 	CloudflareHostnameEnv   = "LIBTUNNEL__CLOUDFLARE_HOSTNAME"
@@ -360,8 +365,8 @@ type Backend[T Spec] interface {
 	// Name identifies the backend (e.g. "cloudflare").
 	Name() string
 	// Provider is the credential chain this backend draws specs from. For
-	// Cloudflare: adopt LIBTUNNEL_SPEC from the environment when present,
-	// otherwise mint an anonymous quick tunnel.
+	// Cloudflare: mint an anonymous quick tunnel, hinting with the spec
+	// LIBTUNNEL_SPEC or LIBTUNNEL_FROM carries, or From was given.
 	Provider() Provider[T]
 	// WithTLS declares whether the local origin terminates TLS. True dials the
 	// listener over https (verification is off, so a self-signed cert is fine);
@@ -377,9 +382,9 @@ type Backend[T Spec] interface {
 	// fixes it from the environment under the same rules as WithTLS.
 	WithHTTP2(bool) Backend[T]
 	// WithToken sets the credential the mint request carries, as
-	// "Authorization: token <value>". Mint-only: adopted, replayed, and
-	// pinned specs never hit the API, so a token never applies to them, and
-	// it is never part of the spec or its handoff. A backend whose provider
+	// "Authorization: token <value>". Every resolution mints — a handoff, a
+	// replay and a pinned field set all ask the provider — so the token
+	// always rides; it is never part of the spec or its handoff. A backend whose provider
 	// has no notion of a token accepts and ignores it. Chainable. The
 	// LIBTUNNEL_TOKEN environment variable beats it.
 	WithToken(token string) Backend[T]
@@ -520,9 +525,9 @@ type Tunnel interface {
 	// credentials, once — as "Authorization: token <value>" on the mint
 	// request (see Backend.WithToken). It must be called before the first
 	// spec fetch; the fetch fixes the value, so a later call is a no-op. An
-	// empty token is ignored. Mint-only, and never part of the spec: an
-	// adopted or replayed spec never uses it, and a handoff never carries
-	// it. The LIBTUNNEL_TOKEN environment variable beats it.
+	// empty token is ignored. Never part of the spec: a handoff never
+	// carries it, and a child's own mint sends its own. The LIBTUNNEL_TOKEN
+	// environment variable beats it.
 	WithToken(token string) Tunnel
 	// WithListener provides the local origin as a listener and lazily starts
 	// the edge connection. The origin scheme is not inferred from the

@@ -23,10 +23,10 @@ type specEnvelope struct {
 }
 
 // selfExported records v1.SpecEnv values this process exported itself, so
-// SpecFromEnv never re-adopts them: the handoff is parent→child inheritance,
+// SpecFromEnv never hands them back: the handoff is parent→child inheritance,
 // not tunnel→tunnel within a process. Without this, a second in-process
-// tunnel would race to adopt the first tunnel's identity the moment its mint
-// exported, putting two connectors behind one hostname.
+// tunnel would take the first tunnel's identity as its hint the moment its
+// mint exported, and ask the provider for the same tunnel.
 var (
 	selfExportedMu sync.Mutex
 	selfExported   = map[string]bool{}
@@ -54,57 +54,36 @@ func (p staticProvider[T]) Spec(context.Context) (T, error) {
 	return p.spec, nil
 }
 
-// Env wraps a provider with LIBTUNNEL_SPEC handling for the named backend: when
-// the environment carries a spec inherited from a parent process, it wins;
-// otherwise the wrapped provider resolves one and the result is exported back
-// into this process's environment, so spawned children inherit the same
-// tunnel identity with no further plumbing. A spec this process exported
-// itself is never re-adopted — a second in-process tunnel mints its own
-// identity. E is the concrete spec struct (e.g. cloudflare.Spec) — inferred
-// from the wrapped provider's *E spec type.
-func Env[E any, T interface {
-	*E
-	v1.Spec
-}](backend string, next v1.Provider[T]) v1.Provider[T] {
-	return envProvider[E, T]{backend: backend, next: next}
+// Export wraps a provider so the spec it resolves is published into this
+// process's environment as LIBTUNNEL_SPEC, and spawned children inherit the
+// same tunnel identity with no further plumbing. Every resolution is
+// exported: a child that re-minted on its parent's hint hands its own
+// children what the provider answered, not what it inherited.
+func Export[T v1.Spec](backend string, next v1.Provider[T]) v1.Provider[T] {
+	return exportProvider[T]{backend: backend, next: next}
 }
 
-type envProvider[E any, T interface {
-	*E
-	v1.Spec
-}] struct {
+type exportProvider[T v1.Spec] struct {
 	backend string
 	next    v1.Provider[T]
 }
 
 // SetLogger forwards the tunnel's logger to the wrapped provider.
-func (p envProvider[E, T]) SetLogger(log *slog.Logger) {
+func (p exportProvider[T]) SetLogger(log *slog.Logger) {
 	if pl, ok := p.next.(LoggerSetter); ok {
 		pl.SetLogger(log)
 	}
 }
 
-func (p envProvider[E, T]) Spec(ctx context.Context) (T, error) {
-	spec := T(new(E))
-	ok, err := SpecFromEnv(p.backend, spec)
+func (p exportProvider[T]) Spec(ctx context.Context) (T, error) {
+	spec, err := p.next.Spec(ctx)
 	if err != nil {
 		var zero T
 		return zero, err
 	}
-	if ok {
-		return spec, nil
-	}
-
-	minted, err := p.next.Spec(ctx)
-	if err != nil {
-		var zero T
-		return zero, err
-	}
-	// Export the freshly minted spec so children of this process inherit it.
-	// Best effort: a marshal/setenv failure shouldn't fail the tunnel. Only
-	// the mint path lands here — adopted specs are not re-exported.
-	_ = ExportSpec(p.backend, minted)
-	return minted, nil
+	// Best effort: a marshal/setenv failure shouldn't fail the tunnel.
+	_ = ExportSpec(p.backend, spec)
+	return spec, nil
 }
 
 // EncodeSpec returns spec as a tagged-envelope JSON string — the value carried
@@ -148,7 +127,7 @@ func SpecEnviron[T v1.Spec](backend string, spec T) (string, error) {
 
 // ExportSpec publishes spec into this process's own environment so re-exec'd
 // or spawned children inherit it. The exported value is remembered and never
-// re-adopted by this process's own SpecFromEnv (see Env). It also sets
+// handed back by this process's own SpecFromEnv (see Export). It also sets
 // v1.HostnameEnv to the spec's plain hostname as a convenience mirror.
 func ExportSpec[T v1.Spec](backend string, spec T) error {
 	entry, err := SpecEnviron(backend, spec)
@@ -163,13 +142,13 @@ func ExportSpec[T v1.Spec](backend string, spec T) error {
 		return err
 	}
 	// Best effort: the hostname mirror is convenience only, not the channel
-	// libtunnel adopts, so a failure here shouldn't fail the export.
+	// libtunnel reads, so a failure here shouldn't fail the export.
 	_ = os.Setenv(v1.HostnameEnv, spec.GetHostname())
 	return nil
 }
 
 // SpecFromEnv decodes LIBTUNNEL_SPEC into the caller-allocated spec. It reports
-// whether a spec was adopted; a present-but-malformed value, or one minted by
+// whether one was present; a present-but-malformed value, or one minted by
 // a different backend, is an error. A value this process exported itself
 // (ExportSpec) reads as absent — the handoff channel carries parent→child
 // inheritance only.

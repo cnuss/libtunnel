@@ -152,16 +152,17 @@ type Spec interface {
 // façade
 func New[T v1.Spec](backend v1.Backend[T]) v1.Tunnel // T wires the backend, not the result
 func Cloudflare() v1.Backend[*cloudflare.Spec]   // in-process cloudflared engine;
-                                                 // adopts LIBTUNNEL_SPEC, else mints
-                                                 // an anonymous quick tunnel
-func From(spec string) v1.Tunnel                 // replay a serialized spec (JSON,
-                                                 // file path, or cached hostname)
+                                                 // mints an anonymous quick tunnel,
+                                                 // hinting with whatever it knows
+func From(spec string) v1.Tunnel                 // replay a serialized spec (JSON
+                                                 // or file path) as the mint's hint
 func Version() string                            // the libtunnel release this build
                                                  // links against (matches the git tag
                                                  // and the container image tag)
 
-// parent→child handoff — no API: minting exports the LIBTUNNEL_SPEC env var,
-// construction adopts it
+// parent→child handoff: minting exports the LIBTUNNEL_SPEC env var, and the
+// child's own mint sends it as its hint, so the provider hands the same
+// tunnel back
 ```
 
 ## Failure classes
@@ -356,17 +357,19 @@ func reconnectOnWatch() libtunnel.Interceptor {
 
 ## Parent→child handoff
 
-`LIBTUNNEL_SPEC` is a first-class handoff channel with nothing to call: when
-the Cloudflare credential chain mints a spec it exports it into the
-process's environment, and at construction it adopts one found there. A
-spawned child (or a re-exec) therefore connects under the same hostname —
-no second quick-tunnel resolution, no plumbing. The export also sets
-`LIBTUNNEL_HOSTNAME` to the plain hostname, so tooling can read it without
-parsing the envelope (libtunnel itself adopts `LIBTUNNEL_SPEC`, not this).
+`LIBTUNNEL_SPEC` is a first-class handoff channel with no plumbing: when the
+Cloudflare credential chain resolves a spec it exports it into the process's
+environment, and a child (or a re-exec) finds it there and sends it as the
+hint of its own mint. The provider hands the same tunnel back while it
+lives — the child is a second connector on it — and a replacement behind
+the same hostname if it does not, so the child connects under the parent's
+hostname either way. The export also sets `LIBTUNNEL_HOSTNAME` to the plain
+hostname, so tooling can read it without parsing the envelope (libtunnel
+itself reads `LIBTUNNEL_SPEC`, not this).
 
-Two guardrails keep the channel safe: a process never re-adopts a spec it
+Two guardrails keep the channel safe: a process never hints with a spec it
 exported itself (a second tunnel in the same process mints its own identity
-instead of inheriting the first one's), and the exported value is tagged
+instead of asking for the first one's), and the exported value is tagged
 with the backend that minted it, so a child running a different backend
 fails loudly instead of silently unmarshaling a foreign spec.
 
@@ -376,7 +379,7 @@ fails loudly instead of silently unmarshaling a foreign spec.
 libtunnel.New(libtunnel.Cloudflare()).Hostname()
 cmd := exec.Command(os.Args[0], "child") // inherits the environment
 
-// child: the Cloudflare credential chain finds LIBTUNNEL_SPEC and adopts it
+// child: the Cloudflare credential chain finds LIBTUNNEL_SPEC and mints on it
 conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 ```
 
@@ -400,8 +403,10 @@ What comes back decides the outcome:
 | a different hostname | it connects on that one, and says so at warn level |
 | nothing (the provider cannot be reached) | the spec is replayed as given |
 
-A replay hands the provider the spec's **record id** — the handle on the DNS
-record reserving that hostname — and it answers on the same hostname while the
+A replay hands the provider the whole spec as hint headers (`X-Record-Id`,
+`X-Id`, `X-Name`, `X-Hostname`, `X-Account-Tag`, `X-Secret`) and the provider
+decides what to honor. tunnel.pizza reads the **record id** — the handle on the
+DNS record reserving that hostname — and answers on the same hostname while the
 reservation holds, whatever became of the tunnel behind it. If the reservation
 is gone it mints a fresh one, and libtunnel uses that: the tunnel exists by
 then either way, and refusing it would only cost a second mint for the same new
@@ -435,35 +440,38 @@ rebuild. (The one exception is noted below.)
 
 | Variable | Mirrors | Behavior |
 | -------- | ------- | -------- |
-| `LIBTUNNEL_SPEC` | — | Parent→child handoff: a serialized spec adopted at construction (see above). Beats everything, including a code-pinned `From` spec. |
-| `LIBTUNNEL_FROM` | `From()` | Replay a spec by hostname, file path, or literal JSON — `From`'s resolution. Applies after `LIBTUNNEL_SPEC`, before the code-pinned spec and minting. |
+| `LIBTUNNEL_SPEC` | — | Parent→child handoff: a serialized spec sent as the hint of this process's own mint (see above). Beats every other hint, including a code-pinned `From` spec. |
+| `LIBTUNNEL_FROM` | `From()` | Replay a spec by file path or literal JSON — `From`'s resolution, as the mint's hint. Applies after `LIBTUNNEL_SPEC`, before the code-pinned spec. |
 | `LIBTUNNEL_LOCAL_URL` | `WithLocalURL()` | Origin override, applied at origin-provide time: supersedes a `WithListener` listener, a `WithLocalURL` argument, and the start-trigger mint. Invalid value cancels the tunnel. |
 | `LIBTUNNEL_TLS` | `WithTLS()` | Bool (`strconv.ParseBool`). Fixed at backend construction; later `WithTLS` calls are no-ops. Unparsable value fails at connect. |
 | `LIBTUNNEL_HTTP2` | `WithHTTP2()` | Same rules as `LIBTUNNEL_TLS`. |
-| `LIBTUNNEL_TOKEN` | `WithToken()` | Credential on the mint request, sent as `Authorization: token <value>`. Mint-only: never used by an adopted or replayed spec, never part of the spec or its handoff. An explicit `WithHeader("Authorization", …)` / `LIBTUNNEL__CLOUDFLARE_HEADERS` entry replaces it. |
+| `LIBTUNNEL_TOKEN` | `WithToken()` | Credential on the mint request, sent as `Authorization: token <value>`. Every resolution mints, so it always rides; never part of the spec or its handoff. An explicit `WithHeader("Authorization", …)` / `LIBTUNNEL__CLOUDFLARE_HEADERS` entry replaces it. |
 | `LIBTUNNEL_LOG` | `WithLogger()` | `debug`\|`info`\|`warn`\|`error`: the default logger becomes a stderr text logger at that level instead of silent. *The exception:* an explicit `WithLogger` keeps its handler — env carries a level, not a sink. |
 | `LIBTUNNEL_NO_REPORT` | — | Set to anything to stop the mint client reporting network errors to the provider. On by default: like a browser, it honors the provider's `NEL` + `Report-To` headers and posts a 4xx, timeout, DNS or TLS failure to the collector they name (for tunnel.pizza, Cloudflare's, into the zone's NEL analytics). Never carries credentials. |
-| `LIBTUNNEL_HOSTNAME` | — | Export-only mirror of the minted spec's hostname, for tooling; never adopted. |
+| `LIBTUNNEL_HOSTNAME` | — | Export-only mirror of the minted spec's hostname, for tooling; never read. |
 
 Backend-scoped variables follow `LIBTUNNEL__<BACKEND>_<FIELD>` (double
 underscore namespaces the backend) and live with their backend package. For
 Cloudflare, each mirrors a spec-field setter on the backend — env beats code,
-field by field, patched onto whatever spec the chain resolves; a complete
-credential set (id, hostname, account tag, secret) skips resolution entirely.
-When the chain does mint, the fields known beforehand also ride the mint
-request as its record id — so a
-provider that reaps idle tunnels can hand the matching tunnel back instead of
-minting fresh. Only fields the caller supplies become hints:
+field by field. They are hints: every one rides the mint request as a header
+(`X-Record-Id`, `X-Id`, `X-Name`, `X-Hostname`, `X-Account-Tag`, `X-Secret`),
+over the same field of whatever spec is being replayed, and the provider
+decides what to honor — tunnel.pizza reads the record id, so a provider that
+reaps idle tunnels can hand the matching tunnel back instead of minting fresh.
+None is stamped onto the result; the provider's answer is the spec. With no
+network at all, a complete credential set (id, hostname, account tag, secret)
+starts as given.
 
 | Variable | Mirrors |
 | -------- | ------- |
+| `LIBTUNNEL__CLOUDFLARE_RECORD_ID` | `WithRecordID()` |
 | `LIBTUNNEL__CLOUDFLARE_ID` | `WithID()` |
 | `LIBTUNNEL__CLOUDFLARE_NAME` | `WithName()` |
 | `LIBTUNNEL__CLOUDFLARE_HOSTNAME` | `WithHostname()` |
 | `LIBTUNNEL__CLOUDFLARE_ACCOUNT_TAG` | `WithAccountTag()` |
 | `LIBTUNNEL__CLOUDFLARE_SECRET` | `WithSecret()` (base64) |
 | `LIBTUNNEL__CLOUDFLARE_PROVIDER` | `WithProvider()` — quick-tunnel provider host, default `tunnel.pizza` (endpoint `https://<host>/tunnel` synthesized; a value with a scheme is used verbatim) |
-| `LIBTUNNEL__CLOUDFLARE_HEADERS` | `WithHeader()` — request headers on the mint call, comma-separated `K=V` (e.g. `X-Opaque=true`, or `X-Ephemeral=true` to mark the mint unreclaimable once reaped); entries beat code per key. No escaping — values can't contain `,` or `=`. Mint-only. |
+| `LIBTUNNEL__CLOUDFLARE_HEADERS` | `WithHeader()` — request headers on the mint call, comma-separated `K=V` (e.g. `X-Opaque=true`, or `X-Ephemeral=true` to mark the mint unreclaimable once reaped); entries beat code per key. No escaping — values can't contain `,` or `=`. |
 | `LIBTUNNEL__CLOUDFLARE_EDGE_PROTOCOL` | `WithEdgeProtocol()` — pins the edge transport: `quic`, `http2`, or `auto`. Unset is `auto`, where cloudflared chooses and falls back on its own. Pin `http2` where UDP is dropped, `quic` to refuse the fallback. An unrecognized value fails the tunnel. |
 
 The Cloudflare backend also has a bare activation switch, `LIBTUNNEL__CLOUDFLARE=1`,

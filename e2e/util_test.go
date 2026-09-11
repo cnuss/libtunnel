@@ -350,8 +350,8 @@ func serveBody(l net.Listener, body string) *http.Server {
 }
 
 // adoptPreflightSpec hands the shared preflight mint to a tunnel through the
-// environment, so a live test reuses that spec instead of minting its own (the
-// Cloudflare chain adopts LIBTUNNEL_SPEC before minting). Same move
+// environment, so a live test's mint hints with it and the provider hands that
+// tunnel back instead of a new hostname. Same move
 // TestLiveTunnel makes — it keeps the live tier's mint count down.
 func adoptPreflightSpec(t *testing.T) {
 	t.Helper()

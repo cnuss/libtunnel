@@ -38,9 +38,12 @@ import (
 // TestWithListenerRejectsMalformedSpecID pins the fail-fast contract: a spec
 // whose ID is not a UUID (e.g. a corrupted LIBTUNNEL_SPEC handoff) must cancel
 // the tunnel with a descriptive cause instead of registering the zero UUID
-// with the edge. Runs offline — the ID check fires before any network use.
+// with the edge. The provider echoes the corrupt hint back, so the ID check
+// is what fails.
 func TestWithListenerRejectsMalformedSpecID(t *testing.T) {
+	clearSpecEnv(t)
 	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	srv := echoServer(t)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -48,7 +51,7 @@ func TestWithListenerRejectsMalformedSpecID(t *testing.T) {
 	}
 	defer l.Close()
 
-	conn := v1alpha1.New(New()).WithListener(l)
+	conn := v1alpha1.New(New().WithProvider(srv.URL)).WithListener(l)
 	select {
 	case <-conn.Done():
 	case <-time.After(10 * time.Second):
@@ -98,27 +101,10 @@ func TestEnvKnobsUnsetLeaveCodeInCharge(t *testing.T) {
 // exactly the channel it stages.
 func clearSpecEnv(t *testing.T) {
 	t.Helper()
-	for _, v := range []string{v1.SpecEnv, v1.FromEnv, v1.CloudflareIDEnv, v1.CloudflareNameEnv,
+	for _, v := range []string{v1.SpecEnv, v1.FromEnv, v1.CloudflareRecordIDEnv, v1.CloudflareIDEnv, v1.CloudflareNameEnv,
 		v1.CloudflareHostnameEnv, v1.CloudflareAccountTagEnv, v1.CloudflareSecretEnv,
 		v1.CloudflareProviderEnv, v1.CloudflareHeadersEnv} {
 		t.Setenv(v, "")
-	}
-}
-
-// TestSpecFieldSettersPatchResolvedSpec pins the overlay: WithName patches the
-// field onto the spec the chain resolves.
-func TestSpecFieldSettersPatchResolvedSpec(t *testing.T) {
-	clearSpecEnv(t)
-	var seen http.Header
-	srv := mintServer(t, &seen)
-
-	b := New().WithProvider(srv.URL).WithName("patched")
-	spec, err := b.Provider().Spec(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if spec.Name != "patched" || spec.Hostname != "minted.tunneled.pizza" {
-		t.Errorf("spec = %+v, want Name patched onto the resolved spec", spec)
 	}
 }
 
@@ -132,7 +118,7 @@ func TestReplayedSpecIsNotOverlaid(t *testing.T) {
 	srv := mintServer(t, &seen)
 
 	// The hostname matches what the stub answers, so this exercises the
-	// overlay rather than the substitution check.
+	// result rather than the substitution notice.
 	replayed := &Spec{ID: "stale-id", Name: "mine", Hostname: "minted.tunneled.pizza", Secret: []byte("s")}
 	spec, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
 	if err != nil {
@@ -148,7 +134,7 @@ func TestReplayedSpecIsNotOverlaid(t *testing.T) {
 }
 
 // TestSpecFieldEnvBeatsCode pins per-field precedence: the
-// LIBTUNNEL__CLOUDFLARE_* variable wins over the WithX setter.
+// LIBTUNNEL__CLOUDFLARE_* variable wins over the WithX setter as the hint.
 func TestSpecFieldEnvBeatsCode(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.CloudflareNameEnv, "from-env")
@@ -156,34 +142,11 @@ func TestSpecFieldEnvBeatsCode(t *testing.T) {
 	var seen http.Header
 	srv := mintServer(t, &seen)
 	b := New().WithProvider(srv.URL).WithName("from-code")
-	spec, err := b.Provider().Spec(context.Background())
-	if err != nil {
+	if _, err := b.Provider().Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if spec.Name != "from-env" {
-		t.Errorf("Name = %q, want the env override", spec.Name)
-	}
-}
-
-// TestCompleteFieldSetShortCircuitsMint pins the short-circuit: a complete
-// credential set from the field env vars is the spec — no mint, no network
-// (an attempted mint would fail offline against the bogus API URL).
-func TestCompleteFieldSetShortCircuitsMint(t *testing.T) {
-	clearSpecEnv(t)
-	t.Setenv(v1.CloudflareIDEnv, "3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6")
-	t.Setenv(v1.CloudflareHostnameEnv, "fields.tunneled.pizza")
-	t.Setenv(v1.CloudflareAccountTagEnv, "tag")
-	t.Setenv(v1.CloudflareSecretEnv, "c2VjcmV0")
-	t.Setenv(v1.CloudflareProviderEnv, "http://127.0.0.1:1/nope")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	spec, err := New().Provider().Spec(ctx)
-	if err != nil {
-		t.Fatalf("Spec() = %v; a complete field set must not mint", err)
-	}
-	if spec.Hostname != "fields.tunneled.pizza" || spec.AccountTag != "tag" || string(spec.Secret) != "secret" {
-		t.Errorf("spec = %+v, want the env field set verbatim", spec)
+	if got := seen.Get("X-Name"); got != "from-env" {
+		t.Errorf("X-Name = %q, want the env override", got)
 	}
 }
 
@@ -333,8 +296,10 @@ func TestProviderHostSynthesizesEndpoint(t *testing.T) {
 // TestEnvKnobUnparsableFailsConnect pins loud failure: an operator override
 // that can't be honored must fail the tunnel at connect, not be ignored.
 func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
+	clearSpecEnv(t)
 	t.Setenv(v1.TLSEnv, "banana")
 	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"x.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	srv := echoServer(t)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -342,7 +307,7 @@ func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
 	}
 	defer l.Close()
 
-	conn := v1alpha1.New(New()).WithListener(l)
+	conn := v1alpha1.New(New().WithProvider(srv.URL)).WithListener(l)
 	select {
 	case <-conn.Done():
 	case <-time.After(10 * time.Second):
@@ -1403,7 +1368,7 @@ func TestReplayFallsBackWhenProviderUnreachable(t *testing.T) {
 	addr := ln.Addr().String()
 	ln.Close() // nothing is listening now, so the mint is refused
 
-	replayed := &Spec{ID: "id", Name: "mine", Hostname: "offline.tunneled.pizza", Secret: []byte("s")}
+	replayed := &Spec{ID: "id", Name: "mine", Hostname: "offline.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
 	spec, err := From(replayed).WithProvider("http://" + addr).Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatalf("Spec() = %v, want the replayed spec when the provider cannot be reached", err)
