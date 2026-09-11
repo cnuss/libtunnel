@@ -24,9 +24,10 @@ import (
 )
 
 // mintServer points the credential chain at a stub mint that answers with
-// spec. A replay consults the provider — it is the provider that knows whether
-// the hostname is still reserved — so a test of From needs one; the real
-// endpoint is e2e's business, not a unit test's.
+// spec. Every resolution consults the provider — it is the provider that
+// knows whether the hostname is still reserved — so a test that resolves a
+// spec needs one, and a re-exec'd child inherits it through the environment;
+// the real endpoint is e2e's business, not a unit test's.
 func mintServer(t *testing.T, spec *cloudflare.Spec) {
 	t.Helper()
 	body, err := json.Marshal(spec)
@@ -102,10 +103,8 @@ func reportSpec() {
 
 // TestSpecHandoffAcrossProcesses is the basic parent→child handoff: the
 // parent (this test) mints a spec and passes it to a child (a re-exec of
-// this test binary) through an explicit exec.Cmd.Env entry; the child adopts
-// it via the Cloudflare credential chain and reports what its tunnel
-// resolves to. The quick-tunnel fallback is never consulted, so nothing
-// dials out.
+// this test binary) through an explicit exec.Cmd.Env entry; the child sends
+// it to the provider as its hint and reports what its tunnel resolves to.
 func TestSpecHandoffAcrossProcesses(t *testing.T) {
 	if role() == "handoff-child" {
 		reportSpec()
@@ -120,6 +119,7 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 		AccountTag: "tag",
 		Secret:     []byte("secret"),
 	}
+	mintServer(t, spec)
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +143,7 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 
 // TestReExecInheritsSpec covers the re-exec (daemonize) handoff path: the
 // spec sits in this process's own environment — no explicit exec.Cmd.Env
-// entry — and a re-exec'd child inherits and adopts it. (In a live parent
+// entry — and a re-exec'd child inherits it as its hint. (In a live parent
 // the Cloudflare chain puts it there automatically on mint.)
 func TestReExecInheritsSpec(t *testing.T) {
 	if role() == "reexec-child" {
@@ -152,6 +152,7 @@ func TestReExecInheritsSpec(t *testing.T) {
 	}
 
 	spec := &cloudflare.Spec{Hostname: "reexec.tunneled.pizza"}
+	mintServer(t, spec)
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
@@ -190,6 +191,7 @@ func TestHandoffChain(t *testing.T) {
 	}
 
 	spec := &cloudflare.Spec{Hostname: "chain.tunneled.pizza"}
+	mintServer(t, spec)
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)
@@ -248,6 +250,7 @@ func TestSpecHostnameWithPort(t *testing.T) {
 	}
 
 	spec := &cloudflare.Spec{Hostname: "scenario.tunneled.pizza:8443"}
+	mintServer(t, spec)
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
 		t.Fatal(err)

@@ -213,10 +213,10 @@ func TestLiveMintedListener(t *testing.T) {
 // server is the origin (LIBTUNNEL_LOCAL_URL), Cloudflare is activated by the
 // switch (LIBTUNNEL__CLOUDFLARE=1), and the built binary prints the public URL
 // to stdout and serves the origin through the edge. No flags, no listener
-// plumbing — the whole configuration is environment. gateLive adopts the shared
+// plumbing — the whole configuration is environment. gateLive puts the shared
 // preflight spec into this process's environment, and the child binary inherits
-// it (LIBTUNNEL_SPEC) through os.Environ() and adopts it too — so this exercises
-// the launcher without minting.
+// it (LIBTUNNEL_SPEC) through os.Environ() as the hint of its own mint, so the
+// provider hands the preflight tunnel back instead of a new hostname.
 func TestLiveBinary(t *testing.T) {
 	gateLive(t) // adopts the shared preflight spec
 
@@ -237,8 +237,8 @@ func TestLiveBinary(t *testing.T) {
 
 	cmd := exec.Command(bin)
 	// gateLive exported the shared preflight spec into this process's
-	// environment; os.Environ() carries LIBTUNNEL_SPEC to the child, which adopts
-	// it instead of minting. The switch is set too, so the activation path is
+	// environment; os.Environ() carries LIBTUNNEL_SPEC to the child, which mints
+	// on it and gets the same tunnel back. The switch is set too, so the activation path is
 	// covered even when a spec is present.
 	cmd.Env = append(os.Environ(),
 		v1.CloudflareEnv+"=1",

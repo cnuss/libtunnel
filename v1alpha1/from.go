@@ -1,10 +1,8 @@
 package v1alpha1
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 
 	v1 "github.com/cnuss/libtunnel/v1"
@@ -31,53 +29,26 @@ func From(spec string, build func(backend string, raw json.RawMessage) (v1.Tunne
 	return tun
 }
 
-// Replay wraps next with v1.FromEnv handling for the named backend: when the
-// environment references a spec, it is loaded and replayed — superseding
-// next, even a code-pinned From spec; env beats code. A reference that
-// cannot be parsed, carries a foreign backend tag, or fails to decode is an
-// error, not a fallthrough. Unset, next resolves as usual. E is the concrete
-// spec struct, inferred like Env's.
-func Replay[E any, T interface {
-	*E
-	v1.Spec
-}](backend string, next v1.Provider[T]) v1.Provider[T] {
-	return replayProvider[E, T]{backend: backend, next: next}
-}
-
-type replayProvider[E any, T interface {
-	*E
-	v1.Spec
-}] struct {
-	backend string
-	next    v1.Provider[T]
-}
-
-// SetLogger forwards the tunnel's logger to the wrapped provider.
-func (p replayProvider[E, T]) SetLogger(log *slog.Logger) {
-	if pl, ok := p.next.(LoggerSetter); ok {
-		pl.SetLogger(log)
-	}
-}
-
-func (p replayProvider[E, T]) Spec(ctx context.Context) (T, error) {
+// ReplayFromEnv decodes v1.FromEnv — a spec file path or a literal envelope,
+// like From's argument — into the caller-allocated spec, reporting whether
+// one was present. A reference that cannot be parsed, or carries a foreign
+// backend tag, is an error, not a fallthrough.
+func ReplayFromEnv[T v1.Spec](backend string, spec T) (bool, error) {
 	env, ok := os.LookupEnv(v1.FromEnv)
 	if !ok || env == "" {
-		return p.next.Spec(ctx)
+		return false, nil
 	}
-
-	var zero T
 	tag, raw, err := DecodeSpec(loadSpec(env))
 	if err != nil {
-		return zero, fmt.Errorf("unable to parse %s: %w", v1.FromEnv, err)
+		return false, fmt.Errorf("unable to parse %s: %w", v1.FromEnv, err)
 	}
-	if tag != p.backend {
-		return zero, fmt.Errorf("%s references a spec minted by backend %q, not %q", v1.FromEnv, tag, p.backend)
+	if tag != backend {
+		return false, fmt.Errorf("%s references a spec minted by backend %q, not %q", v1.FromEnv, tag, backend)
 	}
-	spec := T(new(E))
 	if err := json.Unmarshal(raw, spec); err != nil {
-		return zero, fmt.Errorf("unable to parse %s: %w", v1.FromEnv, err)
+		return false, fmt.Errorf("unable to parse %s: %w", v1.FromEnv, err)
 	}
-	return spec, nil
+	return true, nil
 }
 
 // loadSpec turns the From argument into the serialized envelope: an existing

@@ -3,6 +3,7 @@ package cloudflare
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,9 +23,18 @@ import (
 // quickTunnelURL is the public endpoint that mints anonymous quick tunnels.
 const quickTunnelURL = "https://tunnel.pizza/tunnel"
 
-// recordHeader carries the provider's handle on the DNS record reserving a
-// hostname, both ways: returned by a mint, sent back to resume it.
-const recordHeader = "X-Record-Id"
+// The hint headers: what the caller already knows about the tunnel, for the
+// provider to honor or ignore. recordHeader is the one tunnel.pizza reads —
+// its handle on the DNS record reserving a hostname, both ways: returned by
+// a mint, sent back to resume it.
+const (
+	recordHeader     = "X-Record-Id"
+	idHeader         = "X-Id"
+	nameHeader       = "X-Name"
+	hostnameHeader   = "X-Hostname"
+	accountTagHeader = "X-Account-Tag"
+	secretHeader     = "X-Secret"
+)
 
 // throttleReason renders a throttle's cause with the wait the provider asked
 // for, so an error a caller reads carries the number it would otherwise have
@@ -59,9 +69,9 @@ var budget = v1.Budget
 
 // QuickTunnelProvider mints an anonymous *.tunneled.pizza tunnel from the
 // quick-tunnel API, retrying with linear backoff until the context is done.
-// Spec-field setters carried through Headers ride the request as reclaim
-// hints, so a provider that reaps idle tunnels can hand the named tunnel back
-// instead of minting fresh — see Spec.
+// The hint — whatever the caller already knows about the tunnel — rides the
+// request as the X-* headers, so a provider that reaps idle tunnels can hand
+// the named tunnel back instead of minting fresh — see Spec.
 type QuickTunnelProvider struct {
 	// URL overrides the quick-tunnel API endpoint (synthesized from WithProvider
 	// / its LIBTUNNEL__CLOUDFLARE_PROVIDER mirror, or set directly in tests).
@@ -83,9 +93,10 @@ type QuickTunnelProvider struct {
 	Token string
 	// Log receives retry warnings. Nil is silent.
 	Log *slog.Logger
-	// record resumes a hostname minted earlier (X-Record-Id). Empty mints a
-	// fresh one.
-	record string
+	// hint is what the caller already knows about the tunnel. Its record id
+	// resumes a hostname minted earlier; the rest names what it is asking
+	// for. Nil, or empty, mints fresh.
+	hint *Spec
 }
 
 // QuickTunnel returns a provider that mints anonymous quick tunnels.
@@ -192,6 +203,21 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		if record != "" {
 			req.Header.Set(recordHeader, record)
 		}
+		if p.hint != nil {
+			for header, value := range map[string]string{
+				idHeader:         p.hint.ID,
+				nameHeader:       p.hint.Name,
+				hostnameHeader:   p.hint.Hostname,
+				accountTagHeader: p.hint.AccountTag,
+			} {
+				if value != "" {
+					req.Header.Set(header, value)
+				}
+			}
+			if len(p.hint.Secret) > 0 {
+				req.Header.Set(secretHeader, base64.StdEncoding.EncodeToString(p.hint.Secret))
+			}
+		}
 		// Caller headers (WithHeader) apply over the defaults above — a supplied
 		// key replaces the default for that key.
 		for k, vs := range p.Headers {
@@ -286,7 +312,10 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 	sleep := 0 * time.Second
 	attempts := 0
-	record := p.record
+	var record string
+	if p.hint != nil {
+		record = p.hint.RecordID
+	}
 	// Each class keeps its own clock, started at its first failure, so a mint
 	// that hits a rate limit and then a flaky resolver is not charged twice
 	// for one slow start. The clock is wall time rather than a sum of the

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 
 	"github.com/cnuss/libtunnel"
@@ -32,11 +33,28 @@ func Example() {
 	}
 }
 
+// stubProvider stands in for tunnel.pizza: a mint endpoint that hands back
+// the hostname it was hinted, the way the real one does while the
+// reservation holds. It is pointed at through the same variable an operator
+// would use for an alternate provider.
+func stubProvider() (stop func()) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"success":true,"result":{"hostname":%q}}`, r.Header.Get("X-Hostname"))
+	}))
+	os.Setenv("LIBTUNNEL__CLOUDFLARE_PROVIDER", srv.URL)
+	return func() {
+		os.Unsetenv("LIBTUNNEL__CLOUDFLARE_PROVIDER")
+		srv.Close()
+	}
+}
+
 // LIBTUNNEL_SPEC is the parent→child handoff channel: a parent process that
 // mints a tunnel exports its spec there automatically, and a child's
-// Cloudflare credential chain adopts it at construction — no API to call.
-// Here the environment is populated by hand to stand in for the parent.
+// Cloudflare credential chain sends it to the provider as the hint for its
+// own mint, so the provider hands the same tunnel back. Here the environment
+// is populated by hand to stand in for the parent.
 func Example_handoff() {
+	defer stubProvider()()
 	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.tunneled.pizza"}}`)
 	defer os.Unsetenv("LIBTUNNEL_SPEC")
 
@@ -45,9 +63,10 @@ func Example_handoff() {
 	// Output: demo.tunneled.pizza
 }
 
-// Getters resolve lazily from the backend's credential chain — here a spec
-// adopted from the environment, so nothing touches the network.
+// Getters resolve lazily from the backend's credential chain — nothing is
+// fetched until the first one is read.
 func Example_lazy() {
+	defer stubProvider()()
 	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.tunneled.pizza"}}`)
 	defer os.Unsetenv("LIBTUNNEL_SPEC")
 
