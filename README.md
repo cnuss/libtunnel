@@ -110,13 +110,16 @@ type Tunnel interface {
     Listener() net.Listener // start trigger: mints a loopback listener if none provided
     URL() *url.URL // blocks until reachable end to end; nil if canceled first;
                    // start trigger, like Listener
+    Serialize() string // the spec as LIBTUNNEL_SPEC carries it; From replays it
 
-    // Lifecycle[Tunnel] — embedded; the three verbs a supervisor needs.
-    // Each call is a fresh channel that delivers the tunnel once, then closes.
+    // Lifecycle[Tunnel] — embedded; the verbs a supervisor needs.
+    // Each channel call is a fresh channel that delivers the tunnel once, then closes.
     Ready() <-chan Tunnel           // serving end to end; start trigger, like Listener;
                                     // closes empty if the tunnel ends first
     Done() <-chan Tunnel            // tunnel failed or shut down
     Err() error                     // why (nil while alive); see Failure classes
+    Cancel(cause ...error)          // no cause: deliberate shutdown, Err is ErrClosed;
+                                    // a cause: ends as that failure
 
     HostnameReady() <-chan struct{} // hostname resolves on authoritative NS
     TunnelReady() <-chan struct{}   // closed when Ready would deliver

@@ -732,7 +732,7 @@ func TestLifecycleDeliversTheTunnel(t *testing.T) {
 		t.Fatalf("Err = %v while the tunnel is alive, want nil", err)
 	}
 
-	tun.Cancel(v1.ErrClosed)
+	life.Cancel()
 	select {
 	case got, ok := <-life.Done():
 		if !ok || got != v1.Tunnel(conn) {
@@ -1459,5 +1459,75 @@ func TestWithTokenForwardsOnce(t *testing.T) {
 	lateTun.WithToken("too-late")
 	if got := late.tokens; len(got) != 0 {
 		t.Errorf("backend saw tokens %v after the spec fetch, want none", got)
+	}
+}
+
+// TestCancelIsDeliberate pins Cancel as the caller's clean shutdown: Done
+// delivers, Err reports ErrClosed, and no EventError fires — the same
+// shape as closing the tunnel-owned listener.
+func TestCancelIsDeliberate(t *testing.T) {
+	var events []v1.Event
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{})).WithEventListener(func(e v1.Event) {
+		events = append(events, e)
+	})
+
+	conn.Cancel()
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never delivered after Cancel")
+	}
+	if !errors.Is(conn.Err(), v1.ErrClosed) {
+		t.Errorf("Err() = %v, want ErrClosed", conn.Err())
+	}
+	if errors.Is(conn.Err(), v1.ErrFailed) {
+		t.Errorf("Err() = %v reads as a failure; a deliberate cancel is not one", conn.Err())
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		var kinds []v1.EventKind
+		for _, e := range events {
+			kinds = append(kinds, e.Kind)
+		}
+		if len(kinds) > 0 && kinds[len(kinds)-1] == v1.EventDone {
+			for _, e := range events {
+				if e.Kind == v1.EventError {
+					t.Errorf("EventError fired on Cancel: %v", e.Err)
+				}
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("EventDone never fired; events = %v", kinds)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// TestCancelWithCauseIsAFailure pins the other half: a cause carries through
+// to Err and Done, the way an engine reports the edge dying under it.
+func TestCancelWithCauseIsAFailure(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
+	want := errors.New("edge went away")
+	tun.Cancel(want)
+	select {
+	case <-tun.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never delivered after Cancel(cause)")
+	}
+	if !errors.Is(tun.Err(), want) {
+		t.Errorf("Err() = %v, want the cause", tun.Err())
+	}
+}
+
+// TestSerializeResolvesSpec pins Serialize as a getter like the rest: it
+// resolves the spec on first use rather than reading a field that nothing
+// has filled yet.
+func TestSerializeResolvesSpec(t *testing.T) {
+	spec := &cloudflare.Spec{ID: "id-1", Hostname: "ser.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
+	conn := v1alpha1.New(newFakeEngine(spec))
+	if got, want := conn.Serialize(), spec.Serialize(); got != want {
+		t.Errorf("Serialize() = %q, want %q", got, want)
 	}
 }

@@ -186,7 +186,7 @@ var (
 	ErrRateLimited error = &class{ErrFailed, "rate limited", 180 * time.Second}
 
 	// ErrClosed is the Err result of a tunnel shut down deliberately — by
-	// closing the listener returned from Tunnel.Listener. It is terminal but
+	// Cancel, or by closing the listener returned from Tunnel.Listener. It is terminal but
 	// it is not a failure, so it has no umbrella: the message is a bare
 	// "tunnel closed" and errors.Is(err, ErrFailed) is false.
 	ErrClosed error = &class{nil, "tunnel closed", 0}
@@ -331,6 +331,12 @@ type Lifecycle[T any] interface {
 	// Err reports why it ended: nil while it is alive, the cause once Done
 	// has delivered.
 	Err() error
+	// Cancel ends it. With no cause it is deliberate: Done delivers, Err
+	// reports ErrClosed, and no EventError fires — the lever for code that
+	// holds the value rather than the context that started it
+	// (WithContext). With a cause it ends as a failure, Err reporting that
+	// cause: what an engine says when the thing it runs dies under it.
+	Cancel(cause ...error)
 }
 
 // Spec is the credential/identity set a Provider yields. Each backend defines
@@ -481,6 +487,12 @@ type Tunnel interface {
 	// loopback listener and starts the edge connection, instead of waiting on
 	// readiness that could never arrive.
 	URL() *url.URL
+
+	// Serialize renders the resolved spec as a tagged-envelope JSON string
+	// (Spec.Serialize) — the value LIBTUNNEL_SPEC carries and From replays,
+	// so a caller can store a tunnel's identity and ask for it back. A
+	// getter like Hostname: the first use resolves the spec.
+	Serialize() string
 
 	// HostnameReady is closed once the hostname is expected to resolve
 	// publicly: when the edge connection registers. The record's spread

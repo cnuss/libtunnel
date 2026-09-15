@@ -98,7 +98,8 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 	}
 
 	// Surface why the tunnel context was canceled. cancel is a
-	// CancelCauseFunc, so every t.Cancel(err) records a cause that
+	// CancelCauseFunc, so every t.cancel(err) — Cancel from a caller or an
+	// engine, a getter that cannot proceed — records a cause that
 	// context.Cause reports here when Done fires. Logged at Info: a cancel is
 	// as often a clean shutdown (a signal, a caller context) as a failure, so
 	// it is not inherently a warning.
@@ -211,6 +212,12 @@ func (t *TunnelImpl[T]) Done() <-chan v1.Tunnel {
 	return t.deliver(t.ctx.Done())
 }
 
+// Serialize implements v1.Tunnel: the resolved spec's Serialize. A getter
+// like Hostname — the first use resolves the spec.
+func (t *TunnelImpl[T]) Serialize() string {
+	return t.Spec().Serialize()
+}
+
 // deliver hands t to whoever waits on signal. Each call gets its own channel:
 // a shared one could only broadcast by closing, and a closed channel carries
 // nil, not t.
@@ -250,10 +257,17 @@ func (t *TunnelImpl[T]) Err() error {
 	return context.Cause(t.ctx)
 }
 
-// Cancel records cause and cancels the tunnel's context. Exposed for Engine
-// implementations in subpackages.
-func (t *TunnelImpl[T]) Cancel(cause error) {
-	t.cancel(cause)
+// Cancel implements v1.Lifecycle. Without a cause it is the caller's
+// deliberate shutdown: ErrClosed, the same as closing the tunnel-owned
+// listener, so Err reads as terminal but not a failure and no EventError
+// fires. With one, the tunnel ends as a failure with that cause — what an
+// Engine in a subpackage reports when the edge dies under it.
+func (t *TunnelImpl[T]) Cancel(cause ...error) {
+	if err := errors.Join(cause...); err != nil {
+		t.cancel(err)
+		return
+	}
+	t.cancel(v1.ErrClosed)
 }
 
 // Logger is the tunnel's logger (never nil; silent by default). Exposed for
