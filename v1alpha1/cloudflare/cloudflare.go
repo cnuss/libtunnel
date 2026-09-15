@@ -11,7 +11,6 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -19,7 +18,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/netip"
 	"net/url"
 	"os"
 	"runtime"
@@ -30,33 +28,24 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/breml/rootcerts/embedded"
 	"github.com/cloudflare/cloudflared/client"
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
-	"github.com/cloudflare/cloudflared/connection/dialopts"
-	"github.com/cloudflare/cloudflared/crypto"
 	"github.com/cloudflare/cloudflared/edgediscovery"
 	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
 	"github.com/cloudflare/cloudflared/features"
 	"github.com/cloudflare/cloudflared/ingress"
 	"github.com/cloudflare/cloudflared/ingress/origins"
 	"github.com/cloudflare/cloudflared/orchestration"
-	cfquic "github.com/cloudflare/cloudflared/quic"
 	"github.com/cloudflare/cloudflared/signal"
 	"github.com/cloudflare/cloudflared/supervisor"
-	"github.com/cloudflare/cloudflared/tlsconfig"
-	"github.com/cloudflare/cloudflared/tunnelrpc"
-	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	"github.com/google/uuid"
-	dns "github.com/ncruces/go-dns"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/quic-go/quic-go"
-	"github.com/rs/zerolog"
-	"golang.org/x/net/http2"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/probe"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/trust"
 )
 
 // cloudflaredVersion is reported to the edge as the connector version —
@@ -290,13 +279,10 @@ type Backend struct {
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
 	listener     net.Listener
-	// probeInterval is fixed at construction rather than read by the probe
-	// loop: the loop is a goroutine that may start after the caller has
-	// moved on, and a test shortening the package default for the next
-	// tunnel must not race a goroutine the last one left behind.
-	probeInterval time.Duration
-	// establishInterval is fixed at construction for the same reason as
-	// probeInterval.
+	// establishInterval is fixed at construction rather than read by the
+	// establish loop: the loop is a goroutine that may start after the
+	// caller has moved on, and a test shortening the package default for
+	// the next tunnel must not race a goroutine the last one left behind.
 	establishInterval time.Duration
 	// establishing is set while a loop-through is in flight, so a second
 	// trigger while one runs does not double it — the one running will
@@ -317,7 +303,6 @@ func (b *Backend) Listener() net.Listener { return b.listener }
 // unparsable value wins and is surfaced at connect.
 func New() *Backend {
 	b := &Backend{
-		probeInterval:     probeInterval,
 		establishInterval: establishInterval,
 	}
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
@@ -557,10 +542,11 @@ func (b *Backend) Name() string {
 	return backendName
 }
 
-// Provider is the Cloudflare credential chain. Every resolution mints: what
-// the process already knows about the tunnel (see hint) rides the request,
-// the provider's answer is the spec, and the answer is exported for children
-// to inherit.
+// Provider is the Cloudflare credential chain. What the process already
+// knows about the tunnel (see hint) is put to the edge first: live and
+// unserved, it is the spec; served by another connector, the tunnel fails;
+// otherwise it rides the mint request as hints and the provider's answer is
+// the spec. Either way the answer is exported for children to inherit.
 func (b *Backend) Provider() v1.Provider[*Spec] {
 	host := b.providerHost
 	stringEnv(v1.CloudflareProviderEnv, &host) // env beats code
@@ -605,10 +591,36 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 	if err != nil {
 		return nil, err
 	}
+	log := p.log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+
+	// A hint that could register is put to the edge before any mint: the
+	// edge, not the provider and not this library, knows whether the tunnel
+	// is up. Vouched for, it is the spec and the provider is never asked.
+	complete := hint.ID != "" && hint.Hostname != "" && hint.AccountTag != "" && len(hint.Secret) > 0
+	if complete {
+		protocol := connection.HTTP2
+		if edge, err := p.backend.resolveEdgeProtocol(); err != nil {
+			return nil, err
+		} else if edge == EdgeQUIC {
+			protocol = connection.QUIC
+		}
+		switch err := probeHint(ctx, protocol, hint, log); {
+		case err == nil:
+			log.Info("edge vouched for the spec, using it as given", "hostname", hint.Hostname)
+			return hint, nil
+		case errors.Is(err, probe.ErrInUse):
+			return nil, fmt.Errorf("%w: %w", v1.ErrInUse, err)
+		default:
+			log.Debug("edge did not vouch for the spec, minting with it as the hint", "error", err)
+		}
+	}
+
 	p.mint.hint = hint
 	got, err := p.mint.Spec(ctx)
 	if err != nil {
-		complete := hint.ID != "" && hint.Hostname != "" && hint.AccountTag != "" && len(hint.Secret) > 0
 		if !complete || !errors.Is(err, v1.ErrProviderUnreachable) {
 			return nil, err
 		}
@@ -630,6 +642,19 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 			"was", hint.ID, "now", got.ID)
 	}
 	return got, nil
+}
+
+// probeHint asks the edge whether hint is live, over protocol. A var so a
+// test can answer without an edge.
+var probeHint = func(ctx context.Context, protocol connection.Protocol, hint *Spec, log *slog.Logger) error {
+	return probe.New().
+		WithID(hint.ID).
+		WithHostname(hint.Hostname).
+		WithAccountTag(hint.AccountTag).
+		WithSecret(hint.Secret).
+		WithProtocol(protocol).
+		WithLogger(zerologger(log, nil)).
+		Probe(context.WithTimeout(ctx, probe.Timeout))
 }
 
 func (p *hinted) logf(msg string, args ...any) {
@@ -741,53 +766,10 @@ func stringField(override string, field *string) {
 	}
 }
 
-// caCerts parses the trust set once per process: the Mozilla bundle is a
-// compile-time constant and the Cloudflare roots are fixed, so re-parsing
-// ~150 certificates per tunnel was pure waste.
-var caCerts = sync.OnceValue(func() []*x509.Certificate {
-	certificates := []*x509.Certificate{}
-
-	rest := []byte(embedded.MozillaCACertificatesPEM())
-	for {
-		block, remainder := pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		rest = remainder
-		if block.Type != "CERTIFICATE" {
-			continue
-		}
-		if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
-			certificates = append(certificates, cert)
-		}
-	}
-
-	cloudflareRoots, _ := tlsconfig.GetCloudflareRootCA()
-	return append(certificates, cloudflareRoots...)
-})
-
-// caCertPool is the trust set for the connections libtunnel makes on its own
-// behalf. The host's store when it has one, plus the roots compiled into the
-// binary — so a scratch, busybox or distroless-without-certs image mints and
-// connects without anyone installing ca-certificates first.
-//
-// A host with no store is not an error: SystemCertPool yields an empty pool
-// there, and the embedded roots go on top either way, which is the point.
-var caCertPool = sync.OnceValue(func() *x509.CertPool {
-	pool, err := x509.SystemCertPool()
-	if err != nil {
-		pool = x509.NewCertPool()
-	}
-	for _, c := range caCerts() {
-		pool.AddCert(c)
-	}
-	return pool
-})
-
 // CACerts returns the Mozilla CA bundle plus the Cloudflare origin roots —
 // the trust set cloudflared uses for its edge TLS connections.
 func (b *Backend) CACerts() []*x509.Certificate {
-	return caCerts()
+	return trust.Certs()
 }
 
 // WithListener dials the Cloudflare edge and proxies it onto l. It blocks
@@ -922,10 +904,19 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 
 		originDialer := ingress.NewOriginDialer(ingress.OriginConfig{}, log)
 
+		prober := probe.New().
+			WithID(spec.ID).
+			WithHostname(spec.Hostname).
+			WithAccountTag(spec.AccountTag).
+			WithSecret(spec.Secret).
+			WithProtocolSelector(protocolSelector).
+			WithConnIndex(haConnections).
+			WithLogger(log).
+			OnGone(func() { t.Emit(v1.Event{Kind: v1.EventGone}) })
 		// For the life of the tunnel rather than off an edge event: the reap
 		// worth catching leaves the connections looking fine, so there is no
 		// event to hang it on.
-		b.runProbe(ctx, func() { b.probeGone(ctx, t, spec, protocolSelector, log) })
+		go prober.Run(ctx)
 
 		// The observer fans connection lifecycle events out to sinks; wire one
 		// that feeds edge, so the Reconnect lever can block until the edge is
@@ -959,7 +950,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 				if alive && b.establishing.CompareAndSwap(false, true) {
 					go func() {
 						defer b.establishing.Store(false)
-						b.establish(ctx, t, loopThroughClient(), "https://"+spec.GetHostname()+"/", loop, t.Logger())
+						b.establish(ctx, t, loopThroughClient(prober), "https://"+spec.GetHostname()+"/", loop, t.Logger())
 					}()
 				}
 				if full {
@@ -1012,7 +1003,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			},
 			ProtocolSelector: protocolSelector,
 			EdgeTLSConfigs: func() map[connection.Protocol]*tls.Config {
-				pool := caCertPool()
+				pool := trust.Pool()
 				out := make(map[connection.Protocol]*tls.Config, len(connection.ProtocolList))
 				for _, p := range connection.ProtocolList {
 					s := p.TLSSettings()
@@ -1114,20 +1105,21 @@ func loopThrough(nonce string, next http.Handler) http.Handler {
 }
 
 // loopThroughClient is the client the verification goes out on. It resolves
-// over DoH and dials the address itself, so the machine's resolver is never
-// asked: this is the first request for the name from this host, and a
-// resolver asked a beat early caches the NXDOMAIN for the zone's SOA.
-func loopThroughClient() *http.Client {
+// through the prober's DoH resolvers and dials the address itself, so the
+// machine's resolver is never asked: this is the first request for the name
+// from this host, and a resolver asked a beat early caches the NXDOMAIN for
+// the zone's SOA.
+func loopThroughClient(p *probe.Prober) *http.Client {
 	return &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{RootCAs: caCertPool()},
+			TLSClientConfig: &tls.Config{RootCAs: trust.Pool()},
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				host, port, err := net.SplitHostPort(addr)
 				if err != nil {
 					return nil, err
 				}
-				ip, err := lookupHost(ctx, host)
+				ip, err := p.LookupHost(ctx, host)
 				if err != nil {
 					return nil, err
 				}
@@ -1175,50 +1167,6 @@ func verify(ctx context.Context, client *http.Client, url, nonce string) bool {
 	return resp.StatusCode == http.StatusNoContent && resp.Header.Get(establishHeader) == nonce
 }
 
-// lookupHost resolves host through the DoH resolvers, first to answer wins.
-func lookupHost(ctx context.Context, host string) (string, error) {
-	var lastErr error
-	for _, resolver := range goneResolvers() {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		lookup, cancel := context.WithTimeout(ctx, dohTimeout)
-		addrs, err := resolver.LookupHost(lookup, host)
-		cancel()
-		if err == nil && len(addrs) > 0 {
-			return addrs[0], nil
-		}
-		lastErr = err
-	}
-	if lastErr == nil {
-		lastErr = errors.New("no DoH resolver answered")
-	}
-	return "", lastErr
-}
-
-// probeInterval is how often the probe asks whether the tunnel still exists.
-// Every tick on a healthy tunnel spends a registration, so this is a standing
-// cost for the life of the tunnel rather than a timeout to tune down.
-//
-// #182 measured a client noticing a deleted tunnel at 12s over QUIC and 188s
-// over http2. This sits between them: behind what QUIC notices on its own, well
-// ahead of http2, and cheap enough to leave running.
-//
-// A var, not a const, so a test can shorten it rather than sleep through it —
-// the same seam shape the retry budgets use.
-var probeInterval = 30 * time.Second
-
-// goneProbeTimeout bounds one probe end to end — discovery, dial, handshake,
-// RPC. Past it nothing is claimed.
-const goneProbeTimeout = 15 * time.Second
-
-// probeHandshakeTimeout and probeIdleTimeout bound one edge address, keeping a
-// dead one cheap enough that the walk reaches the live ones.
-const (
-	probeHandshakeTimeout = 2 * time.Second
-	probeIdleTimeout      = 3 * time.Second
-)
-
 // The loop-through that verifies the public URL. Every establishInterval a
 // request goes to the URL with a nonce only this tunnel's proxy recognizes;
 // the proxy answers 204 itself, so the origin never sees it. Until the edge
@@ -1226,384 +1174,15 @@ const (
 // proxy's place, and the loop tries again.
 //
 // A var, not a const, so a test can shorten it rather than sleep through it
-// — captured on the Backend at construction, the same way as probeInterval.
+// — captured on the Backend at construction.
 var establishInterval = 1 * time.Second
 
 // establishHeader carries the loop-through nonce. Any other value is an
 // ordinary request.
 const establishHeader = "X-Libtunnel-Loop"
 
-// probeConnIndex is the connection index the probe registers under. The
-// supervisor owns 0..haConnections-1, so this sits clear: registering an index
-// already in use answers EDUPCONN, which says the tunnel exists but is a
-// slower way to hear it.
-const probeConnIndex = haConnections
-
-// edgeSRVService is the SRV service cloudflared discovers the edge through.
-const edgeSRVService = "v2-origintunneld"
-
 // emitter is the half of the tunnel the probe needs: somewhere to report.
 type emitter interface{ Emit(v1.Event) }
-
-// runProbe calls probe every probeInterval until ctx ends.
-//
-// On a ticker rather than off edge events, because the reap worth catching is
-// the one the edge says nothing about: a tunnel deleted while its connections
-// still look fine produces no event to hang a probe on.
-//
-// Nothing here remembers having answered. A tunnel that goes away twice is
-// reported twice, and what to do about it is the caller's to decide.
-//
-// A slow probe delays the next tick rather than stacking on top of it: the
-// call is synchronous and a ticker holds at most one pending tick.
-func (b *Backend) runProbe(ctx context.Context, probe func()) {
-	go func() {
-		ticker := time.NewTicker(b.probeInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				probe()
-			}
-		}
-	}()
-}
-
-// dohEndpoint is one DNS-over-HTTPS resolver the gone check can ask.
-//
-// The addresses are pinned so the check does not need the machine's resolver
-// to find its way to a resolver.
-type dohEndpoint struct {
-	uri       string
-	addresses []string
-}
-
-// dohEndpoints are asked in order. Public resolvers rather than the machine's:
-// a captive portal, a split-horizon corporate resolver, or a container that
-// lost its resolv.conf will happily report a perfectly good hostname as
-// nonexistent, and this check turns that answer into an event telling a caller
-// to discard its tunnel.
-//
-// Over HTTPS rather than port 53 because plenty of networks block or hijack
-// 53, which is the same failure the machine's resolver has.
-//
-// Two operators, so one having a bad day does not decide.
-var dohEndpoints = []dohEndpoint{
-	{"https://cloudflare-dns.com/dns-query", []string{"1.1.1.1", "1.0.0.1", "2606:4700:4700::1111"}},
-	{"https://dns.google/dns-query", []string{"8.8.8.8", "8.8.4.4", "2001:4860:4860::8888"}},
-}
-
-// dohTimeout bounds one endpoint. The whole check has to fit inside the
-// probe's budget alongside a handshake, and a resolver that has not answered
-// in two seconds is not the fast path this is meant to be.
-const dohTimeout = 2 * time.Second
-
-// goneResolvers builds the DoH resolvers once, dropping any that will not
-// construct. Lazily, so a process that never loses a connection never pays for
-// the TLS setup.
-var goneResolvers = sync.OnceValue(buildGoneResolvers)
-
-func buildGoneResolvers() []*net.Resolver {
-	// The trust set libtunnel ships, so a host with no CA bundle can still ask.
-	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: caCertPool()}}
-
-	resolvers := make([]*net.Resolver, 0, len(dohEndpoints))
-	for _, endpoint := range dohEndpoints {
-		resolver, err := dns.NewDoHResolver(endpoint.uri,
-			dns.DoHAddresses(endpoint.addresses...),
-			dns.DoHTransport(transport),
-		)
-		if err != nil {
-			continue
-		}
-		resolvers = append(resolvers, resolver)
-	}
-	return resolvers
-}
-
-// hostnameGone reports whether hostname has stopped existing, which is what a
-// provider leaves behind when it reaps a tunnel and deletes its record.
-//
-// Only NXDOMAIN counts. A SERVFAIL, a timeout, or every endpoint being
-// unreachable is a question that went unanswered, not an answer. A name
-// positively reported as nonexistent is a different claim, and the only one
-// acted on here.
-//
-// It is a supporting signal, not the arbiter: the registration probe below
-// asks the edge the same question. This one just gets there without a
-// handshake when the record is already gone — and it catches what the
-// handshake cannot, a tunnel that still exists behind a name nothing can
-// reach.
-func hostnameGone(ctx context.Context, hostname string) bool {
-	if hostname == "" {
-		return false
-	}
-	host := hostname
-	if h, _, err := net.SplitHostPort(hostname); err == nil {
-		host = h
-	}
-	for _, resolver := range goneResolvers() {
-		if ctx.Err() != nil {
-			return false
-		}
-		lookup, cancel := context.WithTimeout(ctx, dohTimeout)
-		_, err := resolver.LookupHost(lookup, host)
-		cancel()
-
-		// The first endpoint to answer at all decides. These are independent
-		// operators, so disagreement is not something to arbitrate, and a
-		// second opinion on a positive NXDOMAIN would only slow the common
-		// case where the name is simply still there.
-		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-			return true
-		}
-		if err == nil {
-			return false
-		}
-	}
-	return false
-}
-
-// anEdgeConn walks the discovery pool and returns the first connection dial
-// manages to make, rather than the first address it finds.
-//
-// Discovery yields twenty-odd addresses per region and any one of them can be
-// unreachable while the edge as a whole is fine. Taking the first blind turns a
-// probe that would have got an answer into "no answer", and this probe only
-// ever runs against a tunnel whose health is already the question.
-//
-// Attempts are bounded by ctx rather than counted: the caller's deadline is the
-// budget, and a dial that outlives it fails on its own.
-func anEdgeConn[T any](ctx context.Context, log *zerolog.Logger, dial func(*allregions.EdgeAddr) (T, error)) (T, error) {
-	var none T
-	regions, err := allregions.EdgeDiscovery(log, edgeSRVService)
-	if err != nil {
-		return none, fmt.Errorf("edge discovery: %w", err)
-	}
-
-	var tried int
-	var lastErr error
-	for _, region := range regions {
-		for _, edge := range region {
-			conn, err := dial(edge)
-			if err == nil {
-				return conn, nil
-			}
-			tried++
-			lastErr = err
-			log.Debug().Err(err).Msg("gone probe: edge address did not answer")
-
-			if ctx.Err() != nil {
-				return none, fmt.Errorf("no edge answered in %d attempts: %w", tried, ctx.Err())
-			}
-		}
-	}
-	if lastErr == nil {
-		return none, errors.New("edge discovery returned no usable addresses")
-	}
-	return none, fmt.Errorf("no edge answered in %d attempts: %w", tried, lastErr)
-}
-
-// probeTLSConfig is the edge TLS config for p, carrying the trust set libtunnel
-// ships so a host with no CA bundle can still probe.
-func probeTLSConfig(p connection.Protocol) (*tls.Config, error) {
-	settings := p.TLSSettings()
-	if settings == nil {
-		return nil, fmt.Errorf("no TLS settings for %s", p)
-	}
-	return crypto.TLSConfigWithCurvePreferences(&tls.Config{
-		ServerName: settings.ServerName,
-		NextProtos: settings.NextProtos,
-		RootCAs:    caCertPool(),
-	}, features.PostQuantumPrefer)
-}
-
-// registerProbe runs one registration over rw and returns what the edge
-// answers. A refusal is the point; success just means the tunnel is there.
-func registerProbe(ctx context.Context, rw io.ReadWriteCloser, spec *Spec, tunnelID uuid.UUID, edgeIP net.IP, log *zerolog.Logger) error {
-	client := tunnelrpc.NewRegistrationClient(ctx, rw, goneProbeTimeout)
-	defer client.Close()
-
-	// A real UUID: the edge validates the client id before it looks at the
-	// credentials, so an empty one is refused for the wrong reason.
-	id := uuid.New()
-	reg, err := client.RegisterConnection(ctx,
-		pogs.TunnelAuth{AccountTag: spec.AccountTag, TunnelSecret: spec.Secret},
-		tunnelID, &pogs.ConnectionOptions{
-			Client: pogs.ClientInfo{
-				ClientID: id[:],
-				Version:  cloudflaredVersion,
-				Arch:     runtime.GOOS + "_" + runtime.GOARCH,
-			},
-		}, probeConnIndex, edgeIP)
-
-	log.Debug().Any("reg", reg).Err(err).Msg("gone probe: registration result")
-	if err != nil {
-		return err
-	}
-	_ = client.GracefulShutdown(ctx, time.Second)
-	return nil
-}
-
-// registerOverQUIC opens a stream to the edge and registers on it. cloudflared
-// opens the control stream on QUIC, so the probe drives the whole exchange.
-func registerOverQUIC(ctx context.Context, spec *Spec, tunnelID uuid.UUID, log *zerolog.Logger) error {
-	tlsConfig, err := probeTLSConfig(connection.QUIC)
-	if err != nil {
-		return err
-	}
-
-	// Tighter than cloudflared's own (5s handshake, 5s idle). Those are tuned
-	// for a connector that must not give up on the address it has. This is a
-	// one-shot probe walking twenty-odd addresses inside goneProbeTimeout, so
-	// a slow address is one to abandon rather than wait on — at cloudflared's
-	// values three dead addresses would exhaust the whole budget.
-	quicConfig := &quic.Config{
-		HandshakeIdleTimeout: probeHandshakeTimeout,
-		MaxIdleTimeout:       probeIdleTimeout,
-		// Cloudflared's 1s, comfortably inside the idle timeout above so the
-		// connection survives the pause between dialing and the registration
-		// round trip.
-		KeepAlivePeriod: cfquic.MaxIdlePingPeriod,
-	}
-
-	var edgeIP net.IP
-	conn, err := anEdgeConn(ctx, log, func(edge *allregions.EdgeAddr) (cfquic.QUICConnection, error) {
-		if edge.UDP == nil {
-			return nil, errors.New("edge address has no UDP endpoint")
-		}
-		ip, ok := netip.AddrFromSlice(edge.UDP.IP)
-		if !ok {
-			return nil, errors.New("edge address has an unusable UDP IP")
-		}
-		// nolint: gosec // a port is uint16 by definition
-		addr := netip.AddrPortFrom(ip.Unmap(), uint16(edge.UDP.Port))
-		conn, err := connection.DialQuic(ctx, quicConfig, tlsConfig, addr, nil, probeConnIndex, log,
-			// A probe must not share the connector's UDP port; cloudflared
-			// offers this flag for exactly that.
-			dialopts.DialOpts{SkipPortReuse: true})
-		if err == nil {
-			edgeIP = edge.UDP.IP
-		}
-		return conn, err
-	})
-	if err != nil {
-		return err
-	}
-	defer conn.CloseWithError(quic.ApplicationErrorCode(quic.NoError), "probe complete")
-
-	// The edge takes the first stream on a connection as the control plane.
-	stream, err := conn.OpenStream()
-	if err != nil {
-		return fmt.Errorf("open control stream: %w", err)
-	}
-	defer stream.Close()
-
-	return registerProbe(ctx, stream, spec, tunnelID, edgeIP, log)
-}
-
-// registerOverHTTP2 answers the edge's control stream and registers on it.
-//
-// The roles are reversed from QUIC: cloudflared dials TCP, serves HTTP/2 on the
-// socket, and the edge opens the control stream by requesting it. So the probe
-// stands up a server and waits to be asked rather than asking.
-func registerOverHTTP2(ctx context.Context, spec *Spec, tunnelID uuid.UUID, log *zerolog.Logger) error {
-	tlsConfig, err := probeTLSConfig(connection.HTTP2)
-	if err != nil {
-		return err
-	}
-
-	var edgeIP net.IP
-	conn, err := anEdgeConn(ctx, log, func(edge *allregions.EdgeAddr) (net.Conn, error) {
-		if edge.TCP == nil {
-			return nil, errors.New("edge address has no TCP endpoint")
-		}
-		conn, err := edgediscovery.DialEdge(ctx, probeHandshakeTimeout, tlsConfig, edge.TCP, nil)
-		if err == nil {
-			edgeIP = edge.TCP.IP
-		}
-		return conn, err
-	})
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	// Buffered, so the handler can finish even when ctx wins the race below.
-	answered := make(chan error, 1)
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(connection.InternalUpgradeHeader) != connection.ControlStreamUpgrade {
-			return
-		}
-		rw, err := connection.NewHTTP2RespWriter(r, w, connection.TypeControlStream, log)
-		if err != nil {
-			answered <- err
-			return
-		}
-		answered <- registerProbe(r.Context(), rw, spec, tunnelID, edgeIP, log)
-	})
-	go (&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{Context: ctx, Handler: handler})
-
-	select {
-	case err := <-answered:
-		return err
-	case <-ctx.Done():
-		return fmt.Errorf("edge opened no control stream: %w", ctx.Err())
-	}
-}
-
-// probeGone asks the edge whether the tunnel still exists and reports it if
-// not. Reporting only: cloudflared keeps retrying either way, and ending the
-// tunnel on the strength of one probe is the caller's call to make.
-func (b *Backend) probeGone(ctx context.Context, t emitter, spec *Spec, protocol connection.ProtocolSelector, log *zerolog.Logger) {
-	ctx, cancel := context.WithTimeout(ctx, goneProbeTimeout)
-	defer cancel()
-
-	tunnelID, err := uuid.Parse(spec.ID)
-	if err != nil {
-		log.Debug().Err(err).Msg("gone probe: invalid tunnel id in spec")
-		return
-	}
-
-	// The cheap answer first. A provider that reaps a tunnel deletes the DNS
-	// record with it, so a hostname that has stopped existing settles the
-	// question without dialing anything.
-	if host := spec.GetHostname(); hostnameGone(ctx, host) {
-		log.Info().Str("hostname", host).Msg("gone probe: hostname no longer resolves, tunnel is gone")
-		t.Emit(v1.Event{Kind: v1.EventGone})
-		return
-	}
-
-	// Whatever the connector settled on, read per probe: cloudflared falls back
-	// at runtime, and probing the transport it abandoned would ask over a path
-	// this network may not carry.
-	p := protocol.Current()
-	switch p {
-	case connection.QUIC:
-		err = registerOverQUIC(ctx, spec, tunnelID, log)
-	case connection.HTTP2:
-		err = registerOverHTTP2(ctx, spec, tunnelID, log)
-	default:
-		log.Debug().Str("protocol", p.String()).Msg("gone probe: no registration path for this protocol")
-		return
-	}
-
-	if err != nil {
-		// cloudflared surfaces a refused registration as prose, so this is the
-		// same string match its own supervisor makes.
-		if msg := err.Error(); strings.Contains(msg, "Unauthorized") || strings.Contains(msg, "Tunnel not found") {
-			log.Info().Err(err).Msg("gone probe: edge refused the connection, tunnel is gone")
-			t.Emit(v1.Event{Kind: v1.EventGone})
-			return
-		}
-		log.Debug().Err(err).Str("protocol", p.String()).Msg("gone probe: no answer from the edge")
-		return
-	}
-	log.Debug().Str("protocol", p.String()).Msg("gone probe: edge accepted the connection, tunnel still exists")
-}
 
 // credentialRejected is what a caller sees when the edge refuses these
 // credentials: the class it can branch on, carrying the edge's own words and

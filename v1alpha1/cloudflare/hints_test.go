@@ -4,18 +4,24 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/cloudflared/connection"
+
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/probe"
 )
 
 // known is a spec with every field set, so one assertion covers every hint
@@ -335,5 +341,127 @@ func TestWithRecordIDRidesAsHint(t *testing.T) {
 	}
 	if got := seen.Get("X-Record-Id"); got != "from-env" {
 		t.Errorf("X-Record-Id = %q, want the env override", got)
+	}
+}
+
+// TestMain answers every hint probe "gone" so the hint tests reach the stub
+// mint without an edge; the tests below that care about the verdict set
+// their own.
+func TestMain(m *testing.M) {
+	probeHint = func(context.Context, connection.Protocol, *Spec, *slog.Logger) error { return probe.ErrGone }
+	os.Exit(m.Run())
+}
+
+// answerProbe fixes the hint probe's verdict for one test and reports how
+// many times it was asked.
+func answerProbe(t *testing.T, err error) *atomic.Int32 {
+	t.Helper()
+	prev := probeHint
+	var asked atomic.Int32
+	probeHint = func(context.Context, connection.Protocol, *Spec, *slog.Logger) error {
+		asked.Add(1)
+		return err
+	}
+	t.Cleanup(func() { probeHint = prev })
+	return &asked
+}
+
+// TestLiveHintIsAdoptedWithoutMint pins the point of the probe: a hint the
+// edge vouches for is the spec, and the provider is never asked.
+func TestLiveHintIsAdoptedWithoutMint(t *testing.T) {
+	clearSpecEnv(t)
+	asked := answerProbe(t, nil)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	spec, err := From(known).WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asked.Load() != 1 {
+		t.Errorf("probed %d times, want 1", asked.Load())
+	}
+	if seen != nil {
+		t.Error("mint called although the edge vouched for the hint")
+	}
+	if spec.Hostname != known.Hostname || spec.ID != known.ID {
+		t.Errorf("spec = %+v, want the hint verbatim", spec)
+	}
+}
+
+// TestHintInUseFailsLoudly pins the refusal: a hint another connector is
+// serving is neither adopted (this process would be the duplicate) nor
+// minted over (it is not gone). It is an error a caller can act on.
+func TestHintInUseFailsLoudly(t *testing.T) {
+	clearSpecEnv(t)
+	answerProbe(t, probe.ErrInUse)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	_, err := From(known).WithProvider(srv.URL).Provider().Spec(context.Background())
+	if !errors.Is(err, v1.ErrInUse) {
+		t.Errorf("err = %v, want errors.Is(_, v1.ErrInUse)", err)
+	}
+	if !errors.Is(err, v1.ErrFailed) {
+		t.Errorf("err = %v, want a failure class", err)
+	}
+	if seen != nil {
+		t.Error("mint called for a hint that is in use")
+	}
+}
+
+// TestUnansweredProbeMints pins the fallthrough: an edge that could not be
+// asked is not a verdict, and the provider is asked with the hint as before.
+func TestUnansweredProbeMints(t *testing.T) {
+	clearSpecEnv(t)
+	answerProbe(t, errors.New("no answer from the edge"))
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	spec, err := From(known).WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHints(t, seen, known)
+	wantMinted(t, spec)
+}
+
+// TestPartialHintIsNotProbed pins that only a hint that could register is
+// asked about: a name alone has nothing to present to the edge.
+func TestPartialHintIsNotProbed(t *testing.T) {
+	clearSpecEnv(t)
+	asked := answerProbe(t, nil)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	if _, err := New().WithHostname("named.tunneled.pizza").WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if asked.Load() != 0 {
+		t.Errorf("probed %d times for a partial hint, want 0", asked.Load())
+	}
+	if seen == nil {
+		t.Error("mint never called")
+	}
+}
+
+// TestProbeAsksOverThePinnedEdgeProtocol pins that the probe follows
+// WithEdgeProtocol: a caller who pinned quic because TCP is blocked must not
+// be probed over TCP.
+func TestProbeAsksOverThePinnedEdgeProtocol(t *testing.T) {
+	clearSpecEnv(t)
+	var got connection.Protocol
+	prev := probeHint
+	probeHint = func(_ context.Context, protocol connection.Protocol, _ *Spec, _ *slog.Logger) error {
+		got = protocol
+		return nil
+	}
+	t.Cleanup(func() { probeHint = prev })
+
+	if _, err := From(known).WithEdgeProtocol(EdgeQUIC).Provider().Spec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got != connection.QUIC {
+		t.Errorf("probed over %s, want quic", got)
 	}
 }

@@ -17,6 +17,8 @@ Deep-link by filename; line numbers will drift.
 | Lazy getters + `With*` mutators + DNS readiness | [`v1alpha1/tunnel.go`](./v1alpha1/tunnel.go)                     |
 | Generic providers (`Static`, `Env`) + handoff helpers | [`v1alpha1/provider.go`](./v1alpha1/provider.go)          |
 | Cloudflare engine (cloudflared supervisor wiring) | [`v1alpha1/cloudflare/cloudflare.go`](./v1alpha1/cloudflare/cloudflare.go) |
+| Gone probe (is the tunnel still there?)          | [`v1alpha1/cloudflare/probe/probe.go`](./v1alpha1/cloudflare/probe/probe.go) |
+| Trust set (embedded roots + host store)          | [`v1alpha1/cloudflare/trust/trust.go`](./v1alpha1/cloudflare/trust/trust.go) |
 | Quick-tunnel provider (tunnel.pizza)  | [`v1alpha1/cloudflare/quicktunnel.go`](./v1alpha1/cloudflare/quicktunnel.go) |
 | Network error reporting (NEL + Report-To client) | [`v1alpha1/nel/nel.go`](./v1alpha1/nel/nel.go) |
 | Unit tests + fuzz target                       | [`v1alpha1/tunnel_test.go`](./v1alpha1/tunnel_test.go)           |

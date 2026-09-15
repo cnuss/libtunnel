@@ -189,6 +189,7 @@ case errors.Is(conn.Err(), libtunnel.ErrFailed):
 | `ErrCertificate` | the provider's certificate could not be verified | never |
 | `ErrRejected` | the provider said no, or the request could not be built | never |
 | `ErrCredentialRejected` | the edge refused these credentials — the tunnel is gone | never |
+| `ErrInUse` | another connector is serving the replayed tunnel — one connector per tunnel | never |
 | `ErrProviderUnreachable` | the mint endpoint refuses, times out or 5xxs | 45s |
 | `ErrEdgeUnreachable` | the edge never accepted a connection | 30s |
 | `ErrRateLimited` | throttled past its budget, or past its advertised reset | 180s |
@@ -359,11 +360,12 @@ func reconnectOnWatch() libtunnel.Interceptor {
 
 `LIBTUNNEL_SPEC` is a first-class handoff channel with no plumbing: when the
 Cloudflare credential chain resolves a spec it exports it into the process's
-environment, and a child (or a re-exec) finds it there and sends it as the
-hint of its own mint. The provider hands the same tunnel back while it
-lives — the child is a second connector on it — and a replacement behind
-the same hostname if it does not, so the child connects under the parent's
-hostname either way. The export also sets `LIBTUNNEL_HOSTNAME` to the plain
+environment, and a child (or a re-exec) finds it there and asks the edge
+about it. Live and unserved, the child takes the tunnel over as-is — no
+mint. Gone, the child mints with the spec as its hint and the provider hands
+back a replacement behind the same hostname. Still served by the parent, the
+child fails with `ErrInUse`: one connector per tunnel, so a parent hands off
+by stopping first. The export also sets `LIBTUNNEL_HOSTNAME` to the plain
 hostname, so tooling can read it without parsing the envelope (libtunnel
 itself reads `LIBTUNNEL_SPEC`, not this).
 
@@ -379,7 +381,8 @@ fails loudly instead of silently unmarshaling a foreign spec.
 libtunnel.New(libtunnel.Cloudflare()).Hostname()
 cmd := exec.Command(os.Args[0], "child") // inherits the environment
 
-// child: the Cloudflare credential chain finds LIBTUNNEL_SPEC and mints on it
+// child: the Cloudflare credential chain finds LIBTUNNEL_SPEC and, the edge
+// vouching for it, takes the tunnel over — the parent never connected
 conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 ```
 
@@ -442,12 +445,12 @@ rebuild. (The one exception is noted below.)
 
 | Variable | Mirrors | Behavior |
 | -------- | ------- | -------- |
-| `LIBTUNNEL_SPEC` | — | Parent→child handoff: a serialized spec sent as the hint of this process's own mint (see above). Beats every other hint, including a code-pinned `From` spec. |
+| `LIBTUNNEL_SPEC` | — | Parent→child handoff: a serialized spec this process asks the edge about — adopted if live and unserved, `ErrInUse` if served, else the hint of its own mint (see above). Beats every other hint, including a code-pinned `From` spec. |
 | `LIBTUNNEL_FROM` | `From()` | Replay a spec by file path or literal JSON — `From`'s resolution, as the mint's hint. Applies after `LIBTUNNEL_SPEC`, before the code-pinned spec. |
 | `LIBTUNNEL_LOCAL_URL` | `WithLocalURL()` | Origin override, applied at origin-provide time: supersedes a `WithListener` listener, a `WithLocalURL` argument, and the start-trigger mint. Invalid value cancels the tunnel. |
 | `LIBTUNNEL_TLS` | `WithTLS()` | Bool (`strconv.ParseBool`). Fixed at backend construction; later `WithTLS` calls are no-ops. Unparsable value fails at connect. |
 | `LIBTUNNEL_HTTP2` | `WithHTTP2()` | Same rules as `LIBTUNNEL_TLS`. |
-| `LIBTUNNEL_TOKEN` | `WithToken()` | Credential on the mint request, sent as `Authorization: token <value>`. Every resolution mints, so it always rides; never part of the spec or its handoff. An explicit `WithHeader("Authorization", …)` / `LIBTUNNEL__CLOUDFLARE_HEADERS` entry replaces it. |
+| `LIBTUNNEL_TOKEN` | `WithToken()` | Credential on the mint request, sent as `Authorization: token <value>`. Rides every mint; a spec the edge vouches for is adopted without one. Never part of the spec or its handoff. An explicit `WithHeader("Authorization", …)` / `LIBTUNNEL__CLOUDFLARE_HEADERS` entry replaces it. |
 | `LIBTUNNEL_LOG` | `WithLogger()` | `debug`\|`info`\|`warn`\|`error`: the default logger becomes a stderr text logger at that level instead of silent. *The exception:* an explicit `WithLogger` keeps its handler — env carries a level, not a sink. |
 | `LIBTUNNEL_NO_REPORT` | — | Set to anything to stop the mint client reporting network errors to the provider. On by default: like a browser, it honors the provider's `NEL` + `Report-To` headers and posts a 4xx, timeout, DNS or TLS failure to the collector they name (for tunnel.pizza, Cloudflare's, into the zone's NEL analytics). Never carries credentials. |
 | `LIBTUNNEL_HOSTNAME` | — | Export-only mirror of the minted spec's hostname, for tooling; never read. |

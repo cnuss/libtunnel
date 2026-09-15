@@ -57,8 +57,8 @@ func (p staticProvider[T]) Spec(context.Context) (T, error) {
 // Export wraps a provider so the spec it resolves is published into this
 // process's environment as LIBTUNNEL_SPEC, and spawned children inherit the
 // same tunnel identity with no further plumbing. Every resolution is
-// exported: a child that re-minted on its parent's hint hands its own
-// children what the provider answered, not what it inherited.
+// exported, adopted or minted, so a child's own children get what this
+// process resolved.
 func Export[T v1.Spec](backend string, next v1.Provider[T]) v1.Provider[T] {
 	return exportProvider[T]{backend: backend, next: next}
 }

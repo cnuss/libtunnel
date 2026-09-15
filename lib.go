@@ -189,6 +189,7 @@ var (
 	ErrCertificate         = v1.ErrCertificate         // no trust store, bad clock, MITM proxy
 	ErrRejected            = v1.ErrRejected            // the provider said no, or the request was unbuildable
 	ErrCredentialRejected  = v1.ErrCredentialRejected  // the edge refused these credentials
+	ErrInUse               = v1.ErrInUse               // another connector is serving the replayed tunnel
 	ErrProviderUnreachable = v1.ErrProviderUnreachable // the mint endpoint never answered
 	ErrEdgeUnreachable     = v1.ErrEdgeUnreachable     // the edge never accepted a connection
 	ErrRateLimited         = v1.ErrRateLimited         // throttled past its budget
@@ -211,16 +212,19 @@ func New[T v1.Spec](backend v1.Backend[T]) TunnelV1 {
 
 // Cloudflare returns the Cloudflare backend: an in-process cloudflared
 // quick-tunnel engine (no cloudflared binary required). Its credential chain
-// always mints an anonymous *.tunneled.pizza quick tunnel, hinting with
-// whatever the process already knows about the tunnel, env first: the spec
-// a parent process handed off in LIBTUNNEL_SPEC, else the spec LIBTUNNEL_FROM
-// references (file path or literal JSON — From's resolution), else a
-// code-pinned From spec. The provider decides what to honor — the same
-// tunnel back while it lives, a replacement behind the same hostname when it
-// does not, a fresh hostname when the reservation is gone. The resolved spec
-// is exported back into the environment so spawned children inherit the same
-// tunnel identity; a spec this process exported itself never becomes its
-// own hint — a second in-process tunnel mints its own identity.
+// starts from whatever the process already knows about the tunnel, env
+// first: the spec a parent process handed off in LIBTUNNEL_SPEC, else the
+// spec LIBTUNNEL_FROM references (file path or literal JSON — From's
+// resolution), else a code-pinned From spec. A complete spec is put to the
+// edge before anything else: live and unserved, it is adopted as-is; served
+// by another connector, the tunnel fails with ErrInUse; gone or unanswered,
+// the chain mints an anonymous *.tunneled.pizza quick tunnel with the spec
+// as its hint, and the provider decides what to honor — a replacement behind
+// the same hostname, or a fresh one when the reservation is gone. The
+// resolved spec is exported back into the environment so spawned children
+// inherit the same tunnel identity; a spec this process exported itself
+// never becomes its own hint — a second in-process tunnel mints its own
+// identity.
 //
 // Individual spec fields can be overridden with the backend's setters —
 // WithID, WithName, WithHostname, WithAccountTag, WithSecret — or their
@@ -234,8 +238,9 @@ func Cloudflare() *cloudflare.Backend {
 	return cloudflare.New()
 }
 
-// From returns an unstarted tunnel that replays a previously serialized spec
-// as the hint of its own mint. spec is an existing file path, otherwise the
+// From returns an unstarted tunnel that replays a previously serialized spec:
+// adopted as-is when the edge vouches for it, else the hint of a fresh mint
+// (see Cloudflare). spec is an existing file path, otherwise the
 // serialized JSON itself — from Serialize, or off LIBTUNNEL_SPEC. Empty —
 // the empty string, or a path to an empty file — is no spec at all: it is
 // New(Cloudflare()), a mint with nothing to hint, so a caller can pass

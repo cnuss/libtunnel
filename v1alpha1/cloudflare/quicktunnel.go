@@ -17,6 +17,7 @@ import (
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/trust"
 	"github.com/cnuss/libtunnel/v1alpha1/nel"
 )
 
@@ -170,7 +171,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			// endpoint. Without this the edge connection would have verified
 			// fine against the bundle compiled into the same binary while the
 			// mint three files away could not (#164).
-			TLSClientConfig: &tls.Config{RootCAs: caCertPool()},
+			TLSClientConfig: &tls.Config{RootCAs: trust.Pool()},
 			// Per-attempt bounds. The TLS handshake terminates at the
 			// provider's edge and is quick regardless of load, so it stays
 			// tight — a hung handshake is a dead endpoint, and failing fast

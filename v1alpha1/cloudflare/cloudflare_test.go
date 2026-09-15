@@ -10,7 +10,6 @@ package cloudflare
 import (
 	"bufio"
 	"context"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1301,27 +1300,6 @@ func TestQuickTunnelLongResetFailsImmediately(t *testing.T) {
 	}
 }
 
-// TestCACertPoolCarriesEmbeddedRoots pins #164: the pool libtunnel dials with
-// contains the roots compiled into the binary, so a host with no
-// ca-certificates package can still verify the mint and edge endpoints. Every
-// embedded root is self-signed, so verifying one against the pool proves it is
-// in there without reaching the network.
-func TestCACertPoolCarriesEmbeddedRoots(t *testing.T) {
-	pool := caCertPool()
-	if pool == nil {
-		t.Fatal("caCertPool() = nil")
-	}
-	embedded := caCerts()
-	if len(embedded) == 0 {
-		t.Fatal("no embedded roots parsed")
-	}
-	for _, root := range embedded {
-		if _, err := root.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
-			t.Fatalf("embedded root %q not in the pool: %v", root.Subject.CommonName, err)
-		}
-	}
-}
-
 // TestEdgeRejectionBeatsTheBudget pins the shape of the failure a caller sees.
 // connect's select cannot be driven without a live edge, so this asserts the
 // error the refusal branch constructs: the class, the umbrella, the edge's own
@@ -1951,104 +1929,6 @@ func TestEdgeEventLogOmitsUnsetFields(t *testing.T) {
 	log.Debug("edge event", "event", edgeEventName(connection.Disconnected), "connIndex", zero.Index)
 	if strings.Contains(buf.String(), "protocol=") {
 		t.Errorf("a disconnected event named a protocol it does not carry: %s", buf.String())
-	}
-}
-
-// TestProbeIndexIsClearOfTheSupervisor pins that the probe cannot collide with
-// a real connection, which would answer EDUPCONN instead of the question.
-func TestProbeIndexIsClearOfTheSupervisor(t *testing.T) {
-	if probeConnIndex < haConnections {
-		t.Errorf("probe index %d is inside the supervisor's range 0..%d", probeConnIndex, haConnections-1)
-	}
-}
-
-// shortProbeInterval shrinks the poll so a test exercises the loop rather
-// than the wait.
-func shortProbeInterval(t *testing.T, d time.Duration) {
-	t.Helper()
-	prev := probeInterval
-	probeInterval = d
-	t.Cleanup(func() { probeInterval = prev })
-}
-
-// TestGoneProbeRunsContinuously pins that the probe keeps asking. A tunnel
-// reaped while its connections still look fine produces no edge event, so
-// waiting for one is waiting forever.
-func TestGoneProbeRunsContinuously(t *testing.T) {
-	shortProbeInterval(t, 50*time.Millisecond)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	b := New()
-	var probes atomic.Int32
-
-	b.runProbe(ctx, func() { probes.Add(1) })
-
-	deadline := time.Now().Add(5 * time.Second)
-	for probes.Load() < 3 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := probes.Load(); got < 3 {
-		t.Errorf("probed %d times, want the loop to keep going", got)
-	}
-}
-
-// TestGoneProbeStopsWithTheTunnel pins that nothing outlives the tunnel: a
-// probe firing after close would dial the edge on behalf of something already
-// gone.
-func TestGoneProbeStopsWithTheTunnel(t *testing.T) {
-	shortProbeInterval(t, 50*time.Millisecond)
-	ctx, cancel := context.WithCancel(context.Background())
-	b := New()
-	var probes atomic.Int32
-
-	b.runProbe(ctx, func() { probes.Add(1) })
-
-	deadline := time.Now().Add(5 * time.Second)
-	for probes.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	cancel()
-
-	settled := probes.Load()
-	time.Sleep(300 * time.Millisecond)
-	if got := probes.Load(); got > settled+1 {
-		t.Errorf("probed %d times after the tunnel ended, want the loop stopped", got-settled)
-	}
-}
-
-// TestHostnameGoneOnlyAcceptsNXDOMAIN pins the narrow reading. A provider that
-// reaps a tunnel deletes its record, so a name that positively does not exist
-// answers the question — but a resolver that is merely unhappy does not, and
-// treating the two alike would report a healthy tunnel gone every time the
-// machine's DNS wobbled.
-func TestHostnameGoneOnlyAcceptsNXDOMAIN(t *testing.T) {
-	ctx := context.Background()
-
-	// RFC 2606 reserves .invalid, so no resolver will ever answer for it.
-	if !hostnameGone(ctx, "libtunnel-reaped.invalid") {
-		t.Skip("resolver does not return NXDOMAIN here (captive portal or wildcard DNS)")
-	}
-	// A name that resolves is not gone.
-	if hostnameGone(ctx, "one.one.one.one") {
-		t.Error("a resolving hostname reported gone")
-	}
-	// Nothing to ask about.
-	if hostnameGone(ctx, "") {
-		t.Error("an empty hostname reported gone")
-	}
-	// A cancelled lookup is the resolver being unavailable, not an answer.
-	dead, cancel := context.WithCancel(ctx)
-	cancel()
-	if hostnameGone(dead, "libtunnel-reaped.invalid") {
-		t.Error("a cancelled lookup reported gone; only NXDOMAIN is an answer")
-	}
-}
-
-// TestHostnameGoneStripsAPort pins that a spec hostname carrying :port still
-// resolves — GetHostname may include one and the resolver will not take it.
-func TestHostnameGoneStripsAPort(t *testing.T) {
-	if hostnameGone(context.Background(), "one.one.one.one:443") {
-		t.Error("a resolving host:port reported gone; the port was not stripped")
 	}
 }
 

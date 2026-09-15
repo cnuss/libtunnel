@@ -139,6 +139,12 @@ var (
 	// spec that was replayed is dead and should be discarded.
 	ErrCredentialRejected error = &class{ErrFailed, "credential rejected by the edge", 0}
 
+	// ErrInUse is the Err result of a replayed spec whose tunnel another
+	// connector is serving: asked before any mint, the edge refused the
+	// check as a duplicate connection. One connector per tunnel — a parent
+	// handing off stops serving first. Nothing here changes on retry.
+	ErrInUse error = &class{ErrFailed, "tunnel in use by another connector", 0}
+
 	// ErrProviderUnreachable is the Err result of a mint endpoint that never
 	// answered: it refuses, times out, or keeps returning 5xx for the budget.
 	//
@@ -211,9 +217,10 @@ func Budget(err error) time.Duration {
 const (
 	// SpecEnv carries a JSON-encoded spec across a process boundary — the
 	// parent→child handoff channel. A parent that resolves a spec exports it
-	// here; a child sends it as the hint of its own mint, so the provider
-	// hands the same tunnel back and it connects under the same hostname.
-	// The value is a tagged envelope (the backend that minted it plus its
+	// here; a child asks the edge about it and takes the tunnel over when it
+	// is live and unserved, mints with it as the hint when it is gone, and
+	// fails with ErrInUse when the parent is still serving it. The value is
+	// a tagged envelope (the backend that minted it plus its
 	// spec), so a child running a different backend fails loudly. First in
 	// the hint order: it beats FromEnv and a code-pinned From spec.
 	SpecEnv = "LIBTUNNEL_SPEC"
@@ -223,8 +230,8 @@ const (
 	HostnameEnv = "LIBTUNNEL_HOSTNAME"
 	// FromEnv replays a serialized spec by reference — file path or literal
 	// JSON, resolved exactly like libtunnel.From — as From's environment
-	// mirror: the spec is the hint of this process's own mint. Second in the
-	// hint order: after SpecEnv, before a code-pinned From spec. An
+	// mirror, resolved like a code-pinned From spec. Second in the hint
+	// order: after SpecEnv, before a code-pinned From spec. An
 	// unresolvable or foreign-backend reference is an error, not a
 	// fallthrough.
 	FromEnv = "LIBTUNNEL_FROM"
@@ -387,9 +394,9 @@ type Backend[T Spec] interface {
 	// fixes it from the environment under the same rules as WithTLS.
 	WithHTTP2(bool) Backend[T]
 	// WithToken sets the credential the mint request carries, as
-	// "Authorization: token <value>". Every resolution mints — a handoff, a
-	// replay and a pinned field set all ask the provider — so the token
-	// always rides; it is never part of the spec or its handoff. A backend whose provider
+	// "Authorization: token <value>". It rides every mint; a spec the edge
+	// vouches for is adopted without one. Never part of the spec or its
+	// handoff. A backend whose provider
 	// has no notion of a token accepts and ignores it. Chainable. The
 	// LIBTUNNEL_TOKEN environment variable beats it.
 	WithToken(token string) Backend[T]
@@ -427,7 +434,7 @@ type Tunnel interface {
 	//
 	// Err reports a failure class for a tunnel that will not come up:
 	// errors.Is(err, ErrFailed) is the coarse check, and the class wrapping
-	// it — ErrCertificate, ErrRejected, ErrCredentialRejected,
+	// it — ErrCertificate, ErrRejected, ErrCredentialRejected, ErrInUse,
 	// ErrProviderUnreachable, ErrEdgeUnreachable, ErrRateLimited — is what an
 	// operator can act on. A tunnel closed deliberately reports ErrClosed,
 	// which is terminal but not a failure.
