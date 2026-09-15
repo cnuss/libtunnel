@@ -56,8 +56,8 @@ func main() {
 		Level: level,
 	}))
 
-	// WithContext upgrades URL from "the hostname resolves" to "the tunnel is
-	// reachable end to end": URL then blocks until TunnelReady, honoring ctx.
+	// URL blocks until the public URL is verified to work from here; ctx
+	// bounds the wait.
 	tun := libtunnel.New(libtunnel.Cloudflare().WithTLS(true)).
 		WithLogger(logger).
 		WithContext(ctx).

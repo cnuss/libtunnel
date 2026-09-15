@@ -58,13 +58,8 @@ func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 			t.userCtx = ctx
 			// A context that is already done takes effect right here, before
 			// the tunnel can start. Left to the watcher below it would land
-			// whenever that goroutine happened to be scheduled, which lets
-			// start's post-connect guard — the checkpoint that keeps a dead
-			// tunnel from ever reporting ready — run first and close
-			// tunnelReady; URL's three-way select then picks uniformly among
-			// ready cases and can hand a URL to a caller who gave up before
-			// asking (#153). Applying it synchronously orders the cancel
-			// before the start, so the guard holds.
+			// whenever that goroutine was scheduled — possibly after the
+			// engine reported the tunnel established.
 			if ctx.Err() != nil {
 				t.cancel(context.Cause(ctx))
 				return
@@ -90,7 +85,7 @@ func (t *TunnelImpl[T]) WithContext(ctx context.Context) v1.Tunnel {
 //
 // The origin is provided exactly once, shared with WithLocalURL and the
 // start-trigger mint. Providing it again — a second WithListener or
-// WithLocalURL, or either after a start trigger (Listener, URL, TunnelReady)
+// WithLocalURL, or either after a start trigger (Listener, URL, Ready)
 // already minted one — cancels the tunnel (Err reports "origin already
 // provided"). As an alternative to bringing your own, call Listener() to have
 // the tunnel mint a loopback listener for you.
@@ -352,16 +347,13 @@ func (t *TunnelImpl[T]) provideURLs(urls []*url.URL) {
 }
 
 // start runs the connect sequence in the background: mint the spec, dial the
-// edge via connect (which blocks until the connection is up), then close
-// hostname and tunnel readiness together. No DNS settle happens here anymore:
-// the mint provider waits out the hostname record's spread across the zone's
-// nameservers before returning credentials (#140), so a spec in hand means a
-// propagated hostname, and a registered edge connection is a reachable
-// tunnel. (The old client-side settle — a blind 5s after registration — was
-// the honest design when the mint returned before the record existed
-// anywhere; see #130, #133, #134 for why every querying scheme lost.) On a
-// foreign backend (nil engine, tunnel born canceled — see New) it does
-// nothing.
+// edge via connect (which blocks until the first connection is up), then
+// report the hostname. No DNS settle: the mint provider waits out the
+// record's spread across the zone's nameservers before returning
+// credentials, so a spec in hand is a propagated hostname. Establishment —
+// the public URL verified to work — is the engine's to report, and comes
+// later. On a foreign backend (nil engine, tunnel born canceled — see New)
+// it does nothing.
 func (t *TunnelImpl[T]) start(connect func() error) {
 	if t.engine == nil {
 		return
@@ -378,17 +370,14 @@ func (t *TunnelImpl[T]) start(connect func() error) {
 			// Canceled while resolving or connecting — a failed spec fetch
 			// cancels inside t.Spec() above and a lenient engine can still
 			// "connect" after it, and a WithContext cancel can land mid-dial.
-			// A dead tunnel must never report ready. (The settle-delay select
-			// used to be this checkpoint, incidentally, until #140 removed
-			// the delay; now the check is explicit.)
+			// A dead tunnel reports nothing.
 			return
 		}
 
-		t.markHostnameReady(t.Hostname())
-
-		t.Logger().Info("tunnel is ready")
-		close(t.tunnelReady)
-		t.Emit(v1.Event{Kind: v1.EventTunnelReady})
+		host := t.Hostname()
+		t.hostname.Store(&host)
+		t.Logger().Info("edge connected", "hostname", host)
+		t.Emit(v1.Event{Kind: v1.EventHostnameReady, Hostname: host})
 	}()
 }
 
@@ -412,7 +401,7 @@ func (t *TunnelImpl[T]) Listener() net.Listener {
 }
 
 // ensureOrigin is the shared start-trigger step behind Listener, URL, and
-// TunnelReady: with no origin provided yet it adopts the v1.LocalURLEnv override
+// Ready: with no origin provided yet it adopts the v1.LocalURLEnv override
 // when set, else mints a loopback listener (127.0.0.1:0) and adopts that;
 // with an origin already provided — listener or URL — it is a no-op.
 func (t *TunnelImpl[T]) ensureOrigin() {
@@ -655,9 +644,10 @@ func (t *TunnelImpl[T]) Port() int {
 	return portOf(t.Hostname())
 }
 
-// URL is https://<Hostname>/. It blocks until the tunnel is reachable end to
-// end (TunnelReady). Returns nil if the tunnel, or a WithContext caller
-// context, is canceled first, per the v1 contract's zero-value-on-cancel rule.
+// URL is https://<Hostname>/. It blocks until the public URL is verified to
+// work from here (EventEstablished). Returns nil if the tunnel, or a
+// WithContext caller context, is canceled first, per the v1 contract's
+// zero-value-on-cancel rule.
 //
 // URL demands public reachability, so like Listener it is a start trigger:
 // with no origin provided it mints a loopback listener and starts the edge
@@ -675,10 +665,14 @@ func (t *TunnelImpl[T]) URL() *url.URL {
 	// await helper does not model.
 	t.userCtxOnce.Do(func() {})
 	select {
-	case <-t.TunnelReady():
+	case <-t.established:
 	case <-t.ctx.Done():
 		return nil
 	case <-t.userCtx.Done():
+		return nil
+	}
+	// Both arms can be ready at once; a dead tunnel never hands out a URL.
+	if t.ctx.Err() != nil || t.userCtx.Err() != nil {
 		return nil
 	}
 
@@ -702,40 +696,13 @@ func (t *TunnelImpl[T]) CACerts() []*x509.Certificate {
 	return t.caCerts
 }
 
-// TunnelReady is closed when the edge connection is up — with the hostname's
-// DNS propagation already waited out at mint, a registered connection is a
-// reachable tunnel. Waiting on readiness demands a running tunnel, so like
-// URL it is a start trigger: with no origin provided it mints a loopback
-// listener and starts the edge connection before handing back the channel.
-func (t *TunnelImpl[T]) TunnelReady() <-chan struct{} {
-	t.ensureOrigin()
-	return t.tunnelReady
-}
-
-// Ready implements v1.Lifecycle: delivers the tunnel once it is serving end
-// to end. Waits on TunnelReady, so it is the same start trigger.
+// Ready implements v1.Lifecycle: delivers the tunnel once the public URL is
+// verified to work from here (EventEstablished). Waiting on readiness demands
+// a running tunnel, so like URL it is a start trigger: with no origin
+// provided it mints a loopback listener and starts the edge connection.
 func (t *TunnelImpl[T]) Ready() <-chan v1.Tunnel {
-	return t.deliver(t.TunnelReady())
-}
-
-// HostnameReady returns the channel closed once the public hostname is
-// expected to resolve: when the edge connection registers — the record's
-// spread across the zone's nameservers was already waited out by the mint
-// provider before it returned credentials (see start). Nothing on this
-// machine is asked about the hostname — its resolver's first sight of the
-// name stays the caller's. This is a pure accessor — select on it (and on
-// Done).
-func (t *TunnelImpl[T]) HostnameReady() <-chan struct{} {
-	return t.hostnameReady
-}
-
-// markHostnameReady logs the ready hostname and closes the readiness
-// channel. One caller (start) reaches it once, so the close needs no guard.
-func (t *TunnelImpl[T]) markHostnameReady(host string) {
-	t.hostname.Store(&host)
-	t.Logger().Info("hostname ready", "hostname", host)
-	close(t.hostnameReady)
-	t.Emit(v1.Event{Kind: v1.EventHostnameReady, Hostname: host})
+	t.ensureOrigin()
+	return t.deliver(t.established)
 }
 
 // WithEventListener registers fn to receive the tunnel's lifecycle events.
@@ -759,6 +726,9 @@ func (t *TunnelImpl[T]) WithEventListener(fn func(v1.Event)) v1.Tunnel {
 // WithEventListener. A panicking one is contained here: a caller's bad
 // callback should not take a working tunnel down.
 func (t *TunnelImpl[T]) Emit(e v1.Event) {
+	if e.Kind == v1.EventEstablished && t.ctx.Err() == nil {
+		t.establishedOnce.Do(func() { close(t.established) })
+	}
 	if e.Hostname == "" {
 		// Read from the atomic, not t.spec: that field is guarded by specOnce
 		// and written on whichever goroutine resolves it, while an event can

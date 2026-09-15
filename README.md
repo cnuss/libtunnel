@@ -17,7 +17,7 @@ listener explicitly, `WithLocalURL` points at one or more already-running
 local origins instead (the `cloudflared tunnel --url` shape; extra origins are
 reachable per request via a bare `?n` query parameter — assets and iframes
 follow their document URL via Referer, top-level visits stick via cookie),
-and `Listener`, `URL`, and `TunnelReady` mint a loopback listener if no origin
+and `Listener`, `URL`, and `Ready` mint a loopback listener if no origin
 was provided.
 Configuration is write-once: each `With*` mutator takes effect at most once
 and is a no-op after its value is fixed, whether by an earlier call or by the
@@ -53,7 +53,7 @@ func main() {
 		fmt.Fprint(w, "hello from libtunnel")
 	}))
 
-	url := conn.URL() // blocks until reachable end to end
+	url := conn.URL() // blocks until the public URL is verified from here
 	if url == nil {
 		log.Fatal(conn.Err())
 	}
@@ -108,18 +108,18 @@ type Tunnel interface {
     CACerts() []*x509.Certificate
 
     Listener() net.Listener // start trigger: mints a loopback listener if none provided
-    URL() *url.URL // blocks until reachable end to end; nil if canceled first;
-                   // start trigger, like Listener
+    URL() *url.URL // blocks until the public URL is verified from here; nil if
+                   // canceled first; start trigger, like Listener
+    Serialize() string // the spec as LIBTUNNEL_SPEC carries it; From replays it
 
-    // Lifecycle[Tunnel] — embedded; the three verbs a supervisor needs.
-    // Each call is a fresh channel that delivers the tunnel once, then closes.
-    Ready() <-chan Tunnel           // serving end to end; start trigger, like Listener;
-                                    // closes empty if the tunnel ends first
+    // Lifecycle[Tunnel] — embedded; the verbs a supervisor needs.
+    // Each channel call is a fresh channel that delivers the tunnel once, then closes.
+    Ready() <-chan Tunnel           // public URL verified from here; start trigger, like
+                                    // Listener; closes empty if the tunnel ends first
     Done() <-chan Tunnel            // tunnel failed or shut down
     Err() error                     // why (nil while alive); see Failure classes
-
-    HostnameReady() <-chan struct{} // hostname resolves on authoritative NS
-    TunnelReady() <-chan struct{}   // closed when Ready would deliver
+    Cancel(cause ...error)          // no cause: deliberate shutdown, Err is ErrClosed;
+                                    // a cause: ends as that failure
 
     // write-once mutators: first call wins, no-ops once the value is fixed
     WithLogger(log *slog.Logger) Tunnel      // default: silent

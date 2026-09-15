@@ -1757,7 +1757,6 @@ func TestEstablishRidesOutTheEdge(t *testing.T) {
 
 	b := New()
 	b.establishInterval = 10 * time.Millisecond
-	b.establishBudget = 5 * time.Second
 	rec := &recorder{}
 	log := slog.New(slog.DiscardHandler)
 
@@ -1771,29 +1770,6 @@ func TestEstablishRidesOutTheEdge(t *testing.T) {
 	}
 	if got := origin.Load(); got != 0 {
 		t.Errorf("the origin saw %d requests, want 0", got)
-	}
-}
-
-// TestEstablishGivesUpAtTheBudget pins the bound: an edge that never routes
-// leaves the tunnel connected but unverified, with no event and no hang.
-func TestEstablishGivesUpAtTheBudget(t *testing.T) {
-	edge := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(530)
-	}))
-	defer edge.Close()
-
-	b := New()
-	b.establishInterval = 10 * time.Millisecond
-	b.establishBudget = 100 * time.Millisecond
-	rec := &recorder{}
-
-	start := time.Now()
-	b.establish(context.Background(), rec, edge.Client(), edge.URL+"/", "n", slog.New(slog.DiscardHandler))
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("establish ran %v past a 100ms budget", elapsed)
-	}
-	if got := rec.kinds(); len(got) != 0 {
-		t.Errorf("events %v, want none from an edge that never routed", got)
 	}
 }
 
@@ -1920,7 +1896,7 @@ func TestServingFiresOnceTheProxyServes(t *testing.T) {
 		t.Errorf("EventServing carried hostname %q, want empty until the edge registers", seen[0].Hostname)
 	}
 	for _, k := range got {
-		if k == v1.EventConnected || k == v1.EventTunnelReady {
+		if k == v1.EventConnected {
 			t.Errorf("events %v: %s reported after the tunnel was canceled at serving", got, k)
 		}
 	}
@@ -2149,5 +2125,34 @@ func TestTokenEnvBeatsCode(t *testing.T) {
 	}
 	if got := seen.Get("Authorization"); got != "token from-env" {
 		t.Errorf("Authorization = %q on a direct QuickTunnel, want the env token", got)
+	}
+}
+
+// TestEstablishKeepsTryingUntilCanceled pins that verification has no budget
+// of its own: an edge that never routes is probed until the context ends,
+// which is the caller's WithContext to bound.
+func TestEstablishKeepsTryingUntilCanceled(t *testing.T) {
+	var hits atomic.Int32
+	edge := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(530)
+	}))
+	defer edge.Close()
+
+	b := New()
+	b.establishInterval = 10 * time.Millisecond
+	rec := &recorder{}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	b.establish(ctx, rec, edge.Client(), edge.URL+"/", "n", slog.New(slog.DiscardHandler))
+	if ctx.Err() == nil {
+		t.Error("establish returned before its context ended")
+	}
+	if got := hits.Load(); got < 10 {
+		t.Errorf("edge saw %d requests in 300ms at a 10ms interval; want it probed until the context ended", got)
+	}
+	if got := rec.kinds(); len(got) != 0 {
+		t.Errorf("events %v, want none from an edge that never routed", got)
 	}
 }

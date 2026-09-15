@@ -20,17 +20,15 @@
 // (the cloudflared `tunnel --url` shape; extra origins are reachable per
 // request via a bare ?n query parameter — assets and iframes follow their
 // document URL via Referer, top-level visits stick via cookie), and Listener,
-// URL, and TunnelReady mint a loopback listener if no origin was provided.
+// URL, and Ready mint a loopback listener if no origin was provided.
 //
 //	l, _ := net.Listen("tcp", "127.0.0.1:0")
 //	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 //	go server.Serve(conn.Listener())
-//	select {
-//	case <-conn.TunnelReady():
-//		fmt.Println(conn.URL()) // public https://<hostname>/
-//	case <-conn.Done():
-//		log.Fatal(conn.Err()) // TunnelReady never closes on failure
+//	if _, ok := <-conn.Ready(); !ok {
+//		log.Fatal(conn.Err()) // Ready closes empty when the tunnel ends first
 //	}
+//	fmt.Println(conn.URL()) // public https://<hostname>/
 package libtunnel
 
 import (
@@ -152,7 +150,6 @@ type (
 
 const (
 	EventHostnameReady = v1.EventHostnameReady // the hostname is expected to resolve
-	EventTunnelReady   = v1.EventTunnelReady   // reachable end to end
 	EventServing       = v1.EventServing       // the local side is up: proxy listening, origin wired
 	EventConnected     = v1.EventConnected     // every edge connection is up
 	EventDisconnected  = v1.EventDisconnected  // no edge connection is up

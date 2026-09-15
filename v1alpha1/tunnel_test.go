@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +34,9 @@ type fakeEngine struct {
 	reconnected bool
 	// tokens records every WithToken the tunnel forwarded, in order.
 	tokens []string
+	// manual leaves EventEstablished to the test instead of firing it on
+	// connect, for the cases that observe the gap between the two.
+	manual bool
 }
 
 func newFakeEngine(spec *cloudflare.Spec) *fakeEngine {
@@ -53,10 +57,16 @@ func (e *fakeEngine) Proxy() *httputil.ReverseProxy   { return e.proxy }
 func (e *fakeEngine) Listener() net.Listener          { return e.listener }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
+	if !e.manual {
+		t.Emit(v1.Event{Kind: v1.EventEstablished})
+	}
 	return nil
 }
 func (e *fakeEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], urls []*url.URL) error {
 	e.gotURL <- urls
+	if !e.manual {
+		t.Emit(v1.Event{Kind: v1.EventEstablished})
+	}
 	return nil
 }
 
@@ -276,18 +286,19 @@ func TestURLMintsListenerWhenNoneProvided(t *testing.T) {
 	}
 }
 
-// TestTunnelReadyStartsTunnelWhenNoneProvided pins TunnelReady as a start
-// trigger: waiting on it with no listener provided must start the tunnel and
-// eventually fire, not block forever.
-func TestTunnelReadyStartsTunnelWhenNoneProvided(t *testing.T) {
+// TestReadyStartsTunnelWhenNoneProvided pins Ready as a start trigger:
+// waiting on it with no listener provided must start the tunnel and
+// eventually deliver, not block forever.
+func TestReadyStartsTunnelWhenNoneProvided(t *testing.T) {
 	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
 
 	select {
-	case <-tun.TunnelReady():
-	case <-tun.Done():
-		t.Fatalf("tunnel died instead of becoming ready: %v", tun.Err())
+	case _, ok := <-tun.Ready():
+		if !ok {
+			t.Fatalf("tunnel died instead of becoming ready: %v", tun.Err())
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("TunnelReady never closed — it did not start the tunnel")
+		t.Fatal("Ready never delivered — it did not start the tunnel")
 	}
 }
 
@@ -542,8 +553,8 @@ func TestListenerAfterWithLocalURLCancels(t *testing.T) {
 }
 
 // TestWithLocalURLReadiness pins the start triggers for a URL origin: URL and
-// TunnelReady must not mint a listener (the origin is already provided) and
-// must complete once the engine connects and the hostname resolves.
+// Ready must not mint a listener (the origin is already provided) and must
+// complete once the tunnel is established.
 func TestWithLocalURLReadiness(t *testing.T) {
 	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
 	tun := v1alpha1.New(engine)
@@ -553,11 +564,12 @@ func TestWithLocalURLReadiness(t *testing.T) {
 		t.Fatalf("URL() = %v, want https://demo.tunneled.pizza/", u)
 	}
 	select {
-	case <-conn.TunnelReady():
-	case <-conn.Done():
-		t.Fatalf("tunnel died instead of becoming ready: %v", conn.Err())
+	case _, ok := <-conn.Ready():
+		if !ok {
+			t.Fatalf("tunnel died instead of becoming ready: %v", conn.Err())
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("TunnelReady never closed for a URL origin")
+		t.Fatal("Ready never delivered for a URL origin")
 	}
 	select {
 	case l := <-engine.got:
@@ -579,7 +591,7 @@ func TestEnvLocalURLOverridesProvides(t *testing.T) {
 		"WithLocalURL": func(tun v1.Tunnel, _ net.Listener) {
 			tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:9"})
 		},
-		"StartTriggerMint": func(tun v1.Tunnel, _ net.Listener) { tun.TunnelReady() },
+		"StartTriggerMint": func(tun v1.Tunnel, _ net.Listener) { tun.Ready() },
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(v1.LocalURLEnv, "http://127.0.0.1:4321")
@@ -687,21 +699,6 @@ func TestWithContextWriteOnce(t *testing.T) {
 	}
 }
 
-// TestTunnelReadyAfterEngineConnects pins that TunnelReady closes once the
-// engine connects: readiness follows edge registration directly, the mint
-// provider having already waited out the hostname's DNS propagation.
-func TestTunnelReadyAfterEngineConnects(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
-
-	conn := tun.WithListener(listen(t))
-
-	select {
-	case <-conn.TunnelReady():
-	case <-time.After(15 * time.Second):
-		t.Fatal("TunnelReady never closed after the engine connected")
-	}
-}
-
 // TestLifecycleDeliversTheTunnel pins the payload: Ready and Done each hand
 // back the tunnel itself, to every waiter — a closed channel would broadcast,
 // but carry nil.
@@ -732,7 +729,7 @@ func TestLifecycleDeliversTheTunnel(t *testing.T) {
 		t.Fatalf("Err = %v while the tunnel is alive, want nil", err)
 	}
 
-	tun.Cancel(v1.ErrClosed)
+	life.Cancel()
 	select {
 	case got, ok := <-life.Done():
 		if !ok || got != v1.Tunnel(conn) {
@@ -763,59 +760,27 @@ func TestReadyClosesEmptyOnFailure(t *testing.T) {
 	}
 }
 
-// TestHostnameReadyAtRegistration pins that readiness follows edge
+// TestHostnameReadyAtRegistration pins that the hostname is reported at edge
 // registration with no client-side settle: the mint provider waits out the
 // record's spread before returning credentials, so holding the caller after
-// connect would be a second wait for the same propagation (#140).
+// connect would be a second wait for the same propagation.
 func TestHostnameReadyAtRegistration(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"}))
-	conn := tun.WithListener(listen(t))
-
-	select {
-	case <-conn.HostnameReady():
-	case <-time.After(2 * time.Second):
-		t.Fatal("HostnameReady not closed promptly after the engine connected — is a settle wait back?")
-	}
-}
-
-// TestURLWaitsForTunnelReady pins that URL blocks until the tunnel is
-// reachable end to end, with or without a caller context. WithContext adds a
-// cancellation source; it does not change what URL waits for.
-func TestURLWaitsForTunnelReady(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		with func(v1.Tunnel) v1.Tunnel
-	}{
-		{"without WithContext", func(tun v1.Tunnel) v1.Tunnel { return tun }},
-		{"with WithContext", func(tun v1.Tunnel) v1.Tunnel { return tun.WithContext(context.Background()) }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			tun := tc.with(v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})))
-			conn := tun.WithListener(listen(t))
-
-			got := make(chan string, 1)
-			go func() {
-				if u := conn.URL(); u != nil {
-					got <- u.String()
-				} else {
-					got <- ""
-				}
-			}()
-
-			select {
-			case u := <-got:
-				if u != "https://www.cloudflare.com/" {
-					t.Errorf("URL() = %q, want https://www.cloudflare.com/", u)
-				}
-				select {
-				case <-conn.TunnelReady():
-				default:
-					t.Error("URL returned before TunnelReady closed")
-				}
-			case <-time.After(15 * time.Second):
-				t.Fatal("URL never returned after the engine connected")
+	ready := make(chan string, 1)
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "www.cloudflare.com"})).
+		WithEventListener(func(e v1.Event) {
+			if e.Kind == v1.EventHostnameReady {
+				ready <- e.Hostname
 			}
 		})
+	tun.WithListener(listen(t))
+
+	select {
+	case host := <-ready:
+		if host != "www.cloudflare.com" {
+			t.Errorf("EventHostnameReady carried %q, want the spec's hostname", host)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EventHostnameReady not fired promptly after the engine connected — is a settle wait back?")
 	}
 }
 
@@ -857,9 +822,10 @@ func TestWithContextCancelTearsDownURLOrigin(t *testing.T) {
 		WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
 
 	select {
-	case <-conn.TunnelReady():
-	case <-conn.Done():
-		t.Fatalf("tunnel died before becoming ready: %v", conn.Err())
+	case _, ok := <-conn.Ready():
+		if !ok {
+			t.Fatalf("tunnel died before becoming ready: %v", conn.Err())
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("tunnel never became ready")
 	}
@@ -892,8 +858,8 @@ func TestForeignBackendCancels(t *testing.T) {
 }
 
 // TestDoneSurfacesSpecFailure pins the deadlock fix: a tunnel whose spec can
-// never resolve must report through Done/Err — callers select on Done next
-// to TunnelReady instead of blocking forever.
+// never resolve must report through Done/Err, and Ready must close empty
+// rather than strand a waiter.
 func TestDoneSurfacesSpecFailure(t *testing.T) {
 	tun := v1alpha1.New(failingEngine{})
 
@@ -912,10 +878,8 @@ func TestDoneSurfacesSpecFailure(t *testing.T) {
 		t.Fatal("Done never closed after the spec fetch failed")
 	}
 
-	select {
-	case <-tun.TunnelReady():
-		t.Error("TunnelReady closed on a failed tunnel")
-	default:
+	if got, ok := <-tun.Ready(); ok {
+		t.Errorf("Ready delivered %v on a failed tunnel, want closed empty", got)
 	}
 }
 
@@ -1257,12 +1221,10 @@ func TestWithContextAlreadyCanceledNeverReportsReady(t *testing.T) {
 	conn := tun.WithListener(listen(t))
 
 	// The start goroutine runs Spec, connect, and its guard; give it room to
-	// finish before asserting that it left tunnelReady alone.
+	// finish before asserting it reported nothing.
 	time.Sleep(100 * time.Millisecond)
-	select {
-	case <-conn.TunnelReady():
-		t.Error("tunnel reported ready despite a context canceled before it started")
-	default:
+	if got, ok := <-conn.Ready(); ok {
+		t.Errorf("Ready delivered %v despite a context canceled before the tunnel started", got)
 	}
 	if u := conn.URL(); u != nil {
 		t.Errorf("URL() = %v, want nil", u)
@@ -1380,7 +1342,7 @@ func TestEventListenersAreLayered(t *testing.T) {
 	tun.WithEventListener(func(v1.Event) { order = append(order, "second") })
 	tun.WithEventListener(nil) // ignored rather than panicking later
 
-	tun.Emit(v1.Event{Kind: v1.EventTunnelReady})
+	tun.Emit(v1.Event{Kind: v1.EventServing})
 	if len(order) != 2 || order[0] != "first" || order[1] != "second" {
 		t.Errorf("listeners ran %v, want [first second]", order)
 	}
@@ -1395,7 +1357,7 @@ func TestEventListenerPanicIsContained(t *testing.T) {
 	tun.WithEventListener(func(v1.Event) { panic("listener blew up") })
 	tun.WithEventListener(func(v1.Event) { reached = true })
 
-	tun.Emit(v1.Event{Kind: v1.EventTunnelReady})
+	tun.Emit(v1.Event{Kind: v1.EventServing})
 	if !reached {
 		t.Error("a panicking listener stopped the ones after it")
 	}
@@ -1459,5 +1421,156 @@ func TestWithTokenForwardsOnce(t *testing.T) {
 	lateTun.WithToken("too-late")
 	if got := late.tokens; len(got) != 0 {
 		t.Errorf("backend saw tokens %v after the spec fetch, want none", got)
+	}
+}
+
+// TestCancelIsDeliberate pins Cancel as the caller's clean shutdown: Done
+// delivers, Err reports ErrClosed, and no EventError fires — the same
+// shape as closing the tunnel-owned listener.
+func TestCancelIsDeliberate(t *testing.T) {
+	var mu sync.Mutex
+	var kinds []v1.EventKind
+	done := make(chan struct{})
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{})).WithEventListener(func(e v1.Event) {
+		mu.Lock()
+		kinds = append(kinds, e.Kind)
+		mu.Unlock()
+		if e.Kind == v1.EventDone {
+			close(done)
+		}
+	})
+
+	conn.Cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("EventDone never fired after Cancel")
+	}
+	if !errors.Is(conn.Err(), v1.ErrClosed) {
+		t.Errorf("Err() = %v, want ErrClosed", conn.Err())
+	}
+	if errors.Is(conn.Err(), v1.ErrFailed) {
+		t.Errorf("Err() = %v reads as a failure; a deliberate cancel is not one", conn.Err())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(kinds) != 1 || kinds[0] != v1.EventDone {
+		t.Errorf("events = %v, want [done] only", kinds)
+	}
+}
+
+// TestCancelWithCauseIsAFailure pins the other half: a cause carries through
+// to Err and Done, the way an engine reports the edge dying under it.
+func TestCancelWithCauseIsAFailure(t *testing.T) {
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{}))
+	want := errors.New("edge went away")
+	tun.Cancel(want)
+	select {
+	case <-tun.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done never delivered after Cancel(cause)")
+	}
+	if !errors.Is(tun.Err(), want) {
+		t.Errorf("Err() = %v, want the cause", tun.Err())
+	}
+}
+
+// TestSerializeResolvesSpec pins Serialize as a getter like the rest: it
+// resolves the spec on first use rather than reading a field that nothing
+// has filled yet.
+func TestSerializeResolvesSpec(t *testing.T) {
+	spec := &cloudflare.Spec{ID: "id-1", Hostname: "ser.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
+	conn := v1alpha1.New(newFakeEngine(spec))
+	if got, want := conn.Serialize(), spec.Serialize(); got != want {
+		t.Errorf("Serialize() = %q, want %q", got, want)
+	}
+}
+
+// TestURLWaitsForEstablished pins what URL means: the public URL verified to
+// work from here, not an edge connection registered. With or without a
+// caller context — WithContext adds a cancellation source, not a different
+// wait.
+func TestURLWaitsForEstablished(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		with func(v1.Tunnel) v1.Tunnel
+	}{
+		{"without WithContext", func(tun v1.Tunnel) v1.Tunnel { return tun }},
+		{"with WithContext", func(tun v1.Tunnel) v1.Tunnel { return tun.WithContext(context.Background()) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+			engine.manual = true
+			tun := v1alpha1.New(engine)
+			conn := tc.with(tun).WithListener(listen(t))
+
+			got := make(chan *url.URL, 1)
+			go func() { got <- conn.URL() }()
+
+			<-engine.got // connected; not yet established
+			select {
+			case u := <-got:
+				t.Fatalf("URL() = %v before EventEstablished", u)
+			case <-time.After(200 * time.Millisecond):
+			}
+
+			tun.Emit(v1.Event{Kind: v1.EventEstablished})
+			select {
+			case u := <-got:
+				if u == nil || u.String() != "https://demo.tunneled.pizza/" {
+					t.Errorf("URL() = %v, want https://demo.tunneled.pizza/", u)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("URL never returned after EventEstablished")
+			}
+		})
+	}
+}
+
+// TestReadyDeliversOnEstablished pins Ready to the same moment as URL.
+func TestReadyDeliversOnEstablished(t *testing.T) {
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine.manual = true
+	tun := v1alpha1.New(engine)
+	conn := tun.WithListener(listen(t))
+
+	ready := conn.Ready()
+	<-engine.got
+	select {
+	case got, ok := <-ready:
+		t.Fatalf("Ready delivered (%v, %v) before EventEstablished", got, ok)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	tun.Emit(v1.Event{Kind: v1.EventEstablished})
+	select {
+	case got, ok := <-ready:
+		if !ok || got != v1.Tunnel(conn) {
+			t.Errorf("Ready delivered (%v, %v), want the tunnel", got, ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ready never delivered after EventEstablished")
+	}
+}
+
+// TestEstablishedAfterCancelIsIgnored pins that a dead tunnel never reports
+// ready: an engine whose verification lands after the cancel changes
+// nothing.
+func TestEstablishedAfterCancelIsIgnored(t *testing.T) {
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine.manual = true
+	tun := v1alpha1.New(engine)
+	conn := tun.WithListener(listen(t))
+	<-engine.got
+
+	tun.Cancel()
+	<-conn.Done()
+	tun.Emit(v1.Event{Kind: v1.EventEstablished})
+
+	if u := conn.URL(); u != nil {
+		t.Errorf("URL() = %v on a canceled tunnel, want nil", u)
+	}
+	if got, ok := <-conn.Ready(); ok {
+		t.Errorf("Ready delivered %v on a canceled tunnel, want closed empty", got)
 	}
 }
