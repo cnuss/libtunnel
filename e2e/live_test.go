@@ -215,8 +215,8 @@ func TestLiveMintedListener(t *testing.T) {
 // to stdout and serves the origin through the edge. No flags, no listener
 // plumbing — the whole configuration is environment. gateLive puts the shared
 // preflight spec into this process's environment, and the child binary inherits
-// it (LIBTUNNEL_SPEC) through os.Environ() as the hint of its own mint, so the
-// provider hands the preflight tunnel back instead of a new hostname.
+// it (LIBTUNNEL_SPEC) through os.Environ() and, with no connector on it, takes
+// the preflight tunnel over without a mint.
 func TestLiveBinary(t *testing.T) {
 	gateLive(t) // adopts the shared preflight spec
 

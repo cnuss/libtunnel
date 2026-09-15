@@ -24,10 +24,11 @@ import (
 )
 
 // mintServer points the credential chain at a stub mint that answers with
-// spec. Every resolution consults the provider — it is the provider that
-// knows whether the hostname is still reserved — so a test that resolves a
-// spec needs one, and a re-exec'd child inherits it through the environment;
-// the real endpoint is e2e's business, not a unit test's.
+// spec. A resolution the edge does not vouch for consults the provider — it
+// is the provider that knows whether the hostname is still reserved — so a
+// test that resolves a fabricated spec needs one, and a re-exec'd child
+// inherits it through the environment; the real endpoint is e2e's business,
+// not a unit test's.
 func mintServer(t *testing.T, spec *cloudflare.Spec) {
 	t.Helper()
 	body, err := json.Marshal(spec)

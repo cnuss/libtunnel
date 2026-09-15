@@ -103,6 +103,7 @@ func TestExamples(t *testing.T) {
 	}{
 		{"serve", "served: hello from libtunnel", true, nil},
 		{"serve-tls", "served: hello from libtunnel (tls)", true, nil},
+		{"reclaim", "tun2 url: https://", true, nil},
 	}
 	for _, tc := range cases {
 		tc := tc
