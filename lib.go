@@ -239,7 +239,10 @@ func Cloudflare() *cloudflare.Backend {
 
 // From returns an unstarted tunnel that replays a previously serialized spec
 // as the hint of its own mint. spec is an existing file path, otherwise the
-// serialized JSON itself — from Serialize, or off LIBTUNNEL_SPEC.
+// serialized JSON itself — from Serialize, or off LIBTUNNEL_SPEC. Empty —
+// the empty string, or a path to an empty file — is no spec at all: it is
+// New(Cloudflare()), a mint with nothing to hint, so a caller can pass
+// through whatever it has stored without checking first.
 //
 // The spec rides the mint request as hint headers; tunnel.pizza reads the
 // record id, so the provider resumes that hostname while its reservation holds — on the original tunnel if it
@@ -265,6 +268,8 @@ func Cloudflare() *cloudflare.Backend {
 func From(spec string) TunnelV1 {
 	return v1alpha1.From(spec, func(backend string, raw json.RawMessage) (v1.Tunnel, error) {
 		switch backend {
+		case "":
+			return New(Cloudflare()), nil
 		case "cloudflare":
 			s := &cloudflare.Spec{}
 			if err := json.Unmarshal(raw, s); err != nil {

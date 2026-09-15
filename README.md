@@ -389,8 +389,10 @@ conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
 
 `Serialize()` renders a live tunnel's spec as a tagged-envelope JSON string —
 the same form `LIBTUNNEL_SPEC` carries. `libtunnel.From(spec)` replays one:
-`spec` is a path to a file holding that JSON, or the JSON itself. A bad or
-unknown spec yields a tunnel already canceled with the cause (off `Err()`).
+`spec` is a path to a file holding that JSON, or the JSON itself. Empty is no
+spec: `From("")` is `New(Cloudflare())`, so a caller can pass through whatever
+it has stored without checking first; an empty file reads the same. A bad or unknown spec yields a tunnel
+already canceled with the cause (off `Err()`).
 
 A replay asks the provider for that tunnel rather than assuming it survives —
 providers reap idle tunnels, and the provider is the only thing that knows.
