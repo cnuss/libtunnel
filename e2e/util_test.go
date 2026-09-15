@@ -204,23 +204,24 @@ func paceLive() {
 	lastLiveStart = time.Now()
 }
 
-// readyErr waits for TunnelReady with a deadline, returning an error when the
-// tunnel dies first (Done) or never readies within d. waitReady is the
-// t.Fatal form; scenarios that wait inside worker goroutines (where t.Fatal
-// is illegal) use this directly.
+// readyErr waits for Ready with a deadline, returning an error when the
+// tunnel dies first or never readies within d. waitReady is the t.Fatal
+// form; scenarios that wait inside worker goroutines (where t.Fatal is
+// illegal) use this directly.
 func readyErr(conn v1.Tunnel, d time.Duration) error {
 	select {
-	case <-conn.TunnelReady():
+	case _, ok := <-conn.Ready():
+		if !ok {
+			return fmt.Errorf("tunnel failed: %w", conn.Err())
+		}
 		return nil
-	case <-conn.Done():
-		return fmt.Errorf("tunnel failed: %w", conn.Err())
 	case <-time.After(d):
 		return fmt.Errorf("tunnel not ready after %v (rate-limited mint or dead connection?)", d)
 	}
 }
 
-// waitReady waits for TunnelReady with a deadline, failing fast when the
-// tunnel dies first (Done) or never readies within d.
+// waitReady waits for Ready with a deadline, failing fast when the tunnel
+// dies first or never readies within d.
 func waitReady(t *testing.T, conn v1.Tunnel, d time.Duration) {
 	t.Helper()
 	if err := readyErr(conn, d); err != nil {

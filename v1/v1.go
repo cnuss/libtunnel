@@ -7,7 +7,7 @@
 // getter resolves on first use, and the edge connection starts on first
 // demand — WithListener provides the origin listener explicitly, WithLocalURL
 // points at an already-running local origin instead, and Listener, URL, and
-// TunnelReady mint a loopback listener if no origin was provided.
+// Ready mint a loopback listener if no origin was provided.
 package v1
 
 import (
@@ -26,16 +26,15 @@ type EventKind string
 
 const (
 	// EventHostnameReady fires when the public hostname is expected to
-	// resolve, the same moment HostnameReady closes.
+	// resolve: the first edge connection registered, and the mint provider
+	// had already waited out the record's spread across the zone's
+	// nameservers. Nothing on this machine is asked about the hostname.
 	EventHostnameReady EventKind = "hostname-ready"
-	// EventTunnelReady fires when the tunnel is reachable end to end, the same
-	// moment TunnelReady closes.
-	EventTunnelReady EventKind = "tunnel-ready"
 	// EventConnected fires when every edge connection is registered — the
 	// tunnel is connected with the redundancy it was configured for. It fires
 	// again when a partial outage heals: a connection dropping frees its
 	// slot, and the registration that fills the set again is the tunnel back
-	// at full strength. First contact with the edge is EventTunnelReady.
+	// at full strength.
 	EventConnected EventKind = "connected"
 	// EventServing fires when the tunnel's own side is up: the in-process
 	// reverse proxy has begun serving, with the interceptor pipeline and the
@@ -322,9 +321,9 @@ const (
 // `v, ok := <-x.Ready()`. Hold the channel rather than calling in a loop:
 // every call is a new one.
 type Lifecycle[T any] interface {
-	// Ready delivers the value once it is serving. If it ends first the
-	// channel closes without delivering, so a receive with ok == false means
-	// it never came up — Err says why.
+	// Ready delivers the value once it is serving end to end. If it ends
+	// first the channel closes without delivering, so a receive with
+	// ok == false means it never came up — Err says why.
 	Ready() <-chan T
 	// Done delivers the value once it has ended, by failure or by choice.
 	Done() <-chan T
@@ -409,8 +408,8 @@ type Backend[T Spec] interface {
 // return zero values. The edge connection starts on first demand: the origin
 // is provided exactly once — WithListener provides it as a listener,
 // WithLocalURL as the URL of an already-running local service, and the start
-// triggers — Listener, URL, TunnelReady — mint a loopback listener if no
-// origin was provided. Providing an origin twice, by any combination of
+// triggers — Listener, URL, Ready — mint a loopback listener if no origin
+// was provided. Providing an origin twice, by any combination of
 // those, cancels the tunnel (Err reports "origin already provided").
 //
 // Configuration is write-once: each With* mutator takes effect at most once
@@ -421,10 +420,10 @@ type Backend[T Spec] interface {
 // does not outlive New, so callers can store a tunnel reference without
 // threading the spec type through their own code.
 type Tunnel interface {
-	// Ready delivers the tunnel when the edge connection is up and the
-	// hostname resolves publicly — reachable end to end. Demand-driven, like
-	// URL: with no origin provided it mints a loopback listener and starts
-	// the edge connection before handing back the channel.
+	// Ready delivers the tunnel once the public URL is verified to work from
+	// here (EventEstablished). Demand-driven, like URL: with no origin
+	// provided it mints a loopback listener and starts the edge connection
+	// before handing back the channel.
 	//
 	// Err reports a failure class for a tunnel that will not come up:
 	// errors.Is(err, ErrFailed) is the coarse check, and the class wrapping
@@ -480,12 +479,13 @@ type Tunnel interface {
 	// listener handed to WithListener instead and rebind the same address; a
 	// minted listener has no separate owner, so closing it is terminal.
 	Listener() net.Listener
-	// URL is https://<Hostname>/. It blocks until the tunnel is reachable end
-	// to end (TunnelReady), or returns nil if the tunnel — or a WithContext
-	// caller context — ends first. URL demands public reachability, so like
-	// Listener it is a start trigger: with no origin provided it mints a
-	// loopback listener and starts the edge connection, instead of waiting on
-	// readiness that could never arrive.
+	// URL is https://<Hostname>/. It blocks until the public URL is verified
+	// to work from here (EventEstablished), or returns nil if the tunnel — or
+	// a WithContext caller context — ends first; a caller that wants a bound
+	// on the wait puts it on that context. URL demands public reachability,
+	// so like Listener it is a start trigger: with no origin provided it
+	// mints a loopback listener and starts the edge connection, instead of
+	// waiting on readiness that could never arrive.
 	URL() *url.URL
 
 	// Serialize renders the resolved spec as a tagged-envelope JSON string
@@ -493,19 +493,6 @@ type Tunnel interface {
 	// so a caller can store a tunnel's identity and ask for it back. A
 	// getter like Hostname: the first use resolves the spec.
 	Serialize() string
-
-	// HostnameReady is closed once the hostname is expected to resolve
-	// publicly: when the edge connection registers. The record's spread
-	// across the zone's nameservers is waited out by the mint provider before
-	// it returns credentials, so a running tunnel implies a propagated
-	// hostname. Nothing on this machine is asked about the hostname.
-	HostnameReady() <-chan struct{}
-	// TunnelReady is closed when the edge connection is up and the hostname
-	// resolves publicly — the tunnel is reachable end to end. It is never
-	// closed on failure: select on Done alongside it. Like URL it is a start
-	// trigger: with no origin provided it mints a loopback listener and
-	// starts the edge connection before handing back the channel.
-	TunnelReady() <-chan struct{}
 
 	// WithEventListener registers a function to receive the tunnel's lifecycle
 	// events. Layerable, not write-once: every registered listener is called,
@@ -549,7 +536,7 @@ type Tunnel interface {
 	// The origin is provided exactly once, shared with WithLocalURL and the
 	// start-trigger mint. Providing it again — a second WithListener or
 	// WithLocalURL, or either after a start trigger (Listener, URL,
-	// TunnelReady) minted a listener — cancels the tunnel (Err reports
+	// Ready) minted a listener — cancels the tunnel (Err reports
 	// "origin already provided"). To let the tunnel supply the listener
 	// instead, skip WithListener and call Listener().
 	//

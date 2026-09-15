@@ -295,10 +295,9 @@ type Backend struct {
 	// moved on, and a test shortening the package default for the next
 	// tunnel must not race a goroutine the last one left behind.
 	probeInterval time.Duration
-	// establishInterval and establishBudget are fixed at construction for
-	// the same reason as probeInterval.
+	// establishInterval is fixed at construction for the same reason as
+	// probeInterval.
 	establishInterval time.Duration
-	establishBudget   time.Duration
 	// establishing is set while a loop-through is in flight, so a second
 	// trigger while one runs does not double it — the one running will
 	// succeed on the new connection anyway.
@@ -320,7 +319,6 @@ func New() *Backend {
 	b := &Backend{
 		probeInterval:     probeInterval,
 		establishInterval: establishInterval,
-		establishBudget:   establishBudget,
 	}
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
 	if b.envErr == nil {
@@ -956,8 +954,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 				// one had dropped — is when routing has to be verified
 				// again: the edge may be fanning a new location out. Every
 				// connection up is the tunnel's news; one of several
-				// registering is neither — TunnelReady already said the
-				// edge answered.
+				// registering is neither.
 				alive, full := b.edge.up(e.Index)
 				if alive && b.establishing.CompareAndSwap(false, true) {
 					go func() {
@@ -1141,12 +1138,9 @@ func loopThroughClient() *http.Client {
 }
 
 // establish sends the loop-through to url until the proxy answers it, then
-// reports EventEstablished. Bounded by establishBudget: past it the tunnel
-// is connected but unverified, which is what the caller already had.
+// reports EventEstablished. It has no bound of its own: a caller that wants
+// one puts it on the tunnel's context.
 func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client, url, nonce string, log *slog.Logger) {
-	ctx, cancel := context.WithTimeout(ctx, b.establishBudget)
-	defer cancel()
-
 	start := time.Now()
 	attempts := 0
 	for {
@@ -1158,7 +1152,6 @@ func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client,
 		}
 		select {
 		case <-ctx.Done():
-			log.Warn("tunnel connected but not verified from here", "url", url, "attempts", attempts, "after", time.Since(start).Round(time.Second))
 			return
 		case <-time.After(b.establishInterval):
 		}
@@ -1230,17 +1223,11 @@ const (
 // request goes to the URL with a nonce only this tunnel's proxy recognizes;
 // the proxy answers 204 itself, so the origin never sees it. Until the edge
 // has fanned the tunnel's location out to its colos it answers 530 in the
-// proxy's place, and the loop tries again. establishBudget bounds the wait:
-// past it the tunnel is connected but unverified, which is what the caller
-// already had.
+// proxy's place, and the loop tries again.
 //
-// Vars, not consts, so a test can shorten them rather than sleep through
-// them — captured on the Backend at construction, the same way as
-// probeInterval.
-var (
-	establishInterval = 1 * time.Second
-	establishBudget   = 60 * time.Second
-)
+// A var, not a const, so a test can shorten it rather than sleep through it
+// — captured on the Backend at construction, the same way as probeInterval.
+var establishInterval = 1 * time.Second
 
 // establishHeader carries the loop-through nonce. Any other value is an
 // ordinary request.

@@ -46,8 +46,8 @@ type Engine[T v1.Spec] interface {
 	// listener down when the tunnel's WithListener fires. It is invoked once,
 	// in its own goroutine, and blocks until the edge connection is up
 	// (returning any setup failure). Runtime failures after that are reported
-	// through t.Cancel. The core closes TunnelReady once WithListener returns
-	// nil and the hostname resolves publicly.
+	// through t.Cancel; the public URL verified to work is reported through
+	// t.Emit as EventEstablished, which is what URL and Ready wait on.
 	WithListener(t *TunnelImpl[T], l net.Listener) error
 	// WithLocalURL is WithListener's counterpart for URL origins: the core
 	// hands down the validated origin URLs (each scheme http/https, host set,
@@ -75,8 +75,7 @@ func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		userCtx:        context.Background(),
 		backend:        backend,
 		originProvided: make(chan struct{}),
-		tunnelReady:    make(chan struct{}),
-		hostnameReady:  make(chan struct{}),
+		established:    make(chan struct{}),
 		wsOrigin:       -1,
 	}
 	// Auto-assigned interceptor Priorities count down from the top of the range.
@@ -196,9 +195,11 @@ type TunnelImpl[T v1.Spec] struct {
 	// with headroom for the step-down arithmetic; it saturates at 0.
 	autoPriority atomic.Uint32
 
-	hostnameReady chan struct{}
-
-	tunnelReady chan struct{}
+	// established closes on the first EventEstablished — the public URL
+	// verified to work from here — which is what URL and Ready wait on. The
+	// event fires again after a full outage heals; the channel closes once.
+	established     chan struct{}
+	establishedOnce sync.Once
 }
 
 // Context is the tunnel's lifetime context, canceled (with cause) on any

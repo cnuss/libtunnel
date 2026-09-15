@@ -25,12 +25,11 @@ func Example() {
 		fmt.Fprint(w, "hello")
 	}))
 
-	select {
-	case <-conn.TunnelReady():
-		fmt.Println(conn.URL()) // https://<something>.tunneled.pizza/
-	case <-conn.Done():
+	if _, ok := <-conn.Ready(); !ok {
 		fmt.Println(conn.Err())
+		return
 	}
+	fmt.Println(conn.URL()) // https://<something>.tunneled.pizza/
 }
 
 // stubProvider stands in for tunnel.pizza: a mint endpoint that hands back
