@@ -70,6 +70,20 @@ func TestFromFile(t *testing.T) {
 
 // TestFromBadInput pins the façade error contract: bad JSON or an unknown
 // backend yields a tunnel already canceled with the cause.
+// TestFromEmptyMints pins that an empty spec is no spec: From("") starts the
+// way New(Cloudflare()) does, minting with nothing to hint.
+func TestFromEmptyMints(t *testing.T) {
+	want := &cloudflare.Spec{Hostname: "fresh.tunneled.pizza"}
+	mintServer(t, want)
+	tun := libtunnel.From("")
+	if err := tun.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil for an empty spec", err)
+	}
+	if got := tun.Hostname(); got != want.Hostname {
+		t.Errorf("Hostname() = %q, want the fresh mint %q", got, want.Hostname)
+	}
+}
+
 func TestFromBadInput(t *testing.T) {
 	if err := libtunnel.From("{not json").Err(); err == nil {
 		t.Error("From(malformed) Err() = nil, want a parse error")
