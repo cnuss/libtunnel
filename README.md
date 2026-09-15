@@ -549,12 +549,14 @@ Self-contained programs in [`./examples`](./examples):
 | --------- | ------------------------------------------------------------------ |
 | `serve`   | Real quick tunnel: serve locally, request the public URL.           |
 | `serve-tls` | Same as `serve`, but a TLS listener (`tls.Listen`) — ingress flips to https. |
+| `reclaim` | Cancel a tunnel, `From(Serialize())` it back: the edge vouches for it and the same URL returns without a mint. |
 
 Run one locally:
 
 ```sh
 make run serve
 make run serve-tls
+make run reclaim
 ```
 
 ## Testing
