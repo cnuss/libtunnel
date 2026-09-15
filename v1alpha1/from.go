@@ -10,17 +10,23 @@ import (
 
 // From loads a serialized spec and replays it into a tunnel. spec is resolved
 // as an existing file at the given path, otherwise as the literal JSON. It
-// decodes the envelope and hands
-// the backend tag plus the raw backend spec to build, which constructs the
-// tunnel for that backend — the one piece From can't own, since v1alpha1 is
-// backend-agnostic and the façade wires the concrete backend. Any failure
+// decodes the envelope and hands the backend tag plus the raw backend spec to
+// build, which constructs the tunnel for that backend — the one piece From
+// can't own, since v1alpha1 is backend-agnostic and the façade wires the
+// concrete backend. An empty spec — the empty string, or a path to an empty
+// file — is no spec: build is called with an empty backend tag and nil raw,
+// and decides what that means (the façade mints fresh). Any failure
 // (unparseable, unknown backend, or a build error) returns a tunnel already
 // canceled with the cause, so callers get it through Err()/Done() rather than a
 // second return value.
 func From(spec string, build func(backend string, raw json.RawMessage) (v1.Tunnel, error)) v1.Tunnel {
-	backend, raw, err := DecodeSpec(loadSpec(spec))
-	if err != nil {
-		return Failed(fmt.Errorf("From: %w", err))
+	var backend string
+	var raw json.RawMessage
+	if envelope := loadSpec(spec); envelope != "" {
+		var err error
+		if backend, raw, err = DecodeSpec(envelope); err != nil {
+			return Failed(fmt.Errorf("From: %w", err))
+		}
 	}
 	tun, err := build(backend, raw)
 	if err != nil {
@@ -31,14 +37,15 @@ func From(spec string, build func(backend string, raw json.RawMessage) (v1.Tunne
 
 // ReplayFromEnv decodes v1.FromEnv — a spec file path or a literal envelope,
 // like From's argument — into the caller-allocated spec, reporting whether
-// one was present. A reference that cannot be parsed, or carries a foreign
-// backend tag, is an error, not a fallthrough.
+// one was present. Unset, empty, or naming an empty file reads as absent,
+// like From. A reference that cannot be parsed, or carries a foreign backend
+// tag, is an error, not a fallthrough.
 func ReplayFromEnv[T v1.Spec](backend string, spec T) (bool, error) {
-	env, ok := os.LookupEnv(v1.FromEnv)
-	if !ok || env == "" {
+	envelope := loadSpec(os.Getenv(v1.FromEnv))
+	if envelope == "" {
 		return false, nil
 	}
-	tag, raw, err := DecodeSpec(loadSpec(env))
+	tag, raw, err := DecodeSpec(envelope)
 	if err != nil {
 		return false, fmt.Errorf("unable to parse %s: %w", v1.FromEnv, err)
 	}
