@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1427,16 +1428,23 @@ func TestWithTokenForwardsOnce(t *testing.T) {
 // delivers, Err reports ErrClosed, and no EventError fires — the same
 // shape as closing the tunnel-owned listener.
 func TestCancelIsDeliberate(t *testing.T) {
-	var events []v1.Event
+	var mu sync.Mutex
+	var kinds []v1.EventKind
+	done := make(chan struct{})
 	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{})).WithEventListener(func(e v1.Event) {
-		events = append(events, e)
+		mu.Lock()
+		kinds = append(kinds, e.Kind)
+		mu.Unlock()
+		if e.Kind == v1.EventDone {
+			close(done)
+		}
 	})
 
 	conn.Cancel()
 	select {
-	case <-conn.Done():
+	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Done never delivered after Cancel")
+		t.Fatal("EventDone never fired after Cancel")
 	}
 	if !errors.Is(conn.Err(), v1.ErrClosed) {
 		t.Errorf("Err() = %v, want ErrClosed", conn.Err())
@@ -1444,25 +1452,10 @@ func TestCancelIsDeliberate(t *testing.T) {
 	if errors.Is(conn.Err(), v1.ErrFailed) {
 		t.Errorf("Err() = %v reads as a failure; a deliberate cancel is not one", conn.Err())
 	}
-	deadline := time.After(5 * time.Second)
-	for {
-		var kinds []v1.EventKind
-		for _, e := range events {
-			kinds = append(kinds, e.Kind)
-		}
-		if len(kinds) > 0 && kinds[len(kinds)-1] == v1.EventDone {
-			for _, e := range events {
-				if e.Kind == v1.EventError {
-					t.Errorf("EventError fired on Cancel: %v", e.Err)
-				}
-			}
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("EventDone never fired; events = %v", kinds)
-		case <-time.After(10 * time.Millisecond):
-		}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(kinds) != 1 || kinds[0] != v1.EventDone {
+		t.Errorf("events = %v, want [done] only", kinds)
 	}
 }
 
