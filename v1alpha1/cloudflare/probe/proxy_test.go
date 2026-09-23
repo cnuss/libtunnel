@@ -82,10 +82,11 @@ func (c *connectProxy) serve(conn net.Conn) {
 	}
 	defer remote.Close()
 
-	fmt.Fprint(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
-	if c.preamble != "" {
-		fmt.Fprint(conn, c.preamble)
-	}
+	// One write, so the preamble lands in the same segment as the response.
+	// What is being tested is bytes already buffered when the response is
+	// parsed; two writes make that a race with the network, which is how
+	// this first passed locally and failed on CI.
+	fmt.Fprint(conn, "HTTP/1.1 200 Connection established\r\n\r\n"+c.preamble)
 	go func() { _, _ = io.Copy(remote, conn) }()
 	_, _ = io.Copy(conn, remote)
 }
