@@ -8,13 +8,17 @@
 package probe
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -30,6 +34,7 @@ import (
 	"github.com/google/uuid"
 	dns "github.com/ncruces/go-dns"
 	"github.com/rs/zerolog"
+	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/http2"
 
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/trust"
@@ -290,13 +295,153 @@ func (p *Prober) EdgeAddrs(ctx context.Context) []string {
 		p.log.Info().Str("relay", relayHost).
 			Msg("edge unreachable at its own addresses, pinning the tunnel to the relay")
 
+		addr := fmt.Sprintf("%s:%d", relayHost, relayPort)
+
+		// The caller dials these addresses itself and knows nothing of
+		// proxies, so where one stands in the way it gets a loopback address
+		// instead and the forwarder carries the connection on.
+		if proxy := proxyFor(addr); proxy != nil {
+			local, err := p.forwardThroughProxy(ctx, proxy, addr)
+			if err != nil {
+				p.log.Warn().Err(err).Msg("no forwarder for the proxy, leaving the edge to the caller")
+				return nil
+			}
+			p.log.Info().Str("proxy", proxy.Host).Str("listening", local).
+				Msg("carrying the tunnel to the relay through the proxy")
+			return []string{local, local}
+		}
+
 		// Twice, because the list is split across two regions by index and a
 		// single entry leaves one of them empty — with nowhere to put the
 		// second HA connection.
-		addr := fmt.Sprintf("%s:%d", relayHost, relayPort)
 		return []string{addr, addr}
 	}
 	return nil
+}
+
+// proxyFor reports the proxy the environment names for target, or nil when it
+// names none. The target is modelled as an https URL because that is what
+// HTTPS_PROXY answers for, and NO_PROXY is honored on the way.
+//
+// Read afresh each time rather than through http.ProxyFromEnvironment, which
+// caches the environment behind a sync.Once on first use anywhere in the
+// process — a tunnel built after that call would not see its own settings.
+func proxyFor(target string) *url.URL {
+	proxy, err := httpproxy.FromEnvironment().ProxyFunc()(&url.URL{Scheme: "https", Host: target})
+	if err != nil {
+		return nil
+	}
+	return proxy
+}
+
+// dialViaProxy opens a TCP tunnel to target through proxy and returns it. The
+// bytes that follow are not read or written by anything here, so TLS still
+// terminates at the far end and the pinned trust set still decides.
+func dialViaProxy(ctx context.Context, proxy *url.URL, target string) (net.Conn, error) {
+	address := proxy.Host
+	if proxy.Port() == "" {
+		if proxy.Scheme == "https" {
+			address = net.JoinHostPort(address, "443")
+		} else {
+			address = net.JoinHostPort(address, "80")
+		}
+	}
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("dial proxy %s: %w", address, err)
+	}
+
+	// The whole CONNECT exchange under one deadline, cleared before the
+	// caller gets the socket: what it carries afterwards has its own.
+	if err := conn.SetDeadline(time.Now().Add(dialTimeout)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	request := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: target},
+		Host:   target,
+		Header: http.Header{},
+	}
+	if user := proxy.User; user != nil {
+		password, _ := user.Password()
+		request.Header.Set("Proxy-Authorization", "Basic "+
+			base64.StdEncoding.EncodeToString([]byte(user.Username()+":"+password)))
+	}
+	if err := request.Write(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("write CONNECT to %s: %w", address, err)
+	}
+
+	reader := bufio.NewReader(conn)
+	response, err := http.ReadResponse(reader, request)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read CONNECT response from %s: %w", address, err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		conn.Close()
+		return nil, fmt.Errorf("proxy %s refused CONNECT to %s: %s", address, target, response.Status)
+	}
+	// Anything buffered past the response is payload the proxy sent before
+	// the tunnel opened, and the caller's TLS handshake would never see it.
+	if reader.Buffered() > 0 {
+		conn.Close()
+		return nil, fmt.Errorf("proxy %s sent %d bytes before the tunnel to %s",
+			address, reader.Buffered(), target)
+	}
+
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// forwardThroughProxy is how a caller that cannot speak to a proxy reaches one
+// anyway: a loopback address it dials as if it were the edge, with every
+// connection carried on through the proxy to target. cloudflared's supervisor
+// takes addresses and dials them itself, and 127.0.0.1 is the one address
+// every network allows.
+//
+// The listener lives as long as ctx. Nothing here reads the bytes it copies,
+// so the supervisor's TLS still terminates at the edge.
+func (p *Prober) forwardThroughProxy(ctx context.Context, proxy *url.URL, target string) (string, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", fmt.Errorf("listen for the proxy forwarder: %w", err)
+	}
+
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
+	go func() {
+		for {
+			local, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer local.Close()
+				remote, err := dialViaProxy(ctx, proxy, target)
+				if err != nil {
+					p.log.Debug().Err(err).Str("target", target).Msg("proxy would not carry this connection")
+					return
+				}
+				defer remote.Close()
+				go func() { _, _ = io.Copy(remote, local) }()
+				_, _ = io.Copy(local, remote)
+			}()
+		}
+	}()
+
+	return listener.Addr().String(), nil
 }
 
 // dialEdge opens a TLS connection to the edge, either at one of its own
@@ -308,6 +453,26 @@ func (p *Prober) dialEdge(ctx context.Context, tlsConfig *tls.Config, viaRelay b
 		// Info: the relay is a detour worth seeing in a log, and reaching for
 		// it says something about the network this is running on.
 		p.log.Info().Str("relay", relayHost).Msg("reaching the edge through the relay")
+
+		// A network whose only way out is a proxy: CONNECT carries the relay
+		// because it is a normal host on 443, which is the one destination
+		// such a proxy is set up to allow. The edge's own 7844 is not, which
+		// is why only this leg bothers.
+		target := fmt.Sprintf("%s:%d", relayHost, relayPort)
+		if proxy := proxyFor(target); proxy != nil {
+			p.log.Info().Str("proxy", proxy.Host).Str("target", target).
+				Msg("reaching the relay through the proxy")
+			raw, err := dialViaProxy(ctx, proxy, target)
+			if err != nil {
+				return nil, err
+			}
+			conn := tls.Client(raw, tlsConfig)
+			if err := conn.HandshakeContext(ctx); err != nil {
+				raw.Close()
+				return nil, fmt.Errorf("TLS to %s through %s: %w", target, proxy.Host, err)
+			}
+			return conn, nil
+		}
 
 		ips, err := net.LookupIP(relayHost)
 		if err != nil {
