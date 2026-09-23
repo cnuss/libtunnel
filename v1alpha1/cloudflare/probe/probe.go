@@ -15,24 +15,22 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/netip"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cloudflare/cloudflared/connection"
-	"github.com/cloudflare/cloudflared/connection/dialopts"
 	"github.com/cloudflare/cloudflared/crypto"
+	"github.com/cloudflare/cloudflared/edgediscovery"
 	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
 	"github.com/cloudflare/cloudflared/features"
-	cfquic "github.com/cloudflare/cloudflared/quic"
 	"github.com/cloudflare/cloudflared/tunnelrpc"
 	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	"github.com/google/uuid"
 	dns "github.com/ncruces/go-dns"
-	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
+	"golang.org/x/net/http2"
 
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/trust"
 )
@@ -45,6 +43,23 @@ const Timeout = 15 * time.Second
 // traffic to a registration on a held index, and the probe closing moments
 // later strands it — measured as a five-second run of 530s on a live tunnel.
 const probeConnIndex = 2
+
+// relayHost fronts the edge on a port and an address a hostile network is
+// likelier to allow: it forwards TCP to region1.v2.argotunnel.com:7844 and
+// reads none of it, so TLS still terminates at the edge.
+const (
+	relayHost = "relay.tunnel.pizza"
+	relayPort = 443
+)
+
+// dialTimeout bounds one edge address. Short, because failing it is not the
+// end of the ask — the relay is tried next, and both have to fit inside the
+// probe's budget.
+const dialTimeout = 3 * time.Second
+
+// relayMemo is how long a working relay stays the first route tried before
+// the direct edge is given another chance.
+const relayMemo = 5 * time.Minute
 
 // maxBackoff caps the wait between attempts, which otherwise grows a second
 // per attempt for as long as the caller's context lives.
@@ -90,6 +105,16 @@ type Prober struct {
 
 	resolversOnce sync.Once
 	resolvers     []*net.Resolver
+
+	tlsConfigs     map[connection.Protocol]*tls.Config
+	tlsConfigsOnce sync.Once
+
+	// relayUntil is how long the relay stays the first thing tried. A
+	// network that refused 7844 once refuses it still, and waiting out that
+	// refusal every time costs dialTimeout per ask — but not forever, since
+	// the machine this runs on changes networks.
+	relayMu    sync.Mutex
+	relayUntil time.Time
 }
 
 // New returns a Prober with every knob defaulted: reports an "unknown" client
@@ -166,6 +191,39 @@ func (p *Prober) WithLogger(log *zerolog.Logger) *Prober {
 	return p
 }
 
+// TLSConfigs is the edge TLS config per protocol, for a caller that dials the
+// edge itself — cloudflared's supervisor takes a map of exactly this shape.
+// It asks nothing of the network: a config is a pure function of the trust
+// set, so it is ready before anything has been reached, and every protocol
+// gets an entry because a nil config is a panic one layer down.
+func (p *Prober) TLSConfigs() map[connection.Protocol]*tls.Config {
+	p.tlsConfigsOnce.Do(func() {
+		p.tlsConfigs = make(map[connection.Protocol]*tls.Config, len(connection.ProtocolList))
+		for _, protocol := range connection.ProtocolList {
+			settings := protocol.TLSSettings()
+			if settings == nil {
+				continue
+			}
+			plain := &tls.Config{
+				ServerName: settings.ServerName,
+				NextProtos: settings.NextProtos,
+				RootCAs:    p.rootCAs,
+			}
+			config, err := crypto.TLSConfigWithCurvePreferences(plain, features.PostQuantumPrefer)
+			if err != nil {
+				// Curve preferences are all that can fail here, and they fail
+				// the same way every time. A config without them still dials
+				// the edge; no config at all panics the supervisor.
+				p.log.Warn().Err(err).Str("protocol", protocol.String()).
+					Msg("edge TLS curve preferences, using the config without them")
+				config = plain
+			}
+			p.tlsConfigs[protocol] = config
+		}
+	})
+	return p.tlsConfigs
+}
+
 // ErrGone is Probe's answer when the tunnel no longer exists. ErrInUse is
 // its answer when the tunnel exists and another connector holds the index
 // the probe registered under: the edge only refuses a registration as a
@@ -180,7 +238,7 @@ func (p *Prober) Probe(ctx context.Context, cancel context.CancelFunc) error {
 	defer cancel()
 
 	for attempt := 1; ; attempt++ {
-		err := p.probe(ctx)
+		err := p.probeHTTP2(ctx)
 		if !errors.Is(err, ErrRetry) {
 			return err
 		}
@@ -196,7 +254,100 @@ func (p *Prober) Probe(ctx context.Context, cancel context.CancelFunc) error {
 	}
 }
 
-func (p *Prober) probe(ctx context.Context) error {
+// EdgeAddrs is the edge address list for a caller that dials the edge itself,
+// or nil to leave it to that caller's own discovery — cloudflared's supervisor
+// takes exactly this, and treats a non-empty list as the whole edge.
+//
+// It decides by dialing: the edge's own addresses first, the relay second, and
+// whichever answers is what the tunnel should use for its life. Only the
+// handshake is spent, not a registration, so nothing is left behind at the
+// edge and no connection index is taken. Nothing answering returns nil, which
+// leaves the caller to discover and retry as it would have anyway.
+func (p *Prober) EdgeAddrs(ctx context.Context) []string {
+	tlsConfig := p.TLSConfigs()[connection.HTTP2]
+
+	for _, relay := range [2]bool{false, true} {
+		conn, err := p.dialEdge(ctx, tlsConfig, relay)
+		if err != nil {
+			p.log.Debug().Err(err).Bool("relay", relay).Msg("no answer on this route")
+			continue
+		}
+		conn.Close()
+
+		// The probe starts on this route too: they are asking the same
+		// network the same question.
+		p.relayMu.Lock()
+		if relay {
+			p.relayUntil = time.Now().Add(relayMemo)
+		} else {
+			p.relayUntil = time.Time{}
+		}
+		p.relayMu.Unlock()
+
+		if !relay {
+			return nil
+		}
+		p.log.Info().Str("relay", relayHost).
+			Msg("edge unreachable at its own addresses, pinning the tunnel to the relay")
+
+		// Twice, because the list is split across two regions by index and a
+		// single entry leaves one of them empty — with nowhere to put the
+		// second HA connection.
+		addr := fmt.Sprintf("%s:%d", relayHost, relayPort)
+		return []string{addr, addr}
+	}
+	return nil
+}
+
+// dialEdge opens a TLS connection to the edge, either at one of its own
+// addresses on 7844 or through the relay on 443. The relay forwards bytes
+// without reading them, so the certificate verified is origintunneld's on
+// both routes and one TLS config serves for either.
+func (p *Prober) dialEdge(ctx context.Context, tlsConfig *tls.Config, viaRelay bool) (net.Conn, error) {
+	if viaRelay {
+		// Info: the relay is a detour worth seeing in a log, and reaching for
+		// it says something about the network this is running on.
+		p.log.Info().Str("relay", relayHost).Msg("reaching the edge through the relay")
+
+		ips, err := net.LookupIP(relayHost)
+		if err != nil {
+			return nil, fmt.Errorf("resolve %s: %w", relayHost, err)
+		}
+		for _, ip := range ips {
+			v4 := ip.To4()
+			if v4 == nil {
+				continue
+			}
+			addr := &net.TCPAddr{IP: v4, Port: relayPort}
+			conn, err := edgediscovery.DialEdge(ctx, dialTimeout, tlsConfig, addr, nil)
+			if err == nil {
+				return conn, nil
+			}
+			p.log.Debug().Err(err).Str("relay", addr.String()).Msg("relay did not answer")
+		}
+		return nil, fmt.Errorf("%s has no address that answered", relayHost)
+	}
+
+	regions, err := allregions.EdgeDiscovery(p.log, edgeSRVService)
+	if err != nil {
+		return nil, fmt.Errorf("edge discovery: %w", err)
+	}
+	for _, region := range regions {
+		for _, candidate := range region {
+			if candidate.TCP == nil || candidate.TCP.IP.To4() == nil {
+				continue
+			}
+			return edgediscovery.DialEdge(ctx, dialTimeout, tlsConfig, candidate.TCP, nil)
+		}
+	}
+	return nil, errors.New("edge discovery returned no IPv4 TCP endpoint")
+}
+
+// probeHTTP2 registers a spare connection over TCP and reads the edge's
+// answer. cloudflared dials TCP, serves HTTP/2 on the socket it dialed, and
+// the edge opens the control stream by requesting it — so the probe stands
+// up a server and waits to be asked, rather than asking.
+func (p *Prober) probeHTTP2(ctx context.Context) error {
 	tunnelID, err := uuid.Parse(p.id)
 	if err != nil {
 		return fmt.Errorf("%w: %q is not a tunnel id: %w", ErrGone, p.id, err)
@@ -212,87 +363,112 @@ func (p *Prober) probe(ctx context.Context) error {
 		return errors.New("no hostname to weigh a refusal against")
 	}
 
-	tlsConfig, err := crypto.TLSConfigWithCurvePreferences(&tls.Config{
-		ServerName: connection.QUIC.TLSSettings().ServerName,
-		NextProtos: connection.QUIC.TLSSettings().NextProtos,
-		RootCAs:    p.rootCAs,
-	}, features.PostQuantumPrefer)
-	if err != nil {
-		return fmt.Errorf("%w: edge TLS config: %w", ErrRetry, err)
-	}
+	tlsConfig := p.TLSConfigs()[connection.HTTP2]
 
-	regions, err := allregions.EdgeDiscovery(p.log, edgeSRVService)
-	if err != nil {
-		return fmt.Errorf("%w: edge discovery: %w", ErrRetry, err)
-	}
-	edge := func() *net.UDPAddr {
-		for _, region := range regions {
-			for _, candidate := range region {
-				if candidate.UDP != nil && candidate.UDP.IP.To4() != nil {
-					return candidate.UDP
-				}
-			}
+	// Whichever route worked last goes first. The order is the only thing
+	// remembered: both are tried every time, so a network that starts
+	// carrying 7844 again is noticed, and one that stops is not waited on
+	// twice.
+	p.relayMu.Lock()
+	relayFirst := time.Now().Before(p.relayUntil)
+	p.relayMu.Unlock()
+
+	var conn net.Conn
+	var viaRelay bool
+	for _, relay := range [2]bool{relayFirst, !relayFirst} {
+		conn, err = p.dialEdge(ctx, tlsConfig, relay)
+		if err == nil {
+			viaRelay = relay
+			break
 		}
-		return nil
-	}()
-	if edge == nil {
-		return fmt.Errorf("%w: edge discovery returned no IPv4 UDP endpoint", ErrRetry)
+		p.log.Debug().Err(err).Bool("relay", relay).Msg("no answer on this route")
 	}
-
-	// Unmapped: DialQuic picks its listen network off the address family,
-	// and a 4-in-6 address sends it to udp6 for a v4 edge.
-	addr := edge.AddrPort()
-	conn, err := connection.DialQuic(ctx, &quic.Config{
-		HandshakeIdleTimeout: 5 * time.Second,
-		MaxIdleTimeout:       15 * time.Second,
-		KeepAlivePeriod:      cfquic.MaxIdlePingPeriod,
-		// quic-go's 1280 default doesn't fit a 1280-byte path once the
-		// UDP and IP headers are on it, and the Initial packet can't
-		// shrink below this floor: a tunnelled default route (WARP,
-		// Tailscale) never gets a handshake out. 1232 leaves room for
-		// either IP version.
-		InitialPacketSize: 1232,
-	}, tlsConfig, netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port()), nil, probeConnIndex, p.log,
-		// A probe must not share the connector's UDP port.
-		dialopts.DialOpts{SkipPortReuse: true})
 	if err != nil {
-		return fmt.Errorf("%w: dial %s: %w", ErrRetry, edge, err)
+		// Neither route reached the edge, so the edge never ruled: this is a
+		// network with no way out, not a tunnel that stopped existing.
+		return fmt.Errorf("%w: no way to the edge: %w", ErrRetry, err)
 	}
-	defer conn.CloseWithError(quic.ApplicationErrorCode(quic.NoError), "probe complete")
 
-	// The edge takes the first stream on a connection as the control plane.
-	stream, err := conn.OpenStream()
-	if err != nil {
-		return fmt.Errorf("%w: open control stream to %s: %w", ErrRetry, edge, err)
+	p.relayMu.Lock()
+	if viaRelay {
+		p.relayUntil = time.Now().Add(relayMemo)
+	} else {
+		p.relayUntil = time.Time{}
 	}
-	defer stream.Close()
+	p.relayMu.Unlock()
 
-	client := tunnelrpc.NewRegistrationClient(ctx, stream, 5*time.Second)
-	defer client.Close()
+	defer conn.Close()
 
-	// A real UUID: the edge validates the client id before the credentials,
-	// so an empty one is refused for the wrong reason.
-	clientID := uuid.New()
-	details, err := client.RegisterConnection(ctx, pogs.TunnelAuth{
-		AccountTag:   p.accountTag,
-		TunnelSecret: p.secret,
-	}, tunnelID, &pogs.ConnectionOptions{
-		Client: pogs.ClientInfo{
-			ClientID: clientID[:],
-			Version:  p.version,
-			Arch:     runtime.GOOS + "_" + runtime.GOARCH,
-		},
-	}, probeConnIndex, edge.IP)
+	// What the registration reports as the edge it reached: the address this
+	// connection actually landed on, which is the relay's when the relay
+	// carried it.
+	var edgeIP net.IP
+	if remote, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		edgeIP = remote.IP
+	}
 
-	if err == nil {
-		p.log.Info().Any("details", details).Str("hostname", p.hostname).Msg("probe success")
+	// Buffered, so the handler can finish even when ctx wins the race below
+	// and nothing is left reading.
+	type answer struct {
+		details *pogs.ConnectionDetails
+		err     error
+	}
+	answered := make(chan answer, 1)
+
+	go (&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{
+		Context: ctx,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The edge opens other streams on this connection for its own
+			// reasons; only the control stream carries the registration.
+			if r.Header.Get(connection.InternalUpgradeHeader) != connection.ControlStreamUpgrade {
+				return
+			}
+			rw, err := connection.NewHTTP2RespWriter(r, w, connection.TypeControlStream, p.log)
+			if err != nil {
+				// Pre-classified: the stream never formed, so the edge never
+				// ruled on the tunnel.
+				answered <- answer{err: fmt.Errorf("%w: control stream: %w", ErrRetry, err)}
+				return
+			}
+
+			client := tunnelrpc.NewRegistrationClient(r.Context(), rw, 5*time.Second)
+			defer client.Close()
+
+			// A real UUID: the edge validates the client id before the
+			// credentials, so an empty one is refused for the wrong reason.
+			clientID := uuid.New()
+			details, err := client.RegisterConnection(r.Context(), pogs.TunnelAuth{
+				AccountTag:   p.accountTag,
+				TunnelSecret: p.secret,
+			}, tunnelID, &pogs.ConnectionOptions{
+				Client: pogs.ClientInfo{
+					ClientID: clientID[:],
+					Version:  p.version,
+					Arch:     runtime.GOOS + "_" + runtime.GOARCH,
+				},
+			}, probeConnIndex, edgeIP)
+			answered <- answer{details: details, err: err}
+		}),
+	})
+
+	var got answer
+	select {
+	case got = <-answered:
+	case <-ctx.Done():
+		return fmt.Errorf("%w: edge opened no control stream: %w", ErrRetry, context.Cause(ctx))
+	}
+
+	if got.err == nil {
+		p.log.Info().Any("details", got.details).Str("hostname", p.hostname).Msg("probe success")
 		return nil
+	} else if errors.Is(got.err, ErrRetry) {
+		return got.err
 	} else if ctx.Err() != nil {
 		// An ask cut short is not an answer: the edge never ruled.
 		return fmt.Errorf("%w: registration cut short: %w", ErrRetry, context.Cause(ctx))
-	} else if strings.Contains(err.Error(), connection.DuplicateConnectionError) {
+	} else if strings.Contains(got.err.Error(), connection.DuplicateConnectionError) {
 		p.log.Info().Msg("duplicate connection detected")
-		return fmt.Errorf("%w: index %d: %w", ErrInUse, probeConnIndex, err)
+		return fmt.Errorf("%w: index %d: %w", ErrInUse, probeConnIndex, got.err)
 	}
 
 	// The edge refused. A provider that reaps a tunnel deletes the record
@@ -306,23 +482,17 @@ func (p *Prober) probe(ctx context.Context) error {
 
 	resolved, err := p.LookupHost(ctx, host)
 	if err == nil {
-		p.log.Debug().Str("host", host).Str("resolved", resolved).
+		p.log.Debug().Str("host", host).Str("resolved", resolved).Err(got.err).
 			Msg("edge refused the connection but the hostname still resolves")
 		return nil
 	} else if errors.Is(err, ErrRetry) {
 		return fmt.Errorf("edge refused the connection and %s could not be resolved: %w", host, err)
 	} else {
-		return fmt.Errorf("%w: edge refused the connection and %s no longer resolves: %w", ErrGone, host, err)
+		return fmt.Errorf("%w: edge refused the connection (%v) and %s no longer resolves: %w",
+			ErrGone, got.err, host, err)
 	}
 }
 
-// LookupHost resolves host through the DoH resolvers, first to answer wins.
-// The machine's resolver is never asked.
-//
-// Only a name that positively does not exist is an answer. A resolver that
-// timed out, refused, or could not be reached at all is a question that went
-// unasked, and comes back wrapped in ErrRetry so a caller can tell a record
-// that is gone from a resolver having a bad day.
 func (p *Prober) LookupHost(ctx context.Context, host string) (string, error) {
 	var lastErr error
 	for _, resolver := range p.dohResolvers() {
