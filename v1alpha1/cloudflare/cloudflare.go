@@ -92,6 +92,12 @@ var promMu sync.Mutex
 // LIBTUNNEL_SPEC envelope) — one source of truth so the tag never drifts.
 const backendName = "cloudflare"
 
+// goneProbeDelay is how long the tunnel may have no connection at all before
+// the edge is asked whether it still has the tunnel. Long enough that an
+// ordinary reconnect — cloudflared's first backoff is a second — is over
+// before anything is asked.
+const goneProbeDelay = 30 * time.Second
+
 // haConnections is the number of edge (HA) connections the supervisor keeps.
 // The reconnect lever fires one ReconnectSignal per conn to cycle them all.
 const haConnections = 2
@@ -601,13 +607,7 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 	// is up. Vouched for, it is the spec and the provider is never asked.
 	complete := hint.ID != "" && hint.Hostname != "" && hint.AccountTag != "" && len(hint.Secret) > 0
 	if complete {
-		protocol := connection.HTTP2
-		if edge, err := p.backend.resolveEdgeProtocol(); err != nil {
-			return nil, err
-		} else if edge == EdgeQUIC {
-			protocol = connection.QUIC
-		}
-		switch err := probeHint(ctx, protocol, hint, log); {
+		switch err := probeHint(ctx, hint, log); {
 		case err == nil:
 			log.Info("edge vouched for the spec, using it as given", "hostname", hint.Hostname)
 			return hint, nil
@@ -644,15 +644,14 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 	return got, nil
 }
 
-// probeHint asks the edge whether hint is live, over protocol. A var so a
-// test can answer without an edge.
-var probeHint = func(ctx context.Context, protocol connection.Protocol, hint *Spec, log *slog.Logger) error {
+// probeHint asks the edge whether hint is live. A var so a test can answer
+// without an edge.
+var probeHint = func(ctx context.Context, hint *Spec, log *slog.Logger) error {
 	return probe.New().
 		WithID(hint.ID).
 		WithHostname(hint.Hostname).
 		WithAccountTag(hint.AccountTag).
 		WithSecret(hint.Secret).
-		WithProtocol(protocol).
 		WithLogger(zerologger(log, nil)).
 		Probe(context.WithTimeout(ctx, probe.Timeout))
 }
@@ -909,14 +908,44 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			WithHostname(spec.Hostname).
 			WithAccountTag(spec.AccountTag).
 			WithSecret(spec.Secret).
-			WithProtocolSelector(protocolSelector).
-			WithConnIndex(haConnections).
-			WithLogger(log).
-			OnGone(func() { t.Emit(v1.Event{Kind: v1.EventGone}) })
-		// For the life of the tunnel rather than off an edge event: the reap
-		// worth catching leaves the connections looking fine, so there is no
-		// event to hang it on.
-		go prober.Run(ctx)
+			WithLogger(log)
+
+		// A tunnel deleted at the edge and a network that dropped look the
+		// same from here: cloudflared retries both forever, its backoffs are
+		// built retryForever, and the registration error that would say which
+		// is discarded before the supervisor can classify it. So the question
+		// is asked whenever the tunnel is not fully connected, and only the
+		// edge's answer ends it. A healthy tunnel is never probed.
+		go func() {
+			ticker := time.NewTicker(goneProbeDelay)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					// Every connection up is the only state that needs no
+					// asking. A deleted tunnel does not drop the connections
+					// it already has — the edge gets to them in its own time
+					// — but it refuses the next registration at once, so a
+					// tunnel short of its full complement is the first thing
+					// worth asking about. Probing a partly-connected tunnel
+					// is safe: the probe registers on an index the connector
+					// never holds.
+					if b.edge.liveCount() >= haConnections {
+						continue
+					}
+					err := prober.Probe(context.WithTimeout(ctx, probe.Timeout))
+					if !errors.Is(err, probe.ErrGone) {
+						continue
+					}
+					t.Logger().Warn("edge disowned the tunnel", "error", err)
+					t.Emit(v1.Event{Kind: v1.EventGone})
+					t.Cancel(err)
+					return
+				}
+			}
+		}()
 
 		// The observer fans connection lifecycle events out to sinks; wire one
 		// that feeds edge, so the Reconnect lever can block until the edge is

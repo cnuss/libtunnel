@@ -17,8 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cloudflare/cloudflared/connection"
-
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/probe"
@@ -348,7 +346,7 @@ func TestWithRecordIDRidesAsHint(t *testing.T) {
 // mint without an edge; the tests below that care about the verdict set
 // their own.
 func TestMain(m *testing.M) {
-	probeHint = func(context.Context, connection.Protocol, *Spec, *slog.Logger) error { return probe.ErrGone }
+	probeHint = func(context.Context, *Spec, *slog.Logger) error { return probe.ErrGone }
 	os.Exit(m.Run())
 }
 
@@ -358,7 +356,7 @@ func answerProbe(t *testing.T, err error) *atomic.Int32 {
 	t.Helper()
 	prev := probeHint
 	var asked atomic.Int32
-	probeHint = func(context.Context, connection.Protocol, *Spec, *slog.Logger) error {
+	probeHint = func(context.Context, *Spec, *slog.Logger) error {
 		asked.Add(1)
 		return err
 	}
@@ -442,26 +440,5 @@ func TestPartialHintIsNotProbed(t *testing.T) {
 	}
 	if seen == nil {
 		t.Error("mint never called")
-	}
-}
-
-// TestProbeAsksOverThePinnedEdgeProtocol pins that the probe follows
-// WithEdgeProtocol: a caller who pinned quic because TCP is blocked must not
-// be probed over TCP.
-func TestProbeAsksOverThePinnedEdgeProtocol(t *testing.T) {
-	clearSpecEnv(t)
-	var got connection.Protocol
-	prev := probeHint
-	probeHint = func(_ context.Context, protocol connection.Protocol, _ *Spec, _ *slog.Logger) error {
-		got = protocol
-		return nil
-	}
-	t.Cleanup(func() { probeHint = prev })
-
-	if _, err := From(known).WithEdgeProtocol(EdgeQUIC).Provider().Spec(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got != connection.QUIC {
-		t.Errorf("probed over %s, want quic", got)
 	}
 }
