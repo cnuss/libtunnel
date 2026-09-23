@@ -896,7 +896,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to create client config: %w", err)
 		}
-		protocolSelector, err := connection.NewProtocolSelector(string(protocol), spec.AccountTag, false, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
+		protocolSelector, err := connection.NewProtocolSelector("http2", spec.AccountTag, false, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create protocol selector: %w", err)
 		}
@@ -1006,9 +1006,12 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			// bounds teardown after a cancel. Max accepted is 3m.
 			GracePeriod: 30 * time.Second,
 			Region:      "",
-			// Empty: cloudflared discovers the edge by SRV, with its own DoT
-			// fallback when the machine's resolver cannot answer.
-			EdgeAddrs:     nil,
+			// Nil on a network that carries 7844, and cloudflared discovers
+			// the edge by SRV with its own DoT fallback. Where it does not,
+			// the prober hands back the relay it just reached the edge
+			// through — the supervisor would otherwise retry addresses this
+			// network drops, forever.
+			EdgeAddrs:     prober.EdgeAddrs(ctx),
 			EdgeIPVersion: allregions.Auto,
 			HAConnections: haConnections,
 			// No tags, matching cloudflared's quick-tunnel default. (Tags never
@@ -1030,16 +1033,8 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 				},
 				QuickTunnelUrl: t.Hostname(),
 			},
-			ProtocolSelector: protocolSelector,
-			EdgeTLSConfigs: func() map[connection.Protocol]*tls.Config {
-				pool := trust.Pool()
-				out := make(map[connection.Protocol]*tls.Config, len(connection.ProtocolList))
-				for _, p := range connection.ProtocolList {
-					s := p.TLSSettings()
-					out[p] = &tls.Config{ServerName: s.ServerName, NextProtos: s.NextProtos, RootCAs: pool}
-				}
-				return out
-			}(),
+			ProtocolSelector:    protocolSelector,
+			EdgeTLSConfigs:      prober.TLSConfigs(),
 			MaxEdgeAddrRetries:  8,
 			RPCTimeout:          5 * time.Second,
 			OriginDNSService:    origins.NewDNSResolverService(originDialer, log, noop()),
