@@ -287,10 +287,12 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 				return out, nil
 			}
 			// The spec is complete and the tunnel exists; the hostname just
-			// does not resolve yet. Replaying the record is idempotent, so
-			// this waits it out rather than handing back a name that answers
-			// nothing.
-			return out, fmt.Errorf("%w: %s", v1.ErrRateLimited, throttleReason(out.after, "hostname not resolving yet"))
+			// does not reach it yet — a fresh name still propagating, or a
+			// resumed one whose record was repointed at a recreated tunnel
+			// and whose route the edge has not picked up. Replaying the
+			// record is idempotent, so this waits it out rather than handing
+			// back a name that answers nothing.
+			return out, fmt.Errorf("%w: %s", v1.ErrRateLimited, throttleReason(out.after, "hostname does not route to the tunnel yet"))
 		}
 
 		var errorMessages []string

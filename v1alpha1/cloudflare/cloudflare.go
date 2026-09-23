@@ -636,28 +636,11 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 		p.logf("hinted hostname is gone, adopting the one minted for it",
 			"was", hint.Hostname, "now", got.Hostname)
 	case hint.ID != "" && got.ID != hint.ID:
-		// The record now names a tunnel the edge has not been told about.
-		// A request for the hostname that lands before it has — and the
-		// establish loop sends one the moment the edge connects — is
-		// answered from the old route and pins that answer for about two
-		// minutes. So the spec is held back until the change has spread.
-		p.logf("tunnel replaced behind the same hostname, waiting for the edge to route to it",
-			"hostname", hint.Hostname, "was", hint.ID, "now", got.ID, "settle", routeSettle)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(routeSettle):
-		}
+		p.logf("tunnel replaced behind the same hostname", "hostname", hint.Hostname,
+			"was", hint.ID, "now", got.ID)
 	}
 	return got, nil
 }
-
-// routeSettle is how long the edge takes to route a hostname to the tunnel
-// its record was repointed at. Measured: a request 0s or 3s after the repoint
-// is answered from the old route, and keeps being for ~120s; one 10s after
-// reaches the new tunnel at once. Fifteen leaves margin over the one
-// measurement that worked. A var so a test can shorten it.
-var routeSettle = 15 * time.Second
 
 // probeHint asks the edge whether hint is live. A var so a test can answer
 // without an edge.
