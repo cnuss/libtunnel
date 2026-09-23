@@ -274,14 +274,12 @@ type Backend struct {
 	// supersedes either.
 	token string
 	// Runtime state wired at connect. reconnected feeds the supervisor's
-	// external-control channel, edge tracks edge connections, edgeReject
-	// carries a refused registration back from the log bridge, and reconnectCtx
+	// external-control channel, edge tracks edge connections, and reconnectCtx
 	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
 	// and listener is the loopback socket cloudflared dials to reach it. All nil
 	// until connect runs.
 	reconnected  chan supervisor.ReconnectSignal
 	edge         *edgeWatcher
-	edgeReject   *edgeReject
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
 	listener     net.Listener
@@ -652,7 +650,7 @@ var probeHint = func(ctx context.Context, hint *Spec, log *slog.Logger) error {
 		WithHostname(hint.Hostname).
 		WithAccountTag(hint.AccountTag).
 		WithSecret(hint.Secret).
-		WithLogger(zerologger(log, nil)).
+		WithLogger(zerologger(log)).
 		Probe(context.WithTimeout(ctx, probe.Timeout))
 }
 
@@ -817,7 +815,6 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	// pipeline are live.
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edge = newEdgeWatcher()
-	b.edgeReject = newEdgeReject()
 	b.reconnectCtx = t.Context()
 	wsOrigin, _ := t.WebSocketOrigin()
 	b.proxy = newOriginProxy(originURLs, wsOrigin, t.Logger(), transport)
@@ -849,7 +846,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origins", originURLs)
 	service := (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
 	ctx := t.Context()
-	log := zerologger(t.Logger(), b.edgeReject)
+	log := zerologger(t.Logger())
 	spec := t.Spec()
 	if spec == nil {
 		return fmt.Errorf("no spec resolved")
@@ -1103,8 +1100,6 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-connected.Wait():
-	case <-b.edgeReject.wait():
-		return b.credentialRejected()
 	case <-timeout.C:
 		return fmt.Errorf("%w: no connection after %d attempts (%d ended) in %s: %s",
 			v1.ErrEdgeUnreachable, b.edge.attemptCount(), b.edge.disconnectCount(), edgeBudget, edgeBlockedHint)
@@ -1207,14 +1202,6 @@ const establishHeader = "X-Libtunnel-Loop"
 
 // emitter is the half of the tunnel the probe needs: somewhere to report.
 type emitter interface{ Emit(v1.Event) }
-
-// credentialRejected is what a caller sees when the edge refuses these
-// credentials: the class it can branch on, carrying the edge's own words and
-// none of edgeBlockedHint's advice, which is about a network this failure has
-// nothing to do with.
-func (b *Backend) credentialRejected() error {
-	return fmt.Errorf("%w: %s", v1.ErrCredentialRejected, b.edgeReject.message())
-}
 
 // edgeBlockedHint is cloudflared's own diagnosis of this failure, which it logs
 // at warn level from selectNextProtocol. Repeated verbatim so the error carries

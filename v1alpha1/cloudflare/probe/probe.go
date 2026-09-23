@@ -518,16 +518,6 @@ func (p *Prober) probeHTTP2(ctx context.Context) error {
 		return fmt.Errorf("%w: %q is not a tunnel id: %w", ErrGone, p.id, err)
 	}
 
-	// A refusal on its own does not end a tunnel — the hostname is what tells
-	// a reap from a refusal — so without one there is no verdict to be had
-	// and nothing worth dialing for.
-	if p.hostname == "" {
-		// Not ErrRetry: asking again cannot conjure a hostname, and not
-		// ErrGone: nothing was asked. A caller that built the prober this
-		// way gets told so once.
-		return errors.New("no hostname to weigh a refusal against")
-	}
-
 	tlsConfig := p.TLSConfigs()[connection.HTTP2]
 
 	// Whichever route worked last goes first. The order is the only thing
@@ -636,25 +626,14 @@ func (p *Prober) probeHTTP2(ctx context.Context) error {
 		return fmt.Errorf("%w: index %d: %w", ErrInUse, probeConnIndex, got.err)
 	}
 
-	// The edge refused. A provider that reaps a tunnel deletes the record
-	// with it, so what the name does now is what says whether that happened:
-	// still resolving means this tunnel was not reaped, and no answer at all
-	// leaves the refusal standing alone, which is not enough to end a tunnel.
-	host := p.hostname
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-
-	resolved, err := p.LookupHost(ctx, host)
+	resolved, err := p.LookupHost(ctx, p.hostname)
 	if err == nil {
-		p.log.Debug().Str("host", host).Str("resolved", resolved).Err(got.err).
-			Msg("edge refused the connection but the hostname still resolves")
+		p.log.Info().Any("hostname", p.hostname).Str("resolved", resolved).Msg("probe success")
 		return nil
 	} else if errors.Is(err, ErrRetry) {
-		return fmt.Errorf("edge refused the connection and %s could not be resolved: %w", host, err)
+		return fmt.Errorf("%w: hostname %s could not be resolved: %w", ErrRetry, p.hostname, err)
 	} else {
-		return fmt.Errorf("%w: edge refused the connection (%v) and %s no longer resolves: %w",
-			ErrGone, got.err, host, err)
+		return fmt.Errorf("%w: hostname %s could not be resolved: %w", ErrGone, p.hostname, err)
 	}
 }
 
