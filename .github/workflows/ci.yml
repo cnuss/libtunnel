@@ -122,6 +122,17 @@ jobs:
       - name: tests
         run: make test
 
+      # The mint provider screens callers against DNS blocklists, and runner
+      # addresses are shared enough to land on one — an honest run then gets
+      # "rejected by the provider: 1000: Blacklisted" (#233). A mint carrying
+      # a credential is judged by that instead, and v1.Token falls back to
+      # the token Actions issues every job. GitHub hands that variable to a
+      # JS action and not to a `run:` step, so it has to be exported here.
+      - name: expose the actions runtime token
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN)
+
       # All live-tier selection lives in the e2e package (#147): which tier a
       # platform runs — the full scenario suite on linux/amd64, the example
       # binaries on one variant of each OS family, nothing live elsewhere —
