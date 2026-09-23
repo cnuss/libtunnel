@@ -346,7 +346,7 @@ func TestWithRecordIDRidesAsHint(t *testing.T) {
 // mint without an edge; the tests below that care about the verdict set
 // their own.
 func TestMain(m *testing.M) {
-	probeHint = func(context.Context, *Spec, *slog.Logger) error { return probe.ErrGone }
+	probeHint = func(context.Context, *probe.Prober, *Spec, *slog.Logger) error { return probe.ErrGone }
 	os.Exit(m.Run())
 }
 
@@ -356,7 +356,7 @@ func answerProbe(t *testing.T, err error) *atomic.Int32 {
 	t.Helper()
 	prev := probeHint
 	var asked atomic.Int32
-	probeHint = func(context.Context, *Spec, *slog.Logger) error {
+	probeHint = func(context.Context, *probe.Prober, *Spec, *slog.Logger) error {
 		asked.Add(1)
 		return err
 	}

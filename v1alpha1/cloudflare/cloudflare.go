@@ -291,6 +291,10 @@ type Backend struct {
 	// stopped closes once the supervisor has returned: its edge connections
 	// unregistered and closed, or the grace period spent. Nil until connect.
 	stopped chan struct{}
+	// prober is the one asker for this backend: the hint probe and the edge
+	// watcher share it, so what the first learned about the network — the
+	// route to the edge, the TLS configs — is not learned twice.
+	prober *probe.Prober
 	// establishInterval is fixed at construction rather than read by the
 	// establish loop: the loop is a goroutine that may start after the
 	// caller has moved on, and a test shortening the package default for
@@ -320,6 +324,7 @@ func (b *Backend) Stopped() <-chan struct{} { return b.stopped }
 func New() *Backend {
 	b := &Backend{
 		establishInterval: establishInterval,
+		prober:            probe.New(),
 	}
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
 	if b.envErr == nil {
@@ -617,7 +622,7 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 	// is up. Vouched for, it is the spec and the provider is never asked.
 	complete := hint.ID != "" && hint.Hostname != "" && hint.AccountTag != "" && len(hint.Secret) > 0
 	if complete {
-		switch err := probeHint(ctx, hint, log); {
+		switch err := probeHint(ctx, p.backend.prober, hint, log); {
 		case err == nil:
 			log.Info("edge vouched for the spec, using it as given", "hostname", hint.Hostname)
 			return hint, nil
@@ -654,14 +659,14 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 	return got, nil
 }
 
-// probeHint asks the edge whether hint is live. A var so a test can answer
-// without an edge.
-var probeHint = func(ctx context.Context, hint *Spec, log *slog.Logger) error {
+// probeHint asks the edge, through prober, whether hint is live. A var so a
+// test can answer without an edge.
+var probeHint = func(ctx context.Context, prober *probe.Prober, hint *Spec, log *slog.Logger) error {
 	timed, stop := context.WithTimeout(ctx, probe.Timeout)
 	defer stop()
 	asked, cancel := context.WithCancelCause(timed)
 
-	err := probe.New().
+	err := prober.
 		WithID(hint.ID).
 		WithHostname(hint.Hostname).
 		WithAccountTag(hint.AccountTag).
@@ -953,7 +958,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 
 		originDialer := ingress.NewOriginDialer(ingress.OriginConfig{}, log)
 
-		prober := probe.New().
+		prober := b.prober.
 			WithID(spec.ID).
 			WithHostname(spec.Hostname).
 			WithAccountTag(spec.AccountTag).
