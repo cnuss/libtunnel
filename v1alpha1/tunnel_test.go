@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,10 @@ type fakeEngine struct {
 	// manual leaves EventEstablished to the test instead of firing it on
 	// connect, for the cases that observe the gap between the two.
 	manual bool
+	// stopped is what Stopped reports: nil, the default, is an engine that
+	// holds nothing at the edge; a channel is one that lets go when the
+	// test closes it.
+	stopped chan struct{}
 }
 
 func newFakeEngine(spec *cloudflare.Spec) *fakeEngine {
@@ -55,6 +60,7 @@ func (e *fakeEngine) WithToken(token string) v1.Backend[*cloudflare.Spec] {
 func (e *fakeEngine) Reconnect(context.Context) error { e.reconnected = true; return nil }
 func (e *fakeEngine) Proxy() *httputil.ReverseProxy   { return e.proxy }
 func (e *fakeEngine) Listener() net.Listener          { return e.listener }
+func (e *fakeEngine) Stopped() <-chan struct{}        { return e.stopped }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
 	if !e.manual {
@@ -907,6 +913,7 @@ func (failingEngine) Provider() v1.Provider[*cloudflare.Spec] {
 func (failingEngine) CACerts() []*x509.Certificate                    { return nil }
 func (failingEngine) Proxy() *httputil.ReverseProxy                   { return nil }
 func (failingEngine) Listener() net.Listener                          { return nil }
+func (failingEngine) Stopped() <-chan struct{}                        { return nil }
 func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]     { return e }
 func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e failingEngine) WithToken(string) v1.Backend[*cloudflare.Spec] { return e }
@@ -1572,5 +1579,48 @@ func TestEstablishedAfterCancelIsIgnored(t *testing.T) {
 	}
 	if got, ok := <-conn.Ready(); ok {
 		t.Errorf("Ready delivered %v on a canceled tunnel, want closed empty", got)
+	}
+}
+
+// TestDoneWaitsForTheEngineToLetGo pins what Done means: not the context
+// ending, but the engine having let go of the edge after it. A process that
+// exits on Done then leaves nothing registered for the edge to route to; one
+// that exited on the context alone left its connections behind, and the next
+// connector on the same tunnel answered 502 until the edge noticed.
+func TestDoneWaitsForTheEngineToLetGo(t *testing.T) {
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine.stopped = make(chan struct{})
+	var events []v1.EventKind
+	var mu sync.Mutex
+	tun := v1alpha1.New(engine).WithEventListener(func(e v1.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, e.Kind)
+	})
+
+	done := tun.Done()
+	tun.Cancel()
+	if err := tun.Err(); !errors.Is(err, v1.ErrClosed) {
+		t.Fatalf("Err() = %v after Cancel, want ErrClosed", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("Done delivered with the engine still holding the edge")
+	case <-time.After(50 * time.Millisecond):
+	}
+	mu.Lock()
+	if slices.Contains(events, v1.EventDone) {
+		t.Error("EventDone fired with the engine still holding the edge")
+	}
+	mu.Unlock()
+
+	close(engine.stopped)
+	select {
+	case got, ok := <-done:
+		if !ok || got != tun {
+			t.Errorf("Done delivered (%v, %v), want the tunnel", got, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done not delivered once the engine let go")
 	}
 }

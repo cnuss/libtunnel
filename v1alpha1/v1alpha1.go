@@ -56,6 +56,14 @@ type Engine[T v1.Spec] interface {
 	// routing (see v1.Tunnel.WithLocalURL). Same contract — invoked once, in
 	// its own goroutine, blocking until the edge connection is up.
 	WithLocalURL(t *TunnelImpl[T], urls []*url.URL) error
+	// Stopped closes once the engine has let go of the edge after the
+	// tunnel's context ended: its connections unregistered, so the edge
+	// stops routing to them, or the grace period spent trying. Nil before
+	// connect — there is nothing to let go of — which the core reads as
+	// already stopped. Done waits on it, so a caller that waits on Done
+	// before exiting leaves no dead connections behind for the next
+	// connector on the same tunnel to be routed to.
+	Stopped() <-chan struct{}
 }
 
 // New returns an unstarted tunnel for the given backend, which also supplies
@@ -76,6 +84,7 @@ func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		backend:        backend,
 		originProvided: make(chan struct{}),
 		established:    make(chan struct{}),
+		finished:       make(chan struct{}),
 		wsOrigin:       -1,
 	}
 	// Auto-assigned interceptor Priorities count down from the top of the range.
@@ -112,6 +121,16 @@ func New[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		if cause != nil && !errors.Is(cause, v1.ErrClosed) {
 			t.Emit(v1.Event{Kind: v1.EventError, Err: cause})
 		}
+		// The end is when the engine has let go of the edge, not when the
+		// context did: Done is what a caller waits on before exiting, and
+		// exiting with connections still registered leaves the edge routing
+		// to a dead process for the next ten seconds or so.
+		if t.engine != nil {
+			if stopped := t.engine.Stopped(); stopped != nil {
+				<-stopped
+			}
+		}
+		t.finish()
 		t.Emit(v1.Event{Kind: v1.EventDone, Err: cause})
 	}()
 
@@ -200,6 +219,12 @@ type TunnelImpl[T v1.Spec] struct {
 	// event fires again after a full outage heals; the channel closes once.
 	established     chan struct{}
 	establishedOnce sync.Once
+
+	// finished closes once the tunnel has ended and its engine has let go
+	// of the edge (Engine.Stopped) — what Done delivers on, and EventDone
+	// fires on. Closed through finish, since two paths reach it.
+	finished   chan struct{}
+	finishOnce sync.Once
 }
 
 // Context is the tunnel's lifetime context, canceled (with cause) on any
@@ -208,9 +233,53 @@ func (t *TunnelImpl[T]) Context() context.Context {
 	return t.ctx
 }
 
-// Done implements v1.Lifecycle: delivers the tunnel once it has ended.
+// Done implements v1.Lifecycle: delivers the tunnel once it has ended and
+// its engine has let go of the edge. Not deliver: that releases a waiter
+// when the context ends, and here the context ending is where the wait
+// starts.
 func (t *TunnelImpl[T]) Done() <-chan v1.Tunnel {
-	return t.deliver(t.ctx.Done())
+	// Ended with nothing held at the edge is finished now, not when the
+	// goroutine that says so gets scheduled: WithContext with a dead
+	// context is relied on to have taken effect before it returns.
+	if t.ctx.Err() != nil && t.letGo() {
+		t.finish()
+	}
+	ch := make(chan v1.Tunnel, 1)
+	select {
+	case <-t.finished:
+		ch <- t
+		close(ch)
+	default:
+		go func() {
+			<-t.finished
+			ch <- t
+			close(ch)
+		}()
+	}
+	return ch
+}
+
+// finish marks the tunnel finished. Idempotent: Done's synchronous path and
+// the end-of-life goroutine both reach it.
+func (t *TunnelImpl[T]) finish() {
+	t.finishOnce.Do(func() { close(t.finished) })
+}
+
+// letGo reports whether the engine has let go of the edge, or never held it.
+func (t *TunnelImpl[T]) letGo() bool {
+	if t.engine == nil {
+		return true
+	}
+	stopped := t.engine.Stopped()
+	if stopped == nil {
+		return true
+	}
+	select {
+	case <-stopped:
+		return true
+	default:
+		return false
+	}
 }
 
 // Serialize implements v1.Tunnel: the resolved spec's Serialize. A getter

@@ -635,6 +635,15 @@ func (p *Prober) probeHTTP2(ctx context.Context) error {
 					Arch:     runtime.GOOS + "_" + runtime.GOARCH,
 				},
 			}, probeConnIndex, edgeIP)
+			if err == nil {
+				// Let go of the slot before the socket goes: the edge routes
+				// to a registered connection until it is unregistered or
+				// noticed dead, and a probe that just hung up would leave
+				// its index answering 502 for the next few seconds.
+				if err := client.GracefulShutdown(r.Context(), 5*time.Second); err != nil {
+					p.log.Debug().Err(err).Msg("probe could not unregister; the edge will notice the closed connection")
+				}
+			}
 			answered <- answer{details: details, err: err}
 		}),
 	})

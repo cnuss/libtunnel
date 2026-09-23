@@ -98,6 +98,11 @@ const backendName = "cloudflare"
 // before anything is asked.
 const goneProbeDelay = 30 * time.Second
 
+// gracePeriod bounds the graceful shutdown: how long in-flight requests get
+// to finish once the tunnel ends and its connections are unregistered, and
+// so how long Done can take. cloudflared's own default (its --grace-period).
+const gracePeriod = 30 * time.Second
+
 // haConnections is the number of edge (HA) connections the supervisor keeps.
 // The reconnect lever fires one ReconnectSignal per conn to cycle them all.
 const haConnections = 2
@@ -283,6 +288,9 @@ type Backend struct {
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
 	listener     net.Listener
+	// stopped closes once the supervisor has returned: its edge connections
+	// unregistered and closed, or the grace period spent. Nil until connect.
+	stopped chan struct{}
 	// establishInterval is fixed at construction rather than read by the
 	// establish loop: the loop is a goroutine that may start after the
 	// caller has moved on, and a test shortening the package default for
@@ -301,6 +309,10 @@ func (b *Backend) Proxy() *httputil.ReverseProxy { return b.proxy }
 // Listener returns the loopback listener cloudflared dials to reach the proxy
 // (nil before connect). Implements the v1alpha1 Engine contract.
 func (b *Backend) Listener() net.Listener { return b.listener }
+
+// Stopped closes once the edge has been let go of (nil before connect).
+// Implements the v1alpha1 Engine contract.
+func (b *Backend) Stopped() <-chan struct{} { return b.stopped }
 
 // New returns the Cloudflare backend. The origin-scheme knobs are fixed from
 // the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set. The first
@@ -830,6 +842,17 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edge = newEdgeWatcher()
 	b.reconnectCtx = t.Context()
+	// stopped is the supervisor's to close once it runs; until then a
+	// connect that fails closes it on the way out, so Done never waits on
+	// an edge that was never held.
+	stopped := make(chan struct{})
+	b.stopped = stopped
+	supervised := false
+	defer func() {
+		if !supervised {
+			close(stopped)
+		}
+	}()
 	wsOrigin, _ := t.WebSocketOrigin()
 	b.proxy = newOriginProxy(originURLs, wsOrigin, t.Logger(), transport)
 	b.listener = l
@@ -855,7 +878,12 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			return t.Context()
 		},
 	}
-	context.AfterFunc(t.Context(), func() { srv.Close() })
+	// Closed once the edge is let go of rather than when the context ends:
+	// requests in flight during the grace period still need answering.
+	go func() {
+		<-stopped
+		srv.Close()
+	}()
 	go srv.Serve(l)
 	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origins", originURLs)
 	service := (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
@@ -884,6 +912,17 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	}
 	t.Logger().Info("edge transport selected", "protocol", protocol)
 
+	// The supervisor runs on a context of its own that outlives the tunnel's
+	// by up to the grace period. cloudflared's graceful shutdown sends
+	// UnregisterConnection on the context it was run with, so a context
+	// already canceled cancels the RPC before it leaves, and the edge keeps
+	// routing to the closed connection until it notices on its own — ten
+	// seconds or so of 502 for the next connector on this tunnel. The tunnel
+	// ending closes graceful instead, and run ends when the supervisor has
+	// returned, or the grace period is spent waiting for it.
+	runCtx, stopRun := context.WithCancel(context.WithoutCancel(ctx))
+	graceful := make(chan struct{})
+
 	// The closure scopes the prometheus.DefaultRegisterer swap to supervisor
 	// construction: cloudflared registers collectors against the global
 	// registerer at construction, which would collide across tunnels and
@@ -899,7 +938,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		prometheus.DefaultRegisterer = noop()
 		defer func() { prometheus.DefaultRegisterer = registerer }()
 
-		featureSelector, err := features.NewFeatureSelector(ctx, spec.AccountTag, nil, false, log)
+		featureSelector, err := features.NewFeatureSelector(runCtx, spec.AccountTag, nil, false, log)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create feature selector: %w", err)
 		}
@@ -1027,7 +1066,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			// supervisor waits for in-flight requests on graceful shutdown — and
 			// ctx.Done is wired as the graceful-shutdown signal below, so this
 			// bounds teardown after a cancel. Max accepted is 3m.
-			GracePeriod: 30 * time.Second,
+			GracePeriod: gracePeriod,
 			Region:      "",
 			// Nil on a network that carries 7844, and cloudflared discovers
 			// the edge by SRV with its own DoT fallback. Where it does not,
@@ -1085,7 +1124,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse ingress for %s: %w", service, err)
 		}
-		orchestrator, err := orchestration.NewOrchestrator(ctx, &orchestration.Config{
+		orchestrator, err := orchestration.NewOrchestrator(runCtx, &orchestration.Config{
 			Ingress:             &parsed,
 			WarpRouting:         ingress.NewWarpRoutingConfig(&config.WarpRoutingConfig{}), // cloudflared defaults: 5s connect, unlimited flows, 30s keepalive
 			OriginDialerService: originDialer,
@@ -1098,20 +1137,34 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		// b.reconnected is the backend's external-control channel, wired above;
 		// here it is handed to the supervisor, which selects on it. b.Reconnect
 		// sends on it to cycle the edge.
-		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, b.reconnected, ctx.Done())
+		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, b.reconnected, graceful)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create supervisor: %w", err)
 		}
 		return sup, nil
 	}()
 	if err != nil {
+		stopRun()
 		return err
 	}
 
 	connected := signal.New(make(chan struct{}))
+	supervised = true
 	go func() {
-		if err := sup.Run(ctx, connected); err != nil {
+		defer close(stopped)
+		defer stopRun()
+		if err := sup.Run(runCtx, connected); err != nil {
 			t.Cancel(fmt.Errorf("supervisor run failed: %w", err))
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		close(graceful)
+		select {
+		case <-stopped:
+		case <-time.After(gracePeriod):
+			t.Logger().Warn("edge connections still open after the grace period, closing them", "grace", gracePeriod)
+			stopRun()
 		}
 	}()
 

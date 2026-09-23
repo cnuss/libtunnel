@@ -353,7 +353,10 @@ type Lifecycle[T any] interface {
 	// first the channel closes without delivering, so a receive with
 	// ok == false means it never came up — Err says why.
 	Ready() <-chan T
-	// Done delivers the value once it has ended, by failure or by choice.
+	// Done delivers the value once it has ended, by failure or by choice,
+	// and has let go of what it held: a tunnel delivers once its edge
+	// connections are unregistered, so a process that waits on Done before
+	// exiting leaves the edge nothing dead to route to.
 	Done() <-chan T
 	// Err reports why it ended: nil while it is alive, the cause once Done
 	// has delivered.
