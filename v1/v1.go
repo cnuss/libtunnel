@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 )
 
@@ -197,6 +198,17 @@ var (
 	ErrClosed error = &class{nil, "tunnel closed", 0}
 )
 
+// Token is the mint credential the environment carries: TokenEnv, else
+// ActionsTokenEnv. Empty when neither is set, which leaves whatever
+// Tunnel.WithToken was given in place — and non-empty beats it, the way
+// every env mirror beats its code knob.
+func Token() string {
+	if v := os.Getenv(TokenEnv); v != "" {
+		return v
+	}
+	return os.Getenv(ActionsTokenEnv)
+}
+
 // Budget reports how long the failure class err belongs to may keep failing
 // before it becomes the verdict — and so also whether it is worth retrying at
 // all. Zero never retries, which covers both a permanent class and anything
@@ -253,6 +265,15 @@ const (
 	// resolution mints, so it always rides; it is never part of the spec or
 	// its handoff.
 	TokenEnv = "LIBTUNNEL_TOKEN"
+	// ActionsTokenEnv is what TokenEnv falls back to: the token GitHub
+	// Actions issues to a job, which lets a provider judge a mint by the
+	// credential rather than by the address it came from. Runner addresses
+	// are shared and land on DNS blocklists, so a provider screening by
+	// address alone turns down honest CI.
+	//
+	// GitHub sets this for a JS action, not for a `run:` step, so a workflow
+	// that wants it has to export it first.
+	ActionsTokenEnv = "ACTIONS_RUNTIME_TOKEN"
 	// LogEnv names the level (debug|info|warn|error) of the default logger:
 	// set, a tunnel with no WithLogger call logs to stderr at that level
 	// instead of staying silent. The env-beats-code exception: an explicit

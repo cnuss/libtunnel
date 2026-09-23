@@ -153,9 +153,10 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		endpoint = quickTunnelURL
 	}
 	// Same reasoning as the endpoint: a provider built directly still honors
-	// the env mirror, so LIBTUNNEL_TOKEN is not a silent exception.
+	// the env mirror, so LIBTUNNEL_TOKEN is not a silent exception — nor is
+	// the Actions token it falls back to.
 	token := p.Token
-	if v := os.Getenv(v1.TokenEnv); v != "" {
+	if v := v1.Token(); v != "" {
 		token = v
 	}
 
