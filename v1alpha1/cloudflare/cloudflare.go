@@ -636,22 +636,53 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 		p.logf("hinted hostname is gone, adopting the one minted for it",
 			"was", hint.Hostname, "now", got.Hostname)
 	case hint.ID != "" && got.ID != hint.ID:
-		p.logf("tunnel replaced behind the same hostname", "hostname", hint.Hostname,
-			"was", hint.ID, "now", got.ID)
+		// The record now names a tunnel the edge has not been told about.
+		// A request for the hostname that lands before it has — and the
+		// establish loop sends one the moment the edge connects — is
+		// answered from the old route and pins that answer for about two
+		// minutes. So the spec is held back until the change has spread.
+		p.logf("tunnel replaced behind the same hostname, waiting for the edge to route to it",
+			"hostname", hint.Hostname, "was", hint.ID, "now", got.ID, "settle", routeSettle)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(routeSettle):
+		}
 	}
 	return got, nil
 }
 
+// routeSettle is how long the edge takes to route a hostname to the tunnel
+// its record was repointed at. Measured: a request 0s or 3s after the repoint
+// is answered from the old route, and keeps being for ~120s; one 10s after
+// reaches the new tunnel at once. Fifteen leaves margin over the one
+// measurement that worked. A var so a test can shorten it.
+var routeSettle = 15 * time.Second
+
 // probeHint asks the edge whether hint is live. A var so a test can answer
 // without an edge.
 var probeHint = func(ctx context.Context, hint *Spec, log *slog.Logger) error {
-	return probe.New().
+	timed, stop := context.WithTimeout(ctx, probe.Timeout)
+	defer stop()
+	asked, cancel := context.WithCancelCause(timed)
+
+	err := probe.New().
 		WithID(hint.ID).
 		WithHostname(hint.Hostname).
 		WithAccountTag(hint.AccountTag).
 		WithSecret(hint.Secret).
 		WithLogger(zerologger(log)).
-		Probe(context.WithTimeout(ctx, probe.Timeout))
+		Probe(asked, cancel)
+
+	// The verdict the probe cancels with rather than returns. A hint whose
+	// tunnel is gone is not one to vouch for, however alive its hostname is:
+	// minting with it replays the record id and gets that name back.
+	if err == nil {
+		if cause := context.Cause(asked); errors.Is(cause, probe.ErrOrphaned) {
+			return cause
+		}
+	}
+	return err
 }
 
 func (p *hinted) logf(msg string, args ...any) {
@@ -932,7 +963,19 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 					if b.edge.liveCount() >= haConnections {
 						continue
 					}
-					err := prober.Probe(context.WithTimeout(ctx, probe.Timeout))
+					timed, stop := context.WithTimeout(ctx, probe.Timeout)
+					asked, cancelAsk := context.WithCancelCause(timed)
+					err := prober.Probe(asked, cancelAsk)
+					if err == nil {
+						// Reported by cancellation, not by return: the tunnel
+						// is gone and its hostname is not, which ends this
+						// tunnel like any other gone verdict — the caller
+						// rebuilds on the same name.
+						if cause := context.Cause(asked); errors.Is(cause, probe.ErrOrphaned) {
+							err = cause
+						}
+					}
+					stop()
 					if !errors.Is(err, probe.ErrGone) {
 						continue
 					}
@@ -1156,13 +1199,21 @@ func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client,
 	attempts := 0
 	for {
 		attempts++
-		if verify(ctx, client, url, nonce) {
+		err := verify(ctx, client, url, nonce)
+		if err == nil {
 			log.Info("tunnel established", "url", url, "attempts", attempts, "after", time.Since(start).Round(time.Millisecond))
 			t.Emit(v1.Event{Kind: v1.EventEstablished})
 			return
 		}
+		// Every attempt, because the tunnel is up and serving nothing until
+		// one of these succeeds, and the caller's only other signal is a URL
+		// that never arrives.
+		log.Debug("tunnel not established yet", "url", url, "attempt", attempts, "error", err)
+
 		select {
 		case <-ctx.Done():
+			log.Warn("tunnel never established", "url", url, "attempts", attempts,
+				"after", time.Since(start).Round(time.Millisecond), "error", err)
 			return
 		case <-time.After(b.establishInterval):
 		}
@@ -1171,19 +1222,28 @@ func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client,
 
 // verify makes one loop-through and reports whether the proxy answered it —
 // the nonce back on a 204 — rather than the edge answering in its place.
-func verify(ctx context.Context, client *http.Client, url, nonce string) bool {
+func verify(ctx context.Context, client *http.Client, url, nonce string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return false
+		return err
 	}
 	req.Header.Set(establishHeader, nonce)
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return err
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode == http.StatusNoContent && resp.Header.Get(establishHeader) == nonce
+	if resp.StatusCode != http.StatusNoContent {
+		// The edge answering for a route it has not finished wiring looks
+		// exactly like this — 530 or 1033 while the record points at a
+		// tunnel the colo does not know yet.
+		return fmt.Errorf("answered %s, want %d", resp.Status, http.StatusNoContent)
+	}
+	if got := resp.Header.Get(establishHeader); got != nonce {
+		return fmt.Errorf("answered without this tunnel's nonce (%q): something else is serving the name", got)
+	}
+	return nil
 }
 
 // The loop-through that verifies the public URL. Every establishInterval a
