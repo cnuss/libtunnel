@@ -11,6 +11,13 @@ on:
     # keep synchronize explicit so every new commit on the PR triggers a
     # fresh run.
     types: [opened, synchronize, reopened, ready_for_review]
+  # A lever for re-verifying a branch on demand: what main last said can go
+  # stale without a commit to answer it — a red run whose cause was fixed
+  # outside the repo, a flake in the live tier — and the alternatives are a
+  # push to main, which the branch flow forbids, or a PR re-run, which runs
+  # in pull_request context and never produces a main run. The release job
+  # stays push-only, so a dispatched run is ci + race.
+  workflow_dispatch:
 
 permissions:
   contents: read
