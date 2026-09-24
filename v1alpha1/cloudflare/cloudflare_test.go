@@ -2005,3 +2005,37 @@ func TestEstablishKeepsTryingUntilCanceled(t *testing.T) {
 		t.Errorf("events %v, want none from an edge that never routed", got)
 	}
 }
+
+// TestBridgeForFollowsTheMintEndpoint pins where the bridge lives: the same
+// host and port as the mint, the scheme's WebSocket counterpart, the bridge
+// path — and nothing for an endpoint that is not a URL.
+func TestBridgeForFollowsTheMintEndpoint(t *testing.T) {
+	for _, tc := range []struct{ endpoint, want string }{
+		{"https://tunnel.pizza/tunnel", "wss://tunnel.pizza/relay"},
+		{"http://localhost:3000/tunnel", "ws://localhost:3000/relay"},
+		{"https://mint.example:8443/tunnel?x=1", "wss://mint.example:8443/relay"},
+		{"tunnel.pizza", ""},
+		{"", ""},
+	} {
+		if got := bridgeFor(tc.endpoint); got != tc.want {
+			t.Errorf("bridgeFor(%q) = %q, want %q", tc.endpoint, got, tc.want)
+		}
+	}
+}
+
+// TestProviderNamesTheBridgeOnTheMintHost pins that the bridge follows the
+// mint endpoint, default included: the default is applied lazily by the
+// mint, and a bridge derived from the empty string is no bridge at all.
+func TestProviderNamesTheBridgeOnTheMintHost(t *testing.T) {
+	clearSpecEnv(t)
+	b := New()
+	b.Provider()
+	if got := b.prober.Bridge(); got != "wss://tunnel.pizza/relay" {
+		t.Errorf("default bridge = %q, want wss://tunnel.pizza/relay", got)
+	}
+	b = New().WithProvider("http://localhost:3000/tunnel")
+	b.Provider()
+	if got := b.prober.Bridge(); got != "ws://localhost:3000/relay" {
+		t.Errorf("bridge for a local provider = %q, want ws://localhost:3000/relay", got)
+	}
+}

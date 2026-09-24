@@ -5,6 +5,7 @@
 package cloudflare
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -581,6 +582,10 @@ func (b *Backend) Provider() v1.Provider[*Spec] {
 	if host != "" {
 		qt.URL = providerEndpoint(host)
 	}
+	// The bridge lives on the provider's host: the one host a network that
+	// allows nothing else already had to allow, for the mint. The mint
+	// applies its default endpoint lazily, so it is applied here too.
+	b.prober.WithBridge(bridgeFor(cmp.Or(qt.URL, quickTunnelURL)))
 	qt.Headers = mintHeaders(b.headers)
 	qt.Token = b.token
 	return v1alpha1.Export(backendName, &hinted{backend: b, mint: qt})
@@ -783,6 +788,26 @@ func providerEndpoint(host string) string {
 		return host
 	}
 	return "https://" + host + "/tunnel"
+}
+
+// bridgeFor is the edge bridge on the same host as the mint endpoint: the
+// scheme's WebSocket counterpart, the same host and port, bridgePath. Empty
+// when the endpoint is not one.
+func bridgeFor(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	switch u.Scheme {
+	case "https":
+		u.Scheme = "wss"
+	case "http":
+		u.Scheme = "ws"
+	default:
+		return ""
+	}
+	u.Path, u.RawQuery, u.Fragment = probe.BridgePath, "", ""
+	return u.String()
 }
 
 // stringEnv overwrites *field with the env variable's value when it is set

@@ -1,0 +1,175 @@
+package probe
+
+import (
+	"context"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"slices"
+	"testing"
+	"time"
+
+	"golang.org/x/net/websocket"
+)
+
+// bridgeServer is the bridge the way tunnel.pizza runs it: a WebSocket on
+// /relay whose frames are piped, unread, to upstream. Plain ws, so the test
+// needs no certificate; the scheme is the only difference from the real one.
+func bridgeServer(t *testing.T, upstream string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != BridgePath {
+			http.NotFound(w, r)
+			return
+		}
+		websocket.Server{
+			Handshake: func(*websocket.Config, *http.Request) error { return nil },
+			Handler: func(ws *websocket.Conn) {
+				defer ws.Close()
+				ws.PayloadType = websocket.BinaryFrame
+				remote, err := net.Dial("tcp", upstream)
+				if err != nil {
+					return
+				}
+				defer remote.Close()
+				done := make(chan struct{}, 2)
+				go func() { _, _ = io.Copy(remote, ws); done <- struct{}{} }()
+				go func() { _, _ = io.Copy(ws, remote); done <- struct{}{} }()
+				<-done
+			},
+		}.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return "ws://" + srv.Listener.Addr().String() + BridgePath
+}
+
+// roundTrip proves bytes cross conn both ways, against an echo at the far end.
+func roundTrip(t *testing.T, conn net.Conn) {
+	t.Helper()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte("through the bridge")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len("through the bridge"))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "through the bridge" {
+		t.Errorf("echoed %q", got)
+	}
+}
+
+// TestDialBridgeCarriesBytes pins the route itself: what is written to the
+// stream dialBridge returns comes out of the bridge's upstream, and what the
+// upstream answers comes back — a TLS session to the edge can ride it.
+func TestDialBridgeCarriesBytes(t *testing.T) {
+	bridge := bridgeServer(t, echoServer(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := New().WithBridge(bridge).dialBridge(ctx)
+	if err != nil {
+		t.Fatalf("dialBridge: %v", err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn)
+}
+
+// TestDialBridgeThroughTheProxy pins that the bridge is reached the way a
+// locked-down network requires: CONNECT to the bridge's host through the
+// proxy the environment names, and the upgrade inside that.
+func TestDialBridgeThroughTheProxy(t *testing.T) {
+	bridge := bridgeServer(t, echoServer(t))
+	proxy := &connectProxy{}
+	proxy.start(t)
+	// The bridge is on loopback, which no proxy setting ever covers, so the
+	// proxy is handed over directly rather than through the environment.
+	p := New().WithBridge(bridge)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	target := p.bridge.Host
+	raw, err := dialViaProxy(ctx, &url.URL{Scheme: "http", Host: proxy.addr}, target)
+	if err != nil {
+		t.Fatalf("dialViaProxy: %v", err)
+	}
+	config, err := websocket.NewConfig(bridge, "http://"+p.bridge.Hostname()+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := websocket.NewClient(config, raw)
+	if err != nil {
+		t.Fatalf("upgrade through the proxy: %v", err)
+	}
+	defer ws.Close()
+	ws.PayloadType = websocket.BinaryFrame
+	roundTrip(t, ws)
+}
+
+// TestWithBridgeTakesOnlyAWebSocketURL pins the knob: a ws or wss URL with a
+// host is the bridge, anything else leaves the route untried.
+func TestWithBridgeTakesOnlyAWebSocketURL(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"wss://tunnel.pizza/relay", true},
+		{"ws://localhost:3000/relay", true},
+		{"https://tunnel.pizza/relay", false},
+		{"", false},
+		{"wss:///relay", false},
+	} {
+		if got := New().WithBridge(tc.in).bridge != nil; got != tc.want {
+			t.Errorf("WithBridge(%q) set a bridge: %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestRoutesStartWhereTheLastAskEnded pins the memo: the route that answered
+// goes first next time, every route is still tried, the bridge is only a
+// route once named, and the edge's own addresses need no remembering.
+func TestRoutesStartWhereTheLastAskEnded(t *testing.T) {
+	p := New()
+	if got := p.routes(); !slices.Equal(got, []route{routeDirect, routeRelay}) {
+		t.Errorf("routes with no bridge = %v", got)
+	}
+	p.WithBridge("wss://tunnel.pizza/relay")
+	if got := p.routes(); !slices.Equal(got, []route{routeDirect, routeRelay, routeBridge}) {
+		t.Errorf("routes = %v, want direct, relay, bridge", got)
+	}
+	p.remember(routeBridge)
+	if got := p.routes(); !slices.Equal(got, []route{routeBridge, routeDirect, routeRelay}) {
+		t.Errorf("routes after the bridge answered = %v, want it first", got)
+	}
+	p.remember(routeRelay)
+	if got := p.routes(); !slices.Equal(got, []route{routeRelay, routeDirect, routeBridge}) {
+		t.Errorf("routes after the relay answered = %v, want it first", got)
+	}
+	p.remember(routeDirect)
+	if got := p.routes(); !slices.Equal(got, []route{routeDirect, routeRelay, routeBridge}) {
+		t.Errorf("routes after the edge answered = %v, want the default order", got)
+	}
+}
+
+// TestForwardCarriesTheBridge pins how the supervisor gets the bridge: a
+// loopback address it dials as if it were the edge, with each connection
+// carried on through the WebSocket — the same forwarder the relay gets
+// behind a proxy.
+func TestForwardCarriesTheBridge(t *testing.T) {
+	p := New().WithBridge(bridgeServer(t, echoServer(t)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	local, err := p.forward(ctx, routeBridge, p.dialBridge)
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	conn, err := net.DialTimeout("tcp", local, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial the forwarder: %v", err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn)
+}
