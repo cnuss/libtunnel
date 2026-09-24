@@ -36,6 +36,7 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/websocket"
 
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/trust"
 )
@@ -56,6 +57,40 @@ const (
 	relayHost = "relay.tunnel.pizza"
 	relayPort = 443
 )
+
+// bridgePath is where the provider's own host upgrades to the edge bridge: a
+// WebSocket that carries the edge's TLS to the same 7844 the relay does, for
+// a network that allows HTTPS to that host and nothing else. The host is the
+// provider's (see WithBridge) because it is the one host such a network
+// already had to allow, for the mint.
+const BridgePath = "/relay"
+
+// route is one way to the edge. The zero value is the one tried first when
+// nothing is remembered.
+type route int
+
+const (
+	// routeDirect dials the edge's own addresses on 7844.
+	routeDirect route = iota
+	// routeRelay dials the relay on 443, which passes TCP through to 7844.
+	routeRelay
+	// routeBridge upgrades the provider's host to a WebSocket and carries
+	// the edge's TLS inside it.
+	routeBridge
+)
+
+func (r route) String() string {
+	switch r {
+	case routeDirect:
+		return "direct"
+	case routeRelay:
+		return "relay"
+	case routeBridge:
+		return "bridge"
+	default:
+		return fmt.Sprintf("route(%d)", int(r))
+	}
+}
 
 // dialTimeout bounds one edge address. Short, because failing it is not the
 // end of the ask — the relay is tried next, and both have to fit inside the
@@ -121,12 +156,21 @@ type Prober struct {
 	tlsConfigs     map[connection.Protocol]*tls.Config
 	tlsConfigsOnce sync.Once
 
-	// relayUntil is how long the relay stays the first thing tried. A
-	// network that refused 7844 once refuses it still, and waiting out that
-	// refusal every time costs dialTimeout per ask — but not forever, since
-	// the machine this runs on changes networks.
-	relayMu    sync.Mutex
-	relayUntil time.Time
+	// bridge is the WebSocket that carries the edge's TLS through the
+	// provider's host (WithBridge). Nil leaves that route untried.
+	bridge *url.URL
+	// bridgeTLS is the outer TLS to the bridge's host. Nil verifies against
+	// the system roots, which is what an ordinary host on 443 wants; a test
+	// standing up its own bridge sets its own.
+	bridgeTLS *tls.Config
+
+	// preferred is the route that answered last, tried first until
+	// preferredUntil. A network that refused 7844 once refuses it still,
+	// and waiting out that refusal every time costs dialTimeout per ask —
+	// but not forever, since the machine this runs on changes networks.
+	routeMu        sync.Mutex
+	preferred      route
+	preferredUntil time.Time
 }
 
 // New returns a Prober with every knob defaulted: reports an "unknown" client
@@ -192,6 +236,24 @@ func (p *Prober) WithRootCAs(pool *x509.CertPool) *Prober {
 		p.rootCAs = pool
 	}
 	return p
+}
+
+// WithBridge names the WebSocket endpoint (ws or wss) that carries the edge's
+// TLS through the provider's host — tried after the edge's own addresses and
+// the relay. An empty or unusable value leaves that route untried.
+func (p *Prober) WithBridge(endpoint string) *Prober {
+	if u, err := url.Parse(endpoint); err == nil && u.Host != "" && (u.Scheme == "ws" || u.Scheme == "wss") {
+		p.bridge = u
+	}
+	return p
+}
+
+// Bridge reports the bridge endpoint this prober was given, or "" for none.
+func (p *Prober) Bridge() string {
+	if p.bridge == nil {
+		return ""
+	}
+	return p.bridge.String()
 }
 
 // WithLogger sets where the probe logs.
@@ -304,63 +366,111 @@ func (p *Prober) Probe(ctx context.Context, cancel context.CancelCauseFunc) erro
 func (p *Prober) EdgeAddrs(ctx context.Context) []string {
 	tlsConfig := p.TLSConfigs()[connection.HTTP2]
 
-	for _, relay := range [2]bool{false, true} {
-		conn, err := p.dialEdge(ctx, tlsConfig, relay)
+	for _, r := range p.all() {
+		conn, err := p.dialEdge(ctx, tlsConfig, r)
 		if err != nil {
-			p.log.Debug().Err(err).Bool("relay", relay).Msg("no answer on this route")
+			p.log.Debug().Err(err).Stringer("route", r).Msg("no answer on this route")
 			continue
 		}
 		conn.Close()
 
 		// The probe starts on this route too: they are asking the same
 		// network the same question.
-		p.relayMu.Lock()
-		if relay {
-			p.relayUntil = time.Now().Add(relayMemo)
-		} else {
-			p.relayUntil = time.Time{}
-		}
-		p.relayMu.Unlock()
+		p.remember(r)
 
-		if !relay {
+		if r == routeDirect {
 			return nil
 		}
-		p.log.Info().Str("relay", relayHost).
-			Msg("edge unreachable at its own addresses, pinning the tunnel to the relay")
-
-		addr := fmt.Sprintf("%s:%d", relayHost, relayPort)
+		p.log.Info().Stringer("route", r).
+			Msg("edge unreachable at its own addresses, pinning the tunnel to this route")
 
 		// The caller dials these addresses itself and knows nothing of
-		// proxies, so where one stands in the way it gets a loopback address
-		// instead and the forwarder carries the connection on.
-		if proxy := proxyFor(addr); proxy != nil {
-			local, err := p.forwardThroughProxy(ctx, proxy, addr)
-			if err != nil {
-				p.log.Warn().Err(err).Msg("no forwarder for the proxy, leaving the edge to the caller")
-				return nil
+		// proxies or WebSockets, so a route it cannot dial gets a loopback
+		// address instead and the forwarder carries each connection on.
+		var dial func(context.Context) (net.Conn, error)
+		switch r {
+		case routeRelay:
+			addr := fmt.Sprintf("%s:%d", relayHost, relayPort)
+			proxy := proxyFor("https", addr)
+			if proxy == nil {
+				// Twice, because the list is split across two regions by
+				// index and a single entry leaves one of them empty — with
+				// nowhere to put the second HA connection.
+				return []string{addr, addr}
 			}
-			p.log.Info().Str("proxy", proxy.Host).Str("listening", local).
-				Msg("carrying the tunnel to the relay through the proxy")
-			return []string{local, local}
+			dial = func(ctx context.Context) (net.Conn, error) { return dialViaProxy(ctx, proxy, addr) }
+		case routeBridge:
+			dial = p.dialBridge
 		}
-
-		// Twice, because the list is split across two regions by index and a
-		// single entry leaves one of them empty — with nowhere to put the
-		// second HA connection.
-		return []string{addr, addr}
+		local, err := p.forward(ctx, r, dial)
+		if err != nil {
+			p.log.Warn().Err(err).Msg("no forwarder for this route, leaving the edge to the caller")
+			return nil
+		}
+		p.log.Info().Stringer("route", r).Str("listening", local).
+			Msg("carrying the tunnel through the forwarder")
+		return []string{local, local}
 	}
 	return nil
 }
 
+// all is every route this prober has, in the order they are tried when
+// nothing is remembered: the edge itself, the relay, then the bridge when a
+// provider host was named for it.
+func (p *Prober) all() []route {
+	routes := []route{routeDirect, routeRelay}
+	if p.bridge != nil {
+		routes = append(routes, routeBridge)
+	}
+	return routes
+}
+
+// routes is the order to try: whichever answered last first, for as long as
+// the memo holds, then the rest in their own order. Every route is tried
+// every time, so a network that starts carrying 7844 again is noticed, and
+// one that stopped is not waited on twice.
+func (p *Prober) routes() []route {
+	all := p.all()
+	p.routeMu.Lock()
+	first := p.preferred
+	if time.Now().After(p.preferredUntil) {
+		first = routeDirect
+	}
+	p.routeMu.Unlock()
+	if first == routeDirect {
+		return all
+	}
+	ordered := []route{first}
+	for _, r := range all {
+		if r != first {
+			ordered = append(ordered, r)
+		}
+	}
+	return ordered
+}
+
+// remember records the route that answered, so the next ask starts there.
+// The edge's own addresses need no remembering: they are first anyway.
+func (p *Prober) remember(r route) {
+	p.routeMu.Lock()
+	defer p.routeMu.Unlock()
+	p.preferred = r
+	p.preferredUntil = time.Time{}
+	if r != routeDirect {
+		p.preferredUntil = time.Now().Add(relayMemo)
+	}
+}
+
 // proxyFor reports the proxy the environment names for target, or nil when it
-// names none. The target is modelled as an https URL because that is what
-// HTTPS_PROXY answers for, and NO_PROXY is honored on the way.
+// names none. The target is modelled as a URL of the given scheme — https for
+// a TLS host, which HTTPS_PROXY answers for — and NO_PROXY is honored on the
+// way.
 //
 // Read afresh each time rather than through http.ProxyFromEnvironment, which
 // caches the environment behind a sync.Once on first use anywhere in the
 // process — a tunnel built after that call would not see its own settings.
-func proxyFor(target string) *url.URL {
-	proxy, err := httpproxy.FromEnvironment().ProxyFunc()(&url.URL{Scheme: "https", Host: target})
+func proxyFor(scheme, target string) *url.URL {
+	proxy, err := httpproxy.FromEnvironment().ProxyFunc()(&url.URL{Scheme: scheme, Host: target})
 	if err != nil {
 		return nil
 	}
@@ -435,18 +545,17 @@ func dialViaProxy(ctx context.Context, proxy *url.URL, target string) (net.Conn,
 	return conn, nil
 }
 
-// forwardThroughProxy is how a caller that cannot speak to a proxy reaches one
-// anyway: a loopback address it dials as if it were the edge, with every
-// connection carried on through the proxy to target. cloudflared's supervisor
-// takes addresses and dials them itself, and 127.0.0.1 is the one address
-// every network allows.
+// forward is how a caller that can only dial an address reaches a route it
+// cannot: a loopback address it dials as if it were the edge, with every
+// connection carried on by dial. cloudflared's supervisor takes addresses and
+// dials them itself, and 127.0.0.1 is the one address every network allows.
 //
 // The listener lives as long as ctx. Nothing here reads the bytes it copies,
 // so the supervisor's TLS still terminates at the edge.
-func (p *Prober) forwardThroughProxy(ctx context.Context, proxy *url.URL, target string) (string, error) {
+func (p *Prober) forward(ctx context.Context, r route, dial func(context.Context) (net.Conn, error)) (string, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return "", fmt.Errorf("listen for the proxy forwarder: %w", err)
+		return "", fmt.Errorf("listen for the %s forwarder: %w", r, err)
 	}
 
 	go func() {
@@ -462,9 +571,9 @@ func (p *Prober) forwardThroughProxy(ctx context.Context, proxy *url.URL, target
 			}
 			go func() {
 				defer local.Close()
-				remote, err := dialViaProxy(ctx, proxy, target)
+				remote, err := dial(ctx)
 				if err != nil {
-					p.log.Debug().Err(err).Str("target", target).Msg("proxy would not carry this connection")
+					p.log.Debug().Err(err).Stringer("route", r).Msg("the route would not carry this connection")
 					return
 				}
 				defer remote.Close()
@@ -477,12 +586,97 @@ func (p *Prober) forwardThroughProxy(ctx context.Context, proxy *url.URL, target
 	return listener.Addr().String(), nil
 }
 
-// dialEdge opens a TLS connection to the edge, either at one of its own
-// addresses on 7844 or through the relay on 443. The relay forwards bytes
-// without reading them, so the certificate verified is origintunneld's on
-// both routes and one TLS config serves for either.
-func (p *Prober) dialEdge(ctx context.Context, tlsConfig *tls.Config, viaRelay bool) (net.Conn, error) {
-	if viaRelay {
+// dialBridge opens the WebSocket to the bridge and returns it as a stream:
+// the outer TLS is the bridge host's own, verified against the system roots
+// like any host on 443, and what the caller writes rides the frames unread.
+// Through the proxy where the environment names one, since a network that
+// needs this route usually has one.
+func (p *Prober) dialBridge(ctx context.Context) (net.Conn, error) {
+	if p.bridge == nil {
+		return nil, errors.New("no bridge named")
+	}
+	secure := p.bridge.Scheme == "wss"
+	scheme, port := "http", "80"
+	if secure {
+		scheme, port = "https", "443"
+	}
+	if p.bridge.Port() != "" {
+		port = p.bridge.Port()
+	}
+	host := p.bridge.Hostname()
+	target := net.JoinHostPort(host, port)
+
+	p.log.Info().Str("bridge", p.bridge.String()).Msg("reaching the edge through the bridge")
+
+	var raw net.Conn
+	var err error
+	if proxy := proxyFor(scheme, target); proxy != nil {
+		p.log.Info().Str("proxy", proxy.Host).Str("target", target).
+			Msg("reaching the bridge through the proxy")
+		raw, err = dialViaProxy(ctx, proxy, target)
+	} else {
+		raw, err = (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, "tcp", target)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	stream := raw
+	if secure {
+		config := p.bridgeTLS
+		if config == nil {
+			config = &tls.Config{ServerName: host}
+		}
+		tlsConn := tls.Client(raw, config)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("TLS to %s: %w", target, err)
+		}
+		stream = tlsConn
+	}
+
+	// The upgrade under one deadline, like CONNECT: what follows has its
+	// own.
+	if err := stream.SetDeadline(time.Now().Add(dialTimeout)); err != nil {
+		stream.Close()
+		return nil, err
+	}
+	config, err := websocket.NewConfig(p.bridge.String(), scheme+"://"+host+"/")
+	if err != nil {
+		stream.Close()
+		return nil, err
+	}
+	ws, err := websocket.NewClient(config, stream)
+	if err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("upgrade %s: %w", p.bridge, err)
+	}
+	if err := stream.SetDeadline(time.Time{}); err != nil {
+		ws.Close()
+		return nil, err
+	}
+	ws.PayloadType = websocket.BinaryFrame
+	return ws, nil
+}
+
+// dialEdge opens a TLS connection to the edge by r: at one of its own
+// addresses on 7844, through the relay on 443, or inside a WebSocket to the
+// bridge. None of them reads the bytes, so the certificate verified is
+// origintunneld's on every route and one TLS config serves for all.
+func (p *Prober) dialEdge(ctx context.Context, tlsConfig *tls.Config, r route) (net.Conn, error) {
+	if r == routeBridge {
+		raw, err := p.dialBridge(ctx)
+		if err != nil {
+			return nil, err
+		}
+		conn := tls.Client(raw, tlsConfig)
+		if err := conn.HandshakeContext(ctx); err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("TLS to the edge through %s: %w", p.bridge, err)
+		}
+		return conn, nil
+	}
+	if r == routeRelay {
 		// Info: the relay is a detour worth seeing in a log, and reaching for
 		// it says something about the network this is running on.
 		p.log.Info().Str("relay", relayHost).Msg("reaching the edge through the relay")
@@ -492,7 +686,7 @@ func (p *Prober) dialEdge(ctx context.Context, tlsConfig *tls.Config, viaRelay b
 		// such a proxy is set up to allow. The edge's own 7844 is not, which
 		// is why only this leg bothers.
 		target := fmt.Sprintf("%s:%d", relayHost, relayPort)
-		if proxy := proxyFor(target); proxy != nil {
+		if proxy := proxyFor("https", target); proxy != nil {
 			p.log.Info().Str("proxy", proxy.Host).Str("target", target).
 				Msg("reaching the relay through the proxy")
 			raw, err := dialViaProxy(ctx, proxy, target)
@@ -553,37 +747,22 @@ func (p *Prober) probeHTTP2(ctx context.Context) error {
 
 	tlsConfig := p.TLSConfigs()[connection.HTTP2]
 
-	// Whichever route worked last goes first. The order is the only thing
-	// remembered: both are tried every time, so a network that starts
-	// carrying 7844 again is noticed, and one that stops is not waited on
-	// twice.
-	p.relayMu.Lock()
-	relayFirst := time.Now().Before(p.relayUntil)
-	p.relayMu.Unlock()
-
 	var conn net.Conn
-	var viaRelay bool
-	for _, relay := range [2]bool{relayFirst, !relayFirst} {
-		conn, err = p.dialEdge(ctx, tlsConfig, relay)
+	var via route
+	for _, r := range p.routes() {
+		conn, err = p.dialEdge(ctx, tlsConfig, r)
 		if err == nil {
-			viaRelay = relay
+			via = r
 			break
 		}
-		p.log.Debug().Err(err).Bool("relay", relay).Msg("no answer on this route")
+		p.log.Debug().Err(err).Stringer("route", r).Msg("no answer on this route")
 	}
 	if err != nil {
-		// Neither route reached the edge, so the edge never ruled: this is a
+		// No route reached the edge, so the edge never ruled: this is a
 		// network with no way out, not a tunnel that stopped existing.
 		return fmt.Errorf("%w: no way to the edge: %w", ErrRetry, err)
 	}
-
-	p.relayMu.Lock()
-	if viaRelay {
-		p.relayUntil = time.Now().Add(relayMemo)
-	} else {
-		p.relayUntil = time.Time{}
-	}
-	p.relayMu.Unlock()
+	p.remember(via)
 
 	defer conn.Close()
 

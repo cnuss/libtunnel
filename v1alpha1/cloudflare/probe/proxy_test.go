@@ -143,7 +143,7 @@ func TestProxyForReadsTheEnvironment(t *testing.T) {
 			t.Setenv("HTTP_PROXY", tc.plain)
 			t.Setenv("NO_PROXY", tc.exclude)
 
-			proxy := proxyFor(fmt.Sprintf("%s:%d", relayHost, relayPort))
+			proxy := proxyFor("https", fmt.Sprintf("%s:%d", relayHost, relayPort))
 			got := ""
 			if proxy != nil {
 				got = proxy.Host
@@ -246,10 +246,10 @@ func TestDialViaProxySendsCredentials(t *testing.T) {
 	}
 }
 
-// TestForwardThroughProxyCarriesBytes pins the seam the supervisor uses: it
+// TestForwardCarriesBytes pins the seam the supervisor uses: it
 // dials a loopback address knowing nothing of proxies, and what it says
 // arrives at the far end anyway.
-func TestForwardThroughProxyCarriesBytes(t *testing.T) {
+func TestForwardCarriesBytes(t *testing.T) {
 	target := echoServer(t)
 	proxy := &connectProxy{}
 	proxy.start(t)
@@ -257,9 +257,12 @@ func TestForwardThroughProxyCarriesBytes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	local, err := New().forwardThroughProxy(ctx, &url.URL{Scheme: "http", Host: proxy.addr}, target)
+	via := &url.URL{Scheme: "http", Host: proxy.addr}
+	local, err := New().forward(ctx, routeRelay, func(ctx context.Context) (net.Conn, error) {
+		return dialViaProxy(ctx, via, target)
+	})
 	if err != nil {
-		t.Fatalf("forwardThroughProxy: %v", err)
+		t.Fatalf("forward: %v", err)
 	}
 
 	conn, err := net.Dial("tcp", local)
@@ -286,17 +289,20 @@ func TestForwardThroughProxyCarriesBytes(t *testing.T) {
 	}
 }
 
-// TestForwardThroughProxyEndsWithTheContext pins that the listener does not
+// TestForwardEndsWithTheContext pins that the listener does not
 // outlive the tunnel it was opened for: a loopback port left accepting after
 // the tunnel is gone is a hole nothing closes.
-func TestForwardThroughProxyEndsWithTheContext(t *testing.T) {
+func TestForwardEndsWithTheContext(t *testing.T) {
 	proxy := &connectProxy{}
 	proxy.start(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	local, err := New().forwardThroughProxy(ctx, &url.URL{Scheme: "http", Host: proxy.addr}, "unused.invalid:443")
+	via := &url.URL{Scheme: "http", Host: proxy.addr}
+	local, err := New().forward(ctx, routeRelay, func(ctx context.Context) (net.Conn, error) {
+		return dialViaProxy(ctx, via, "unused.invalid:443")
+	})
 	if err != nil {
-		t.Fatalf("forwardThroughProxy: %v", err)
+		t.Fatalf("forward: %v", err)
 	}
 	cancel()
 
