@@ -3,8 +3,8 @@
 // A provider that reaps an idle tunnel leaves its connections looking fine
 // and the edge saying nothing, so nothing event-driven notices. The prober
 // asks outright, by registering a spare connection and reading the edge's
-// answer — and where that answer is a refusal, by checking whether the
-// hostname still resolves, since a reaped tunnel loses its record with it.
+// answer: a refusal is the tunnel being gone, whatever DNS still says about
+// its hostname.
 package probe
 
 import (
@@ -65,6 +65,13 @@ const dialTimeout = 3 * time.Second
 // relayMemo is how long a working relay stays the first route tried before
 // the direct edge is given another chance.
 const relayMemo = 5 * time.Minute
+
+// controlStreamTimeout bounds the wait for the edge to ask for the control
+// stream. The roles invert on TCP — the probe serves and the edge requests —
+// so an edge that accepts the connection and then says nothing would
+// otherwise hold the whole ask, and the route that might have answered never
+// gets tried. Same five seconds the registration RPC gets.
+const controlStreamTimeout = 5 * time.Second
 
 // maxBackoff caps the wait between attempts, which otherwise grows a second
 // per attempt for as long as the caller's context lives.
@@ -145,9 +152,8 @@ func (p *Prober) WithID(id string) *Prober {
 	return p
 }
 
-// WithHostname sets the tunnel's public hostname, which a refused
-// registration is checked against; a :port suffix is ignored. Without one a
-// refusal is taken at face value.
+// WithHostname sets the tunnel's public hostname. It names the tunnel in the
+// probe's own logs and backs LookupHost; the verdict does not depend on it.
 func (p *Prober) WithHostname(hostname string) *Prober {
 	if hostname != "" {
 		p.hostname = hostname
@@ -237,13 +243,40 @@ var (
 	ErrInUse = errors.New("tunnel in use")
 	ErrGone  = errors.New("tunnel is gone")
 	ErrRetry = errors.New("tunnel should retry")
+	// ErrOrphaned is an ErrGone the provider can undo: the tunnel is gone
+	// but the record that reserved its hostname is not, and a mint replaying
+	// that record id recreates the tunnel under the same name. Every ErrGone
+	// ends a tunnel; this one says the next one can have the same hostname.
+	ErrOrphaned = errors.New("hostname outlived the tunnel")
 )
 
-func (p *Prober) Probe(ctx context.Context, cancel context.CancelFunc) error {
-	defer cancel()
+// Probe asks the edge once, retrying while the answer is that it could not be
+// asked, and reports what the edge said. ctx bounds the whole ask.
+//
+// cancel ends the ask, and carries the one verdict that is not returned: a
+// tunnel whose hostname outlived it comes back as nil with ErrOrphaned as the
+// context's cause. A caller that only reads the error carries on — there is a
+// hostname to rebuild on — and one that reads context.Cause learns it should
+// mint with the record id to get that name back.
+func (p *Prober) Probe(ctx context.Context, cancel context.CancelCauseFunc) error {
+	defer cancel(nil)
+
+	// A floor for a caller who bounded nothing: the loop below ends when ctx
+	// does, and a network that cannot reach the edge answers ErrRetry for as
+	// long as it is asked.
+	if _, bounded := ctx.Deadline(); !bounded {
+		var stop context.CancelFunc
+		ctx, stop = context.WithTimeout(ctx, Timeout)
+		defer stop()
+	}
 
 	for attempt := 1; ; attempt++ {
 		err := p.probeHTTP2(ctx)
+		if errors.Is(err, ErrOrphaned) {
+			// First cancel wins, so the deferred one leaves this in place.
+			cancel(err)
+			return nil
+		}
 		if !errors.Is(err, ErrRetry) {
 			return err
 		}
@@ -518,16 +551,6 @@ func (p *Prober) probeHTTP2(ctx context.Context) error {
 		return fmt.Errorf("%w: %q is not a tunnel id: %w", ErrGone, p.id, err)
 	}
 
-	// A refusal on its own does not end a tunnel — the hostname is what tells
-	// a reap from a refusal — so without one there is no verdict to be had
-	// and nothing worth dialing for.
-	if p.hostname == "" {
-		// Not ErrRetry: asking again cannot conjure a hostname, and not
-		// ErrGone: nothing was asked. A caller that built the prober this
-		// way gets told so once.
-		return errors.New("no hostname to weigh a refusal against")
-	}
-
 	tlsConfig := p.TLSConfigs()[connection.HTTP2]
 
 	// Whichever route worked last goes first. The order is the only thing
@@ -612,6 +635,15 @@ func (p *Prober) probeHTTP2(ctx context.Context) error {
 					Arch:     runtime.GOOS + "_" + runtime.GOARCH,
 				},
 			}, probeConnIndex, edgeIP)
+			if err == nil {
+				// Let go of the slot before the socket goes: the edge routes
+				// to a registered connection until it is unregistered or
+				// noticed dead, and a probe that just hung up would leave
+				// its index answering 502 for the next few seconds.
+				if err := client.GracefulShutdown(r.Context(), 5*time.Second); err != nil {
+					p.log.Debug().Err(err).Msg("probe could not unregister; the edge will notice the closed connection")
+				}
+			}
 			answered <- answer{details: details, err: err}
 		}),
 	})
@@ -619,6 +651,8 @@ func (p *Prober) probeHTTP2(ctx context.Context) error {
 	var got answer
 	select {
 	case got = <-answered:
+	case <-time.After(controlStreamTimeout):
+		return fmt.Errorf("%w: edge opened no control stream in %s", ErrRetry, controlStreamTimeout)
 	case <-ctx.Done():
 		return fmt.Errorf("%w: edge opened no control stream: %w", ErrRetry, context.Cause(ctx))
 	}
@@ -636,26 +670,22 @@ func (p *Prober) probeHTTP2(ctx context.Context) error {
 		return fmt.Errorf("%w: index %d: %w", ErrInUse, probeConnIndex, got.err)
 	}
 
-	// The edge refused. A provider that reaps a tunnel deletes the record
-	// with it, so what the name does now is what says whether that happened:
-	// still resolving means this tunnel was not reaped, and no answer at all
-	// leaves the refusal standing alone, which is not enough to end a tunnel.
-	host := p.hostname
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	// The edge ruled on the credential it was given, and the tunnel is gone
+	// whatever DNS says — weighing the two against each other vouched for
+	// dead specs (#243). What the hostname does now says something else:
+	// whether anything is left to rebuild with. A record that still resolves
+	// is one the provider recreates the tunnel under, so a caller holding
+	// its record id gets the same hostname back by minting with it; a name
+	// that went with the tunnel has nothing to replay. Neither answer, and
+	// no answer at all, changes the verdict.
+	if p.hostname != "" {
+		if resolved, err := p.LookupHost(ctx, p.hostname); err == nil {
+			p.log.Info().Str("hostname", p.hostname).Str("resolved", resolved).Err(got.err).
+				Msg("tunnel is gone, its hostname remains: minting with the record id recreates it")
+			return fmt.Errorf("%w: %w: edge refused the connection: %w", ErrGone, ErrOrphaned, got.err)
+		}
 	}
-
-	resolved, err := p.LookupHost(ctx, host)
-	if err == nil {
-		p.log.Debug().Str("host", host).Str("resolved", resolved).Err(got.err).
-			Msg("edge refused the connection but the hostname still resolves")
-		return nil
-	} else if errors.Is(err, ErrRetry) {
-		return fmt.Errorf("edge refused the connection and %s could not be resolved: %w", host, err)
-	} else {
-		return fmt.Errorf("%w: edge refused the connection (%v) and %s no longer resolves: %w",
-			ErrGone, got.err, host, err)
-	}
+	return fmt.Errorf("%w: edge refused the connection: %w", ErrGone, got.err)
 }
 
 func (p *Prober) LookupHost(ctx context.Context, host string) (string, error) {

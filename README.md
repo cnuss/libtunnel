@@ -116,7 +116,7 @@ type Tunnel interface {
     // Each channel call is a fresh channel that delivers the tunnel once, then closes.
     Ready() <-chan Tunnel           // public URL verified from here; start trigger, like
                                     // Listener; closes empty if the tunnel ends first
-    Done() <-chan Tunnel            // tunnel failed or shut down
+    Done() <-chan Tunnel            // tunnel failed or shut down, edge connections unregistered
     Err() error                     // why (nil while alive); see Failure classes
     Cancel(cause ...error)          // no cause: deliberate shutdown, Err is ErrClosed;
                                     // a cause: ends as that failure

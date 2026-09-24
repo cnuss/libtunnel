@@ -346,7 +346,7 @@ func TestWithRecordIDRidesAsHint(t *testing.T) {
 // mint without an edge; the tests below that care about the verdict set
 // their own.
 func TestMain(m *testing.M) {
-	probeHint = func(context.Context, *Spec, *slog.Logger) error { return probe.ErrGone }
+	probeHint = func(context.Context, *probe.Prober, *Spec, *slog.Logger) error { return probe.ErrGone }
 	os.Exit(m.Run())
 }
 
@@ -356,7 +356,7 @@ func answerProbe(t *testing.T, err error) *atomic.Int32 {
 	t.Helper()
 	prev := probeHint
 	var asked atomic.Int32
-	probeHint = func(context.Context, *Spec, *slog.Logger) error {
+	probeHint = func(context.Context, *probe.Prober, *Spec, *slog.Logger) error {
 		asked.Add(1)
 		return err
 	}
@@ -413,6 +413,25 @@ func TestHintInUseFailsLoudly(t *testing.T) {
 func TestUnansweredProbeMints(t *testing.T) {
 	clearSpecEnv(t)
 	answerProbe(t, errors.New("no answer from the edge"))
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	spec, err := From(known).WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHints(t, seen, known)
+	wantMinted(t, spec)
+}
+
+// TestGoneHintMints pins #243. The edge saying the tunnel does not exist is
+// what must send the hint to the mint: the record id rides with it, and the
+// provider recreates the tunnel under the same hostname. Reading that refusal
+// as a vouch instead serves a spec the connector cannot register with, and a
+// caller that caches specs presents the same dead one on every run.
+func TestGoneHintMints(t *testing.T) {
+	clearSpecEnv(t)
+	answerProbe(t, fmt.Errorf("%w: edge refused the connection: Unauthorized: Tunnel not found", probe.ErrGone))
 	var seen http.Header
 	srv := mintServer(t, &seen)
 

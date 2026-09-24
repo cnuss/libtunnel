@@ -200,6 +200,7 @@ func (e loggerEngine) WithToken(string) v1.Backend[*cloudflare.Spec] { return e 
 func (loggerEngine) Reconnect(context.Context) error                 { return nil }
 func (loggerEngine) Proxy() *httputil.ReverseProxy                   { return nil }
 func (loggerEngine) Listener() net.Listener                          { return nil }
+func (loggerEngine) Stopped() <-chan struct{}                        { return nil }
 func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }

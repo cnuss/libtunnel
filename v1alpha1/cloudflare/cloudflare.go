@@ -98,6 +98,11 @@ const backendName = "cloudflare"
 // before anything is asked.
 const goneProbeDelay = 30 * time.Second
 
+// gracePeriod bounds the graceful shutdown: how long in-flight requests get
+// to finish once the tunnel ends and its connections are unregistered, and
+// so how long Done can take. cloudflared's own default (its --grace-period).
+const gracePeriod = 30 * time.Second
+
 // haConnections is the number of edge (HA) connections the supervisor keeps.
 // The reconnect lever fires one ReconnectSignal per conn to cycle them all.
 const haConnections = 2
@@ -274,17 +279,22 @@ type Backend struct {
 	// supersedes either.
 	token string
 	// Runtime state wired at connect. reconnected feeds the supervisor's
-	// external-control channel, edge tracks edge connections, edgeReject
-	// carries a refused registration back from the log bridge, and reconnectCtx
+	// external-control channel, edge tracks edge connections, and reconnectCtx
 	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
 	// and listener is the loopback socket cloudflared dials to reach it. All nil
 	// until connect runs.
 	reconnected  chan supervisor.ReconnectSignal
 	edge         *edgeWatcher
-	edgeReject   *edgeReject
 	reconnectCtx context.Context
 	proxy        *httputil.ReverseProxy
 	listener     net.Listener
+	// stopped closes once the supervisor has returned: its edge connections
+	// unregistered and closed, or the grace period spent. Nil until connect.
+	stopped chan struct{}
+	// prober is the one asker for this backend: the hint probe and the edge
+	// watcher share it, so what the first learned about the network — the
+	// route to the edge, the TLS configs — is not learned twice.
+	prober *probe.Prober
 	// establishInterval is fixed at construction rather than read by the
 	// establish loop: the loop is a goroutine that may start after the
 	// caller has moved on, and a test shortening the package default for
@@ -304,12 +314,17 @@ func (b *Backend) Proxy() *httputil.ReverseProxy { return b.proxy }
 // (nil before connect). Implements the v1alpha1 Engine contract.
 func (b *Backend) Listener() net.Listener { return b.listener }
 
+// Stopped closes once the edge has been let go of (nil before connect).
+// Implements the v1alpha1 Engine contract.
+func (b *Backend) Stopped() <-chan struct{} { return b.stopped }
+
 // New returns the Cloudflare backend. The origin-scheme knobs are fixed from
 // the environment here when LIBTUNNEL_TLS / LIBTUNNEL_HTTP2 are set. The first
 // unparsable value wins and is surfaced at connect.
 func New() *Backend {
 	b := &Backend{
 		establishInterval: establishInterval,
+		prober:            probe.New(),
 	}
 	b.tls, b.tlsFixed, b.envErr = v1alpha1.EnvBool(v1.TLSEnv)
 	if b.envErr == nil {
@@ -607,7 +622,7 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 	// is up. Vouched for, it is the spec and the provider is never asked.
 	complete := hint.ID != "" && hint.Hostname != "" && hint.AccountTag != "" && len(hint.Secret) > 0
 	if complete {
-		switch err := probeHint(ctx, hint, log); {
+		switch err := probeHint(ctx, p.backend.prober, hint, log); {
 		case err == nil:
 			log.Info("edge vouched for the spec, using it as given", "hostname", hint.Hostname)
 			return hint, nil
@@ -644,16 +659,30 @@ func (p *hinted) Spec(ctx context.Context) (*Spec, error) {
 	return got, nil
 }
 
-// probeHint asks the edge whether hint is live. A var so a test can answer
-// without an edge.
-var probeHint = func(ctx context.Context, hint *Spec, log *slog.Logger) error {
-	return probe.New().
+// probeHint asks the edge, through prober, whether hint is live. A var so a
+// test can answer without an edge.
+var probeHint = func(ctx context.Context, prober *probe.Prober, hint *Spec, log *slog.Logger) error {
+	timed, stop := context.WithTimeout(ctx, probe.Timeout)
+	defer stop()
+	asked, cancel := context.WithCancelCause(timed)
+
+	err := prober.
 		WithID(hint.ID).
 		WithHostname(hint.Hostname).
 		WithAccountTag(hint.AccountTag).
 		WithSecret(hint.Secret).
-		WithLogger(zerologger(log, nil)).
-		Probe(context.WithTimeout(ctx, probe.Timeout))
+		WithLogger(zerologger(log)).
+		Probe(asked, cancel)
+
+	// The verdict the probe cancels with rather than returns. A hint whose
+	// tunnel is gone is not one to vouch for, however alive its hostname is:
+	// minting with it replays the record id and gets that name back.
+	if err == nil {
+		if cause := context.Cause(asked); errors.Is(cause, probe.ErrOrphaned) {
+			return cause
+		}
+	}
+	return err
 }
 
 func (p *hinted) logf(msg string, args ...any) {
@@ -817,8 +846,18 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	// pipeline are live.
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edge = newEdgeWatcher()
-	b.edgeReject = newEdgeReject()
 	b.reconnectCtx = t.Context()
+	// stopped is the supervisor's to close once it runs; until then a
+	// connect that fails closes it on the way out, so Done never waits on
+	// an edge that was never held.
+	stopped := make(chan struct{})
+	b.stopped = stopped
+	supervised := false
+	defer func() {
+		if !supervised {
+			close(stopped)
+		}
+	}()
 	wsOrigin, _ := t.WebSocketOrigin()
 	b.proxy = newOriginProxy(originURLs, wsOrigin, t.Logger(), transport)
 	b.listener = l
@@ -844,12 +883,17 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			return t.Context()
 		},
 	}
-	context.AfterFunc(t.Context(), func() { srv.Close() })
+	// Closed once the edge is let go of rather than when the context ends:
+	// requests in flight during the grace period still need answering.
+	go func() {
+		<-stopped
+		srv.Close()
+	}()
 	go srv.Serve(l)
 	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origins", originURLs)
 	service := (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
 	ctx := t.Context()
-	log := zerologger(t.Logger(), b.edgeReject)
+	log := zerologger(t.Logger())
 	spec := t.Spec()
 	if spec == nil {
 		return fmt.Errorf("no spec resolved")
@@ -873,6 +917,17 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	}
 	t.Logger().Info("edge transport selected", "protocol", protocol)
 
+	// The supervisor runs on a context of its own that outlives the tunnel's
+	// by up to the grace period. cloudflared's graceful shutdown sends
+	// UnregisterConnection on the context it was run with, so a context
+	// already canceled cancels the RPC before it leaves, and the edge keeps
+	// routing to the closed connection until it notices on its own — ten
+	// seconds or so of 502 for the next connector on this tunnel. The tunnel
+	// ending closes graceful instead, and run ends when the supervisor has
+	// returned, or the grace period is spent waiting for it.
+	runCtx, stopRun := context.WithCancel(context.WithoutCancel(ctx))
+	graceful := make(chan struct{})
+
 	// The closure scopes the prometheus.DefaultRegisterer swap to supervisor
 	// construction: cloudflared registers collectors against the global
 	// registerer at construction, which would collide across tunnels and
@@ -888,7 +943,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		prometheus.DefaultRegisterer = noop()
 		defer func() { prometheus.DefaultRegisterer = registerer }()
 
-		featureSelector, err := features.NewFeatureSelector(ctx, spec.AccountTag, nil, false, log)
+		featureSelector, err := features.NewFeatureSelector(runCtx, spec.AccountTag, nil, false, log)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create feature selector: %w", err)
 		}
@@ -903,7 +958,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 
 		originDialer := ingress.NewOriginDialer(ingress.OriginConfig{}, log)
 
-		prober := probe.New().
+		prober := b.prober.
 			WithID(spec.ID).
 			WithHostname(spec.Hostname).
 			WithAccountTag(spec.AccountTag).
@@ -935,7 +990,19 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 					if b.edge.liveCount() >= haConnections {
 						continue
 					}
-					err := prober.Probe(context.WithTimeout(ctx, probe.Timeout))
+					timed, stop := context.WithTimeout(ctx, probe.Timeout)
+					asked, cancelAsk := context.WithCancelCause(timed)
+					err := prober.Probe(asked, cancelAsk)
+					if err == nil {
+						// Reported by cancellation, not by return: the tunnel
+						// is gone and its hostname is not, which ends this
+						// tunnel like any other gone verdict — the caller
+						// rebuilds on the same name.
+						if cause := context.Cause(asked); errors.Is(cause, probe.ErrOrphaned) {
+							err = cause
+						}
+					}
+					stop()
 					if !errors.Is(err, probe.ErrGone) {
 						continue
 					}
@@ -1004,7 +1071,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			// supervisor waits for in-flight requests on graceful shutdown — and
 			// ctx.Done is wired as the graceful-shutdown signal below, so this
 			// bounds teardown after a cancel. Max accepted is 3m.
-			GracePeriod: 30 * time.Second,
+			GracePeriod: gracePeriod,
 			Region:      "",
 			// Nil on a network that carries 7844, and cloudflared discovers
 			// the edge by SRV with its own DoT fallback. Where it does not,
@@ -1062,7 +1129,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse ingress for %s: %w", service, err)
 		}
-		orchestrator, err := orchestration.NewOrchestrator(ctx, &orchestration.Config{
+		orchestrator, err := orchestration.NewOrchestrator(runCtx, &orchestration.Config{
 			Ingress:             &parsed,
 			WarpRouting:         ingress.NewWarpRoutingConfig(&config.WarpRoutingConfig{}), // cloudflared defaults: 5s connect, unlimited flows, 30s keepalive
 			OriginDialerService: originDialer,
@@ -1075,20 +1142,34 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		// b.reconnected is the backend's external-control channel, wired above;
 		// here it is handed to the supervisor, which selects on it. b.Reconnect
 		// sends on it to cycle the edge.
-		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, b.reconnected, ctx.Done())
+		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, b.reconnected, graceful)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create supervisor: %w", err)
 		}
 		return sup, nil
 	}()
 	if err != nil {
+		stopRun()
 		return err
 	}
 
 	connected := signal.New(make(chan struct{}))
+	supervised = true
 	go func() {
-		if err := sup.Run(ctx, connected); err != nil {
+		defer close(stopped)
+		defer stopRun()
+		if err := sup.Run(runCtx, connected); err != nil {
 			t.Cancel(fmt.Errorf("supervisor run failed: %w", err))
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		close(graceful)
+		select {
+		case <-stopped:
+		case <-time.After(gracePeriod):
+			t.Logger().Warn("edge connections still open after the grace period, closing them", "grace", gracePeriod)
+			stopRun()
 		}
 	}()
 
@@ -1103,8 +1184,6 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-connected.Wait():
-	case <-b.edgeReject.wait():
-		return b.credentialRejected()
 	case <-timeout.C:
 		return fmt.Errorf("%w: no connection after %d attempts (%d ended) in %s: %s",
 			v1.ErrEdgeUnreachable, b.edge.attemptCount(), b.edge.disconnectCount(), edgeBudget, edgeBlockedHint)
@@ -1161,13 +1240,21 @@ func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client,
 	attempts := 0
 	for {
 		attempts++
-		if verify(ctx, client, url, nonce) {
+		err := verify(ctx, client, url, nonce)
+		if err == nil {
 			log.Info("tunnel established", "url", url, "attempts", attempts, "after", time.Since(start).Round(time.Millisecond))
 			t.Emit(v1.Event{Kind: v1.EventEstablished})
 			return
 		}
+		// Every attempt, because the tunnel is up and serving nothing until
+		// one of these succeeds, and the caller's only other signal is a URL
+		// that never arrives.
+		log.Debug("tunnel not established yet", "url", url, "attempt", attempts, "error", err)
+
 		select {
 		case <-ctx.Done():
+			log.Warn("tunnel never established", "url", url, "attempts", attempts,
+				"after", time.Since(start).Round(time.Millisecond), "error", err)
 			return
 		case <-time.After(b.establishInterval):
 		}
@@ -1176,19 +1263,28 @@ func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client,
 
 // verify makes one loop-through and reports whether the proxy answered it —
 // the nonce back on a 204 — rather than the edge answering in its place.
-func verify(ctx context.Context, client *http.Client, url, nonce string) bool {
+func verify(ctx context.Context, client *http.Client, url, nonce string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return false
+		return err
 	}
 	req.Header.Set(establishHeader, nonce)
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return err
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode == http.StatusNoContent && resp.Header.Get(establishHeader) == nonce
+	if resp.StatusCode != http.StatusNoContent {
+		// The edge answering for a route it has not finished wiring looks
+		// exactly like this — 530 or 1033 while the record points at a
+		// tunnel the colo does not know yet.
+		return fmt.Errorf("answered %s, want %d", resp.Status, http.StatusNoContent)
+	}
+	if got := resp.Header.Get(establishHeader); got != nonce {
+		return fmt.Errorf("answered without this tunnel's nonce (%q): something else is serving the name", got)
+	}
+	return nil
 }
 
 // The loop-through that verifies the public URL. Every establishInterval a
@@ -1207,14 +1303,6 @@ const establishHeader = "X-Libtunnel-Loop"
 
 // emitter is the half of the tunnel the probe needs: somewhere to report.
 type emitter interface{ Emit(v1.Event) }
-
-// credentialRejected is what a caller sees when the edge refuses these
-// credentials: the class it can branch on, carrying the edge's own words and
-// none of edgeBlockedHint's advice, which is about a network this failure has
-// nothing to do with.
-func (b *Backend) credentialRejected() error {
-	return fmt.Errorf("%w: %s", v1.ErrCredentialRejected, b.edgeReject.message())
-}
 
 // edgeBlockedHint is cloudflared's own diagnosis of this failure, which it logs
 // at warn level from selectNextProtocol. Repeated verbatim so the error carries
