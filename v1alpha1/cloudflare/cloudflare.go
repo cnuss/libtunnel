@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"runtime"
@@ -97,6 +98,11 @@ const backendName = "cloudflare"
 // ordinary reconnect — cloudflared's first backoff is a second — is over
 // before anything is asked.
 const goneProbeDelay = 30 * time.Second
+
+// originDNSResolver is the address cloudflared's DNS origin service would
+// resolve to on its own: the local resolver on the standard port. Unused
+// here, but the service wants one.
+var originDNSResolver = netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 53)
 
 // gracePeriod bounds the graceful shutdown: how long in-flight requests get
 // to finish once the tunnel ends and its connections are unregistered, and
@@ -1100,11 +1106,15 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 				},
 				QuickTunnelUrl: t.Hostname(),
 			},
-			ProtocolSelector:    protocolSelector,
-			EdgeTLSConfigs:      prober.TLSConfigs(),
-			MaxEdgeAddrRetries:  8,
-			RPCTimeout:          5 * time.Second,
-			OriginDNSService:    origins.NewDNSResolverService(originDialer, log, noop()),
+			ProtocolSelector:   protocolSelector,
+			EdgeTLSConfigs:     prober.TLSConfigs(),
+			MaxEdgeAddrRetries: 8,
+			RPCTimeout:         5 * time.Second,
+			// Static, at cloudflared's own default: the service only serves
+			// its DNS origin, which nothing here uses, and the refresh loop
+			// the non-static one runs races with itself — its resolver's Dial
+			// hook writes one field from the parallel A and AAAA lookups.
+			OriginDNSService:    origins.NewStaticDNSResolverService([]netip.AddrPort{originDNSResolver}, originDialer, log, noop()),
 			OriginDialerService: originDialer,
 		}
 
