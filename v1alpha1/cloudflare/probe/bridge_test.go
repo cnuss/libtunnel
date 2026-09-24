@@ -109,20 +109,21 @@ func TestDialBridgeThroughTheProxy(t *testing.T) {
 }
 
 // TestWithBridgeTakesOnlyAWebSocketURL pins the knob: a ws or wss URL with a
-// host is the bridge, anything else leaves the route untried.
+// host is the bridge, anything else leaves the default in place — a prober
+// built on its own still has a way past a network that drops 7844.
 func TestWithBridgeTakesOnlyAWebSocketURL(t *testing.T) {
-	for _, tc := range []struct {
-		in   string
-		want bool
-	}{
-		{"wss://tunnel.pizza/relay", true},
-		{"ws://localhost:3000/relay", true},
-		{"https://tunnel.pizza/relay", false},
-		{"", false},
-		{"wss:///relay", false},
+	if got := New().Bridge(); got != DefaultBridge {
+		t.Errorf("New().Bridge() = %q, want DefaultBridge", got)
+	}
+	for _, tc := range []struct{ in, want string }{
+		{"wss://bridge.example/relay", "wss://bridge.example/relay"},
+		{"ws://localhost:3000/relay", "ws://localhost:3000/relay"},
+		{"https://tunnel.pizza/relay", DefaultBridge},
+		{"", DefaultBridge},
+		{"wss:///relay", DefaultBridge},
 	} {
-		if got := New().WithBridge(tc.in).bridge != nil; got != tc.want {
-			t.Errorf("WithBridge(%q) set a bridge: %v, want %v", tc.in, got, tc.want)
+		if got := New().WithBridge(tc.in).Bridge(); got != tc.want {
+			t.Errorf("WithBridge(%q).Bridge() = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -132,31 +133,22 @@ func TestWithBridgeTakesOnlyAWebSocketURL(t *testing.T) {
 // route once named, and the edge's own addresses need no remembering.
 func TestRoutesStartWhereTheLastAskEnded(t *testing.T) {
 	p := New()
-	if got := p.routes(); !slices.Equal(got, []route{routeDirect, routeRelay}) {
-		t.Errorf("routes with no bridge = %v", got)
-	}
-	p.WithBridge("wss://tunnel.pizza/relay")
-	if got := p.routes(); !slices.Equal(got, []route{routeDirect, routeRelay, routeBridge}) {
-		t.Errorf("routes = %v, want direct, relay, bridge", got)
+	if got := p.routes(); !slices.Equal(got, []route{routeDirect, routeBridge}) {
+		t.Errorf("routes = %v, want direct, bridge", got)
 	}
 	p.remember(routeBridge)
-	if got := p.routes(); !slices.Equal(got, []route{routeBridge, routeDirect, routeRelay}) {
+	if got := p.routes(); !slices.Equal(got, []route{routeBridge, routeDirect}) {
 		t.Errorf("routes after the bridge answered = %v, want it first", got)
 	}
-	p.remember(routeRelay)
-	if got := p.routes(); !slices.Equal(got, []route{routeRelay, routeDirect, routeBridge}) {
-		t.Errorf("routes after the relay answered = %v, want it first", got)
-	}
 	p.remember(routeDirect)
-	if got := p.routes(); !slices.Equal(got, []route{routeDirect, routeRelay, routeBridge}) {
+	if got := p.routes(); !slices.Equal(got, []route{routeDirect, routeBridge}) {
 		t.Errorf("routes after the edge answered = %v, want the default order", got)
 	}
 }
 
 // TestForwardCarriesTheBridge pins how the supervisor gets the bridge: a
 // loopback address it dials as if it were the edge, with each connection
-// carried on through the WebSocket — the same forwarder the relay gets
-// behind a proxy.
+// carried on through the WebSocket.
 func TestForwardCarriesTheBridge(t *testing.T) {
 	p := New().WithBridge(bridgeServer(t, echoServer(t)))
 	ctx, cancel := context.WithCancel(context.Background())

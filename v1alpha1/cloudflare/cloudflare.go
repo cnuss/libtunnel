@@ -1106,9 +1106,9 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			Region:      "",
 			// Nil on a network that carries 7844, and cloudflared discovers
 			// the edge by SRV with its own DoT fallback. Where it does not,
-			// the prober hands back the relay it just reached the edge
-			// through — the supervisor would otherwise retry addresses this
-			// network drops, forever.
+			// the prober hands back a forwarder to the bridge it just reached
+			// the edge through — the supervisor would otherwise retry
+			// addresses this network drops, forever.
 			EdgeAddrs:     prober.EdgeAddrs(ctx),
 			EdgeIPVersion: allregions.Auto,
 			HAConnections: haConnections,
