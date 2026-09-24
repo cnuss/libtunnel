@@ -124,7 +124,7 @@ func echoServer(t *testing.T) string {
 
 // TestProxyForReadsTheEnvironment pins which variable is consulted and that
 // NO_PROXY still wins: the target is modelled as https, so HTTPS_PROXY is the
-// one that answers for it, and a caller who excluded the relay gets no proxy.
+// one that answers for it, and a caller who excluded the bridge gets no proxy.
 func TestProxyForReadsTheEnvironment(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -136,14 +136,14 @@ func TestProxyForReadsTheEnvironment(t *testing.T) {
 		{"nothing set", "", "", "", ""},
 		{"https proxy answers", "http://proxy.invalid:8080", "", "", "proxy.invalid:8080"},
 		{"http proxy does not", "", "http://proxy.invalid:8080", "", ""},
-		{"excluded target", "http://proxy.invalid:8080", "", relayHost, ""},
+		{"excluded target", "http://proxy.invalid:8080", "", "tunnel.pizza", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HTTPS_PROXY", tc.https)
 			t.Setenv("HTTP_PROXY", tc.plain)
 			t.Setenv("NO_PROXY", tc.exclude)
 
-			proxy := proxyFor("https", fmt.Sprintf("%s:%d", relayHost, relayPort))
+			proxy := proxyFor("https", "tunnel.pizza:443")
 			got := ""
 			if proxy != nil {
 				got = proxy.Host
@@ -258,7 +258,7 @@ func TestForwardCarriesBytes(t *testing.T) {
 	defer cancel()
 
 	via := &url.URL{Scheme: "http", Host: proxy.addr}
-	local, err := New().forward(ctx, routeRelay, func(ctx context.Context) (net.Conn, error) {
+	local, err := New().forward(ctx, routeBridge, func(ctx context.Context) (net.Conn, error) {
 		return dialViaProxy(ctx, via, target)
 	})
 	if err != nil {
@@ -298,7 +298,7 @@ func TestForwardEndsWithTheContext(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	via := &url.URL{Scheme: "http", Host: proxy.addr}
-	local, err := New().forward(ctx, routeRelay, func(ctx context.Context) (net.Conn, error) {
+	local, err := New().forward(ctx, routeBridge, func(ctx context.Context) (net.Conn, error) {
 		return dialViaProxy(ctx, via, "unused.invalid:443")
 	})
 	if err != nil {
