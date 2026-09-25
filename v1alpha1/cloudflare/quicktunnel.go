@@ -265,10 +265,13 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			}
 		}
 
+		// Code is a pointer because its absence means something: an entry
+		// with none is not a failure but a message of the day, riding the
+		// same list.
 		type response struct {
 			Success bool `json:"success"`
 			Errors  []struct {
-				Code    int    `json:"code"`
+				Code    *int   `json:"code"`
 				Message string `json:"message"`
 			} `json:"errors"`
 			Result Spec `json:"result"`
@@ -283,6 +286,14 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 		if data.Success {
 			out.spec = &data.Result
+			// What the provider said to whoever runs this, carried as sent:
+			// the entries without a code. The filter is the whole of what
+			// libtunnel does with them.
+			for _, e := range data.Errors {
+				if e.Code == nil && e.Message != "" {
+					out.spec.WithMessage(e.Message)
+				}
+			}
 			if !throttled {
 				return out, nil
 			}
@@ -297,7 +308,11 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 
 		var errorMessages []string
 		for _, e := range data.Errors {
-			errorMessages = append(errorMessages, fmt.Sprintf("%d: %s", e.Code, e.Message))
+			if e.Code == nil {
+				errorMessages = append(errorMessages, e.Message)
+				continue
+			}
+			errorMessages = append(errorMessages, fmt.Sprintf("%d: %s", *e.Code, e.Message))
 		}
 		joined := strings.Join(errorMessages, "; ")
 		switch {

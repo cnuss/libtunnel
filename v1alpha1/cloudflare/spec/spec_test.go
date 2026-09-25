@@ -16,6 +16,7 @@ import (
 func TestRecordIDRidesTheEnvelopeNotTheSpec(t *testing.T) {
 	s := &Spec{ID: "id-1", Name: "n", Hostname: "h.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
 	s.WithMeta(RecordIDKey, "rec-1")
+	s.WithMessage("data:text/markdown;base64,PiBbIW5vdGVdIGhp")
 	envelope := s.Serialize()
 	if envelope == "" {
 		t.Fatal("Serialize returned nothing")
@@ -24,6 +25,7 @@ func TestRecordIDRidesTheEnvelopeNotTheSpec(t *testing.T) {
 	var e struct {
 		Spec     map[string]json.RawMessage `json:"spec"`
 		Metadata map[string]string          `json:"metadata"`
+		Messages []string                   `json:"messages"`
 	}
 	if err := json.Unmarshal([]byte(envelope), &e); err != nil {
 		t.Fatal(err)
@@ -34,17 +36,23 @@ func TestRecordIDRidesTheEnvelopeNotTheSpec(t *testing.T) {
 	if e.Metadata["record_id"] != "rec-1" {
 		t.Errorf("metadata.record_id = %q, want rec-1: %s", e.Metadata["record_id"], envelope)
 	}
+	if len(e.Messages) != 1 || e.Messages[0] != s.Messages()[0] {
+		t.Errorf("messages = %q, want the one as sent: %s", e.Messages, envelope)
+	}
 
-	backend, raw, metadata, err := v1alpha1.DecodeSpec(envelope)
+	backend, raw, aside, err := v1alpha1.DecodeSpec(envelope)
 	if err != nil || backend != Backend {
 		t.Fatalf("DecodeSpec = %q, %v", backend, err)
 	}
 	got := &Spec{}
-	if err := v1alpha1.Unpack(raw, metadata, got); err != nil {
+	if err := v1alpha1.Unpack(raw, aside, got); err != nil {
 		t.Fatal(err)
 	}
 	if got.RecordID() != "rec-1" || got.ID != "id-1" || got.Hostname != s.Hostname {
 		t.Errorf("round trip = %+v record %q, want the spec back with its record", got, got.RecordID())
+	}
+	if len(got.Messages()) != 1 || got.Messages()[0] != s.Messages()[0] {
+		t.Errorf("round trip messages = %q, want %q", got.Messages(), s.Messages())
 	}
 }
 
@@ -53,19 +61,19 @@ func TestRecordIDRidesTheEnvelopeNotTheSpec(t *testing.T) {
 func TestNoRecordIDWritesNoMetadata(t *testing.T) {
 	s := &Spec{ID: "id-1", Hostname: "h.tunneled.pizza"}
 	envelope := s.Serialize()
-	if strings.Contains(envelope, "metadata") {
-		t.Errorf("envelope carries metadata with nothing to say: %s", envelope)
+	if strings.Contains(envelope, "metadata") || strings.Contains(envelope, "messages") {
+		t.Errorf("envelope carries something beside a spec that has nothing: %s", envelope)
 	}
-	_, raw, metadata, err := v1alpha1.DecodeSpec(envelope)
+	_, raw, aside, err := v1alpha1.DecodeSpec(envelope)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := &Spec{}
-	if err := v1alpha1.Unpack(raw, metadata, got); err != nil {
+	if err := v1alpha1.Unpack(raw, aside, got); err != nil {
 		t.Fatal(err)
 	}
-	if got.RecordID() != "" {
-		t.Errorf("RecordID = %q, want none", got.RecordID())
+	if got.RecordID() != "" || got.Messages() != nil {
+		t.Errorf("record %q, messages %v, want none", got.RecordID(), got.Messages())
 	}
 }
 

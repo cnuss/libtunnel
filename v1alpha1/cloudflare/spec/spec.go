@@ -23,9 +23,11 @@ const RecordIDKey = "record_id"
 // Meta is what tunnel.pizza said beside the spec, typed. The interface speaks
 // in keys (v1.SpecMetadata); they are filled in here and read out from here,
 // best effort — a key this backend does not know is dropped on the way in,
-// and a field it has nothing for is left out on the way out.
+// and a field it has nothing for is left out on the way out. Messages are
+// carried as sent.
 type Meta struct {
 	recordID string
+	messages []string
 }
 
 // Spec is the Cloudflare backend's credential set — the spec type T produced
@@ -46,14 +48,10 @@ var _ v1.Spec = (*Spec)(nil)
 // Metadata implements v1.Spec: Meta, under its keys. Nil when there is
 // nothing in it.
 func (s *Spec) Metadata() v1.SpecMetadata {
-	if s == nil || s.meta == (Meta{}) {
+	if s == nil || s.meta.recordID == "" {
 		return nil
 	}
-	metadata := v1.SpecMetadata{}
-	if s.meta.recordID != "" {
-		metadata[RecordIDKey] = s.meta.recordID
-	}
-	return metadata
+	return v1.SpecMetadata{RecordIDKey: s.meta.recordID}
 }
 
 // WithMeta implements v1.Spec: a key this backend knows lands in Meta, any
@@ -63,6 +61,20 @@ func (s *Spec) WithMeta(key, value string) v1.Spec {
 	case RecordIDKey:
 		s.meta.recordID = value
 	}
+	return s
+}
+
+// Messages implements v1.Spec.
+func (s *Spec) Messages() []string {
+	if s == nil {
+		return nil
+	}
+	return s.meta.messages
+}
+
+// WithMessage implements v1.Spec.
+func (s *Spec) WithMessage(message string) v1.Spec {
+	s.meta.messages = append(s.meta.messages, message)
 	return s
 }
 

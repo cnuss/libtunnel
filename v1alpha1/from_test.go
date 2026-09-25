@@ -23,7 +23,7 @@ func TestFromEmptyIsNoSpec(t *testing.T) {
 		var gotBackend string
 		var gotRaw json.RawMessage
 		called := false
-		tun := v1alpha1.From(spec, func(backend string, raw json.RawMessage, _ v1.SpecMetadata) (v1.Tunnel, error) {
+		tun := v1alpha1.From(spec, func(backend string, raw json.RawMessage, _ v1alpha1.Aside) (v1.Tunnel, error) {
 			called, gotBackend, gotRaw = true, backend, raw
 			return v1alpha1.Failed(nil), nil
 		})

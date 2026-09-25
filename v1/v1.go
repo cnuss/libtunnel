@@ -393,6 +393,13 @@ type Spec interface {
 	// WithMeta records one thing said beside the spec, and returns the
 	// spec.
 	WithMeta(key, value string) Spec
+	// Messages is what the provider said to whoever runs this, with the
+	// spec: messages of the day, as it sent them, in its order. libtunnel
+	// carries them, unread; what they mean and how they are shown is the
+	// caller's. Nil when it said nothing.
+	Messages() []string
+	// WithMessage records one message, and returns the spec.
+	WithMessage(message string) Spec
 }
 
 // Provider supplies a tunnel spec. Implementations may mint fresh credentials
@@ -503,6 +510,10 @@ type Tunnel interface {
 	Domain() string
 	// Port is the port encoded in Hostname, or 443 when absent.
 	Port() int
+	// Messages is what the provider said to whoever runs this, with the
+	// spec (see Spec.Messages): as sent, in its order, nil when nothing. A
+	// getter like Hostname: the first use resolves the spec.
+	Messages() []string
 	// CACerts returns the trust roots the backend uses for its edge
 	// connections.
 	CACerts() []*x509.Certificate

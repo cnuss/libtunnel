@@ -20,10 +20,16 @@ type specEnvelope struct {
 	// Redundant with the spec body; decoders that want the credential read Spec.
 	Hostname string          `json:"hostname,omitempty"`
 	Spec     json.RawMessage `json:"spec"`
-	// Metadata is what the provider said beside the spec (v1.Spec.Metadata):
-	// its response headers rather than its body, kept here so the spec's
-	// own encoding stays the provider's. Absent when it said nothing.
+	Aside
+}
+
+// Aside is what the envelope carries beside the spec, kept out of the spec's
+// own encoding so that stays the provider's: what the provider said in its
+// headers (v1.Spec.Metadata) and what it said to whoever runs this
+// (v1.Spec.Messages). Each absent when there was nothing.
+type Aside struct {
 	Metadata v1.SpecMetadata `json:"metadata,omitempty"`
+	Messages []string        `json:"messages,omitempty"`
 }
 
 // selfExported records v1.SpecEnv values this process exported itself, so
@@ -102,7 +108,7 @@ func EncodeSpec[T v1.Spec](backend string, spec T) (string, error) {
 		Backend:  backend,
 		Hostname: spec.GetHostname(),
 		Spec:     data,
-		Metadata: spec.Metadata(),
+		Aside:    Aside{Metadata: spec.Metadata(), Messages: spec.Messages()},
 	})
 	if err != nil {
 		return "", fmt.Errorf("unable to encode spec envelope: %w", err)
@@ -111,28 +117,32 @@ func EncodeSpec[T v1.Spec](backend string, spec T) (string, error) {
 }
 
 // DecodeSpec splits an envelope (EncodeSpec output / v1.SpecEnv value) into
-// its backend tag, the raw backend spec JSON and the metadata beside it, for
-// a caller to unpack into the matching spec type. A value with no backend
-// tag is not an envelope.
-func DecodeSpec(envelope string) (backend string, spec json.RawMessage, metadata v1.SpecMetadata, err error) {
+// its backend tag, the raw backend spec JSON and what rode beside it, for a
+// caller to unpack into the matching spec type. A value with no backend tag
+// is not an envelope.
+func DecodeSpec(envelope string) (backend string, spec json.RawMessage, aside Aside, err error) {
 	var e specEnvelope
 	if err := json.Unmarshal([]byte(envelope), &e); err != nil {
-		return "", nil, nil, err
+		return "", nil, Aside{}, err
 	}
 	if e.Backend == "" {
-		return "", nil, nil, fmt.Errorf("no backend tag (not a spec envelope)")
+		return "", nil, Aside{}, fmt.Errorf("no backend tag (not a spec envelope)")
 	}
-	return e.Backend, e.Spec, e.Metadata, nil
+	return e.Backend, e.Spec, e.Aside, nil
 }
 
 // Unpack fills into from what DecodeSpec split: the spec from its own JSON,
-// then the metadata beside it, key by key.
-func Unpack[T v1.Spec](spec json.RawMessage, metadata v1.SpecMetadata, into T) error {
+// then what rode beside it, the metadata key by key and the messages in
+// order.
+func Unpack[T v1.Spec](spec json.RawMessage, aside Aside, into T) error {
 	if err := json.Unmarshal(spec, into); err != nil {
 		return err
 	}
-	for key, value := range metadata {
+	for key, value := range aside.Metadata {
 		into.WithMeta(key, value)
+	}
+	for _, message := range aside.Messages {
+		into.WithMessage(message)
 	}
 	return nil
 }
@@ -187,14 +197,14 @@ func SpecFromEnv[T v1.Spec](backend string, spec T) (bool, error) {
 		return false, nil
 	}
 
-	tag, raw, metadata, err := DecodeSpec(env)
+	tag, raw, aside, err := DecodeSpec(env)
 	if err != nil {
 		return false, fmt.Errorf("unable to parse %s: %w", v1.SpecEnv, err)
 	}
 	if tag != backend {
 		return false, fmt.Errorf("%s was minted by backend %q, not %q", v1.SpecEnv, tag, backend)
 	}
-	if err := Unpack(raw, metadata, spec); err != nil {
+	if err := Unpack(raw, aside, spec); err != nil {
 		return false, fmt.Errorf("unable to parse %s: %w", v1.SpecEnv, err)
 	}
 	return true, nil

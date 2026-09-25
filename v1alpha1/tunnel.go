@@ -629,6 +629,11 @@ func (t *TunnelImpl[T]) Hostname() string {
 	return t.Spec().GetHostname()
 }
 
+// Messages is what the provider said with the spec, as sent.
+func (t *TunnelImpl[T]) Messages() []string {
+	return t.Spec().Messages()
+}
+
 // Host is the first label of Hostname.
 func (t *TunnelImpl[T]) Host() string {
 	return hostOf(t.Hostname())

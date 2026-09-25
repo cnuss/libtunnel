@@ -10,8 +10,8 @@ import (
 
 // From loads a serialized spec and replays it into a tunnel. spec is resolved
 // as an existing file at the given path, otherwise as the literal JSON. It
-// decodes the envelope and hands the backend tag, the raw backend spec and the
-// metadata beside it (see Unpack) to
+// decodes the envelope and hands the backend tag, the raw backend spec and
+// what rode beside it (see Unpack) to
 // build, which constructs the tunnel for that backend — the one piece From
 // can't own, since v1alpha1 is backend-agnostic and the façade wires the
 // concrete backend. An empty spec — the empty string, or a path to an empty
@@ -20,17 +20,17 @@ import (
 // (unparseable, unknown backend, or a build error) returns a tunnel already
 // canceled with the cause, so callers get it through Err()/Done() rather than a
 // second return value.
-func From(spec string, build func(backend string, raw json.RawMessage, metadata v1.SpecMetadata) (v1.Tunnel, error)) v1.Tunnel {
+func From(spec string, build func(backend string, raw json.RawMessage, aside Aside) (v1.Tunnel, error)) v1.Tunnel {
 	var backend string
 	var raw json.RawMessage
-	var metadata v1.SpecMetadata
+	var aside Aside
 	if envelope := loadSpec(spec); envelope != "" {
 		var err error
-		if backend, raw, metadata, err = DecodeSpec(envelope); err != nil {
+		if backend, raw, aside, err = DecodeSpec(envelope); err != nil {
 			return Failed(fmt.Errorf("From: %w", err))
 		}
 	}
-	tun, err := build(backend, raw, metadata)
+	tun, err := build(backend, raw, aside)
 	if err != nil {
 		return Failed(fmt.Errorf("From: %w", err))
 	}
@@ -47,14 +47,14 @@ func ReplayFromEnv[T v1.Spec](backend string, spec T) (bool, error) {
 	if envelope == "" {
 		return false, nil
 	}
-	tag, raw, metadata, err := DecodeSpec(envelope)
+	tag, raw, aside, err := DecodeSpec(envelope)
 	if err != nil {
 		return false, fmt.Errorf("unable to parse %s: %w", v1.FromEnv, err)
 	}
 	if tag != backend {
 		return false, fmt.Errorf("%s references a spec minted by backend %q, not %q", v1.FromEnv, tag, backend)
 	}
-	if err := Unpack(raw, metadata, spec); err != nil {
+	if err := Unpack(raw, aside, spec); err != nil {
 		return false, fmt.Errorf("unable to parse %s: %w", v1.FromEnv, err)
 	}
 	return true, nil

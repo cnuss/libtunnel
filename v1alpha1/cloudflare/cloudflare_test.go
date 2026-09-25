@@ -2040,3 +2040,35 @@ func TestProviderNamesTheBridgeOnTheMintHost(t *testing.T) {
 		t.Errorf("bridge for a local provider = %q, want ws://localhost:3000/relay", got)
 	}
 }
+
+// TestMessagesRideTheMintWithoutACode pins #239's filter, and that it is the
+// whole of it: a successful mint's errors entries without a code are the
+// provider's messages of the day, kept on the spec as sent, unread; an
+// entry with a code is a failure's, as ever, and a failure's entry without
+// one is repeated without a made-up "0:".
+func TestMessagesRideTheMintWithoutACode(t *testing.T) {
+	clearSpecEnv(t)
+	const motd = "data:text/markdown;base64,PiBbIXdhcm5pbmddIHB1YmxpYw=="
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"},"errors":[{"message":%q},{"message":"second"}]}`, motd)
+	}))
+	t.Cleanup(srv.Close)
+
+	spec, err := New().WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Messages(); len(got) != 2 || got[0] != motd || got[1] != "second" {
+		t.Errorf("Messages = %q, want both, as sent, in order", got)
+	}
+
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"success":false,"errors":[{"code":1002,"message":"no"},{"message":"and this"}]}`)
+	}))
+	t.Cleanup(failing.Close)
+	_, err = New().WithProvider(failing.URL).Provider().Spec(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "1002: no; and this") {
+		t.Errorf("failure = %v, want the coded entry with its code and the other as is", err)
+	}
+}

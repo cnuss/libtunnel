@@ -1624,3 +1624,18 @@ func TestDoneWaitsForTheEngineToLetGo(t *testing.T) {
 		t.Fatal("Done not delivered once the engine let go")
 	}
 }
+
+// TestMessagesComeOffTheSpec pins the accessor: what the provider said with
+// the spec is read off the tunnel as sent, and resolving the spec is what
+// the first call does, like Hostname.
+func TestMessagesComeOffTheSpec(t *testing.T) {
+	spec := &cloudflare.Spec{Hostname: "demo.tunneled.pizza"}
+	spec.WithMessage("data:text/markdown;base64,PiBbIW5vdGVdIGhp")
+	tun := v1alpha1.New(newFakeEngine(spec))
+	if got := tun.Messages(); len(got) != 1 || got[0] != spec.Messages()[0] {
+		t.Errorf("Messages = %q, want the spec's, as sent", got)
+	}
+	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.pizza"})).Messages(); got != nil {
+		t.Errorf("Messages = %v with nothing said, want nil", got)
+	}
+}
