@@ -151,9 +151,12 @@ type Prober struct {
 	tlsConfigs     map[connection.Protocol]*tls.Config
 	tlsConfigsOnce sync.Once
 
-	// bridge is the WebSocket that carries the edge's TLS through the
-	// provider's host: DefaultBridge until WithBridge names another.
-	bridge *url.URL
+	// bridges are the WebSockets that carry the edge's TLS, in the order
+	// tried: the one on the provider's host when WithBridge named one, then
+	// DefaultBridge — a provider without a bridge of its own (trycloudflare)
+	// is still reached through tunnel.pizza's, since what it carries is
+	// Cloudflare's edge, not that provider.
+	bridges []*url.URL
 	// bridgeTLS is the outer TLS to the bridge's host. Nil verifies against
 	// the system roots, which is what an ordinary host on 443 wants; a test
 	// standing up its own bridge sets its own.
@@ -234,21 +237,29 @@ func (p *Prober) WithRootCAs(pool *x509.CertPool) *Prober {
 }
 
 // WithBridge names the WebSocket endpoint (ws or wss) that carries the edge's
-// TLS through the provider's host — tried after the edge's own addresses. An
-// empty or unusable value leaves DefaultBridge in place.
+// TLS through the provider's host — tried after the edge's own addresses, and
+// before DefaultBridge, which stays as the fallback. An empty or unusable
+// value leaves DefaultBridge alone in place.
 func (p *Prober) WithBridge(endpoint string) *Prober {
-	if u, err := url.Parse(endpoint); err == nil && u.Host != "" && (u.Scheme == "ws" || u.Scheme == "wss") {
-		p.bridge = u
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" || (u.Scheme != "ws" && u.Scheme != "wss") {
+		return p
+	}
+	fallback, _ := url.Parse(DefaultBridge)
+	p.bridges = []*url.URL{u}
+	if u.String() != fallback.String() {
+		p.bridges = append(p.bridges, fallback)
 	}
 	return p
 }
 
-// Bridge reports the bridge endpoint this prober was given, or "" for none.
+// Bridge reports the bridge tried first: the one WithBridge named, else
+// DefaultBridge.
 func (p *Prober) Bridge() string {
-	if p.bridge == nil {
+	if len(p.bridges) == 0 {
 		return ""
 	}
-	return p.bridge.String()
+	return p.bridges[0].String()
 }
 
 // WithLogger sets where the probe logs.
@@ -402,7 +413,7 @@ func (p *Prober) EdgeAddrs(ctx context.Context) []string {
 // host was named for it.
 func (p *Prober) all() []route {
 	routes := []route{routeDirect}
-	if p.bridge != nil {
+	if len(p.bridges) > 0 {
 		routes = append(routes, routeBridge)
 	}
 	return routes
@@ -569,27 +580,40 @@ func (p *Prober) forward(ctx context.Context, r route, dial func(context.Context
 	return listener.Addr().String(), nil
 }
 
-// dialBridge opens the WebSocket to the bridge and returns it as a stream:
-// the outer TLS is the bridge host's own, verified against the system roots
-// like any host on 443, and what the caller writes rides the frames unread.
-// Through the proxy where the environment names one, since a network that
-// needs this route usually has one.
+// dialBridge opens the WebSocket to the first bridge that answers and returns
+// it as a stream: the outer TLS is the bridge host's own, verified against
+// the system roots like any host on 443, and what the caller writes rides
+// the frames unread. Through the proxy where the environment names one,
+// since a network that needs this route usually has one.
 func (p *Prober) dialBridge(ctx context.Context) (net.Conn, error) {
-	if p.bridge == nil {
+	if len(p.bridges) == 0 {
 		return nil, errors.New("no bridge named")
 	}
-	secure := p.bridge.Scheme == "wss"
+	var err error
+	for _, bridge := range p.bridges {
+		var conn net.Conn
+		conn, err = p.dialOneBridge(ctx, bridge)
+		if err == nil {
+			return conn, nil
+		}
+		p.log.Debug().Err(err).Str("bridge", bridge.String()).Msg("bridge did not answer")
+	}
+	return nil, err
+}
+
+func (p *Prober) dialOneBridge(ctx context.Context, bridge *url.URL) (net.Conn, error) {
+	secure := bridge.Scheme == "wss"
 	scheme, port := "http", "80"
 	if secure {
 		scheme, port = "https", "443"
 	}
-	if p.bridge.Port() != "" {
-		port = p.bridge.Port()
+	if bridge.Port() != "" {
+		port = bridge.Port()
 	}
-	host := p.bridge.Hostname()
+	host := bridge.Hostname()
 	target := net.JoinHostPort(host, port)
 
-	p.log.Info().Str("bridge", p.bridge.String()).Msg("reaching the edge through the bridge")
+	p.log.Info().Str("bridge", bridge.String()).Msg("reaching the edge through the bridge")
 
 	var raw net.Conn
 	var err error
@@ -624,7 +648,7 @@ func (p *Prober) dialBridge(ctx context.Context) (net.Conn, error) {
 		stream.Close()
 		return nil, err
 	}
-	config, err := websocket.NewConfig(p.bridge.String(), scheme+"://"+host+"/")
+	config, err := websocket.NewConfig(bridge.String(), scheme+"://"+host+"/")
 	if err != nil {
 		stream.Close()
 		return nil, err
@@ -632,7 +656,7 @@ func (p *Prober) dialBridge(ctx context.Context) (net.Conn, error) {
 	ws, err := websocket.NewClient(config, stream)
 	if err != nil {
 		stream.Close()
-		return nil, fmt.Errorf("upgrade %s: %w", p.bridge, err)
+		return nil, fmt.Errorf("upgrade %s: %w", bridge, err)
 	}
 	if err := stream.SetDeadline(time.Time{}); err != nil {
 		ws.Close()
@@ -655,7 +679,7 @@ func (p *Prober) dialEdge(ctx context.Context, tlsConfig *tls.Config, r route) (
 		conn := tls.Client(raw, tlsConfig)
 		if err := conn.HandshakeContext(ctx); err != nil {
 			raw.Close()
-			return nil, fmt.Errorf("TLS to the edge through %s: %w", p.bridge, err)
+			return nil, fmt.Errorf("TLS to the edge through the bridge: %w", err)
 		}
 		return conn, nil
 	}

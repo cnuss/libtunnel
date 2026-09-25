@@ -32,7 +32,10 @@ func main() {
 	if resp1 != hello {
 		log.Fatalf("Unexpected response: got %q, want %q", resp1, hello)
 	}
+	// Wait for Done, not just Cancel: the edge has then been told tun1 is
+	// gone, and tun2 registers on a clean tunnel.
 	tun1.Cancel()
+	<-tun1.Done()
 
 	spec := tun1.Serialize()
 	log.Printf("tun1 spec: %+v", spec)
@@ -49,6 +52,7 @@ func main() {
 		log.Fatalf("Unexpected response: got %q, want %q", resp2, hello)
 	}
 	tun2.Cancel()
+	<-tun2.Done()
 }
 
 func fetch(url string) string {

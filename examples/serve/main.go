@@ -9,6 +9,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -45,7 +46,11 @@ func main() {
 		err := http.Serve(lis, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "hello from libtunnel")
 		}))
-		log.Fatal(err)
+		// The tunnel closes the listener it minted when it ends; that
+		// is the shutdown below, not a failure.
+		if !errors.Is(err, net.ErrClosed) {
+			log.Fatal(err)
+		}
 	}()
 
 	log.Printf("local: %s\n", tun.LocalURL())
@@ -66,6 +71,11 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("served: %s\n", body)
+
+	// Cancel and wait: Done delivers once the edge has been told, so the
+	// next connector on this hostname is not routed to a dead process.
+	tun.Cancel()
+	<-tun.Done()
 }
 
 // fetchClient resolves through a public resolver (1.1.1.1) instead of this

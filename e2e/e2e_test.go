@@ -98,24 +98,21 @@ func TestExamples(t *testing.T) {
 	cases := []struct {
 		name   string
 		want   string
-		live   bool                           // mints a real tunnel; skipped under -short (see skipUnlessLive)
+		live   bool                           // needs a real tunnel; skipped under -short (see skipUnlessLive)
+		own    bool                           // mints its own rather than adopting the preflight's (see gateExamples)
 		verify func(t *testing.T, out string) // optional deeper assertions on the same run
 	}{
-		{"serve", "served: hello from libtunnel", true, nil},
-		{"serve-tls", "served: hello from libtunnel (tls)", true, nil},
-		{"reclaim", "tun2 url: https://", true, nil},
+		{"serve", "served: hello from libtunnel", true, false, nil},
+		{"serve-tls", "served: hello from libtunnel (tls)", true, false, nil},
+		{"reclaim", "tun2 url: https://", true, true, nil},
 	}
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.live {
-				skipUnlessLive(t)
-				if !exampleCell() {
-					t.Skip("live examples tier runs on one CI cell per OS family (#147)")
-				}
-				// No t.Parallel, and paced: live cases mint real tunnels,
-				// and burst minting invites 429s and edge-propagation races.
-				paceLive()
+				// No t.Parallel: the examples share the preflight hostname
+				// one connector at a time, and the gate paces them.
+				gateExamples(t, tc.own)
 			}
 			out := assertExample(t, tc.name, tc.want)
 			if tc.verify != nil {

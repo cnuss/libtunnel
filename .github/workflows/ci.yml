@@ -122,12 +122,13 @@ jobs:
       - name: tests
         run: make test
 
-      # All live-tier selection lives in the e2e package (#147): which tier a
-      # platform runs — the full scenario suite on linux/amd64, the example
-      # binaries on one variant of each OS family, nothing live elsewhere —
-      # and the Dependabot exclusion (read from the event payload). A
-      # `served: error code: 1033` failure here is edge route propagation
-      # lag, not code — rerun the job.
+      # All live-tier selection lives in the e2e package (#147, #255): which
+      # tier a platform runs — the full scenario suite on linux/amd64; the
+      # example binaries on one variant of each OS family, on pushes only,
+      # adopting one shared mint, from trycloudflare off the scenario cell;
+      # nothing live elsewhere — and the Dependabot exclusion (read from the
+      # event payload). A `served: error code: 1033` failure here is edge
+      # route propagation lag, not code — rerun the job.
       - name: e2e
         env:
           LIBTUNNEL__CLOUDFLARE_PROVIDER: ${{ matrix.provider }}
