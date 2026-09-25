@@ -12,7 +12,7 @@ Deep-link by filename; line numbers will drift.
 | ---------------------------------------------- | ---------------------------------------------------------------- |
 | Façade (`New`, backends, providers, handoff)   | [`lib.go`](./lib.go)                                             |
 | Stable contract (`Tunnel`, `Provider[T]`, `Backend[T]`, `Spec`) | [`v1/v1.go`](./v1/v1.go) |
-| Cloudflare `Spec` type                         | [`v1alpha1/cloudflare/spec.go`](./v1alpha1/cloudflare/spec.go)   |
+| Cloudflare `Spec` type                         | [`v1alpha1/cloudflare/spec/spec.go`](./v1alpha1/cloudflare/spec/spec.go) |
 | Core struct + `New` constructor + `Engine` contract | [`v1alpha1/v1alpha1.go`](./v1alpha1/v1alpha1.go)            |
 | Lazy getters + `With*` mutators + DNS readiness | [`v1alpha1/tunnel.go`](./v1alpha1/tunnel.go)                     |
 | Generic providers (`Static`, `Env`) + handoff helpers | [`v1alpha1/provider.go`](./v1alpha1/provider.go)          |

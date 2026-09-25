@@ -268,13 +268,13 @@ func Cloudflare() *cloudflare.Backend {
 // credential chain — including over a code-pinned From spec, after
 // LIBTUNNEL_SPEC (env beats code; SPEC beats FROM).
 func From(spec string) TunnelV1 {
-	return v1alpha1.From(spec, func(backend string, raw json.RawMessage) (v1.Tunnel, error) {
+	return v1alpha1.From(spec, func(backend string, raw json.RawMessage, aside v1alpha1.Aside) (v1.Tunnel, error) {
 		switch backend {
 		case "":
 			return New(Cloudflare()), nil
 		case "cloudflare":
 			s := &cloudflare.Spec{}
-			if err := json.Unmarshal(raw, s); err != nil {
+			if err := v1alpha1.Unpack(raw, aside, s); err != nil {
 				return nil, fmt.Errorf("invalid cloudflare spec: %w", err)
 			}
 			return v1alpha1.New(cloudflare.From(s)), nil

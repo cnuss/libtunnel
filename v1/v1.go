@@ -369,6 +369,11 @@ type Lifecycle[T any] interface {
 	Cancel(cause ...error)
 }
 
+// SpecMetadata is what a provider said beside a spec — in its response
+// headers, not its body — under the keys it said it by. Each backend names
+// its keys (cloudflare.RecordIDKey).
+type SpecMetadata map[string]string
+
 // Spec is the credential/identity set a Provider yields. Each backend defines
 // a concrete spec type (cloudflare.Spec for the Cloudflare backend); the core
 // only needs the public hostname the spec encodes — everything else is
@@ -381,6 +386,20 @@ type Spec interface {
 	// form carried by LIBTUNNEL_SPEC. The result round-trips through
 	// libtunnel.From and can be dropped straight into the env var.
 	Serialize() string
+	// Metadata is what the provider said beside the spec. Nil when it said
+	// nothing. It rides the envelope beside the spec, so a replay can send
+	// it back the same way. Read it; WithMeta writes it.
+	Metadata() SpecMetadata
+	// WithMeta records one thing said beside the spec, and returns the
+	// spec.
+	WithMeta(key, value string) Spec
+	// Messages is what the provider said to whoever runs this, with the
+	// spec: messages of the day, as it sent them, in its order. libtunnel
+	// carries them, unread; what they mean and how they are shown is the
+	// caller's. Nil when it said nothing.
+	Messages() []string
+	// WithMessage records one message, and returns the spec.
+	WithMessage(message string) Spec
 }
 
 // Provider supplies a tunnel spec. Implementations may mint fresh credentials
@@ -491,6 +510,10 @@ type Tunnel interface {
 	Domain() string
 	// Port is the port encoded in Hostname, or 443 when absent.
 	Port() int
+	// Messages is what the provider said to whoever runs this, with the
+	// spec (see Spec.Messages): as sent, in its order, nil when nothing. A
+	// getter like Hostname: the first use resolves the spec.
+	Messages() []string
 	// CACerts returns the trust roots the backend uses for its edge
 	// connections.
 	CACerts() []*x509.Certificate

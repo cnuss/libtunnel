@@ -47,6 +47,7 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/probe"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/spec"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/trust"
 )
 
@@ -92,7 +93,16 @@ var promMu sync.Mutex
 
 // backendName tags specs minted by this backend (Name, Serialize, the
 // LIBTUNNEL_SPEC envelope) — one source of truth so the tag never drifts.
-const backendName = "cloudflare"
+const backendName = spec.Backend
+
+// Spec is the Cloudflare backend's credential set, defined in the spec
+// package so that everything under this directory can name it without
+// importing the engine; an alias, so it is the same type here.
+type Spec = spec.Spec
+
+// RecordIDKey is spec.RecordIDKey, the metadata key the hostname's record
+// rides under.
+const RecordIDKey = spec.RecordIDKey
 
 // goneProbeDelay is how long the tunnel may have no connection at all before
 // the edge is asked whether it still has the tunnel. Long enough that an
@@ -430,7 +440,7 @@ func (b *Backend) Reconnect(ctx context.Context) error {
 // resume — the one hint tunnel.pizza reads (see Spec.RecordID). Env mirror:
 // LIBTUNNEL__CLOUDFLARE_RECORD_ID.
 func (b *Backend) WithRecordID(record string) *Backend {
-	b.fields.RecordID = record
+	b.fields.WithMeta(RecordIDKey, record)
 	return b
 }
 
@@ -720,7 +730,8 @@ func (b *Backend) hint() (*Spec, error) {
 	}
 
 	fields := b.fields
-	stringEnv(v1.CloudflareRecordIDEnv, &fields.RecordID)
+	record := fields.RecordID()
+	stringEnv(v1.CloudflareRecordIDEnv, &record)
 	stringEnv(v1.CloudflareIDEnv, &fields.ID)
 	stringEnv(v1.CloudflareNameEnv, &fields.Name)
 	stringEnv(v1.CloudflareHostnameEnv, &fields.Hostname)
@@ -732,7 +743,9 @@ func (b *Backend) hint() (*Spec, error) {
 		}
 		fields.Secret = secret
 	}
-	stringField(fields.RecordID, &base.RecordID)
+	if record != "" {
+		base.WithMeta(RecordIDKey, record)
+	}
 	stringField(fields.ID, &base.ID)
 	stringField(fields.Name, &base.Name)
 	stringField(fields.Hostname, &base.Hostname)
