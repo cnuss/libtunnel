@@ -120,12 +120,15 @@ Easy to get wrong from the diff alone:
   example names (`Example_handoff` etc.). See [`v1/example_test.go`](./v1/example_test.go).
 - **e2e builds binaries at runtime**, so the test cache can't see example
   source changes — `make e2e` passes `-count=1` to force a rebuild.
-- **Live cases are gated in the tests, not the workflow.** `serve` and
-  `serve-tls` mint real tunnels from `tunnel.pizza`, which rate-limits —
-  minting from every CI matrix cell would trip 429s, so the e2e package
-  narrows itself on CI (#147): the full scenario tier runs on linux/amd64
-  only, the examples tier on one variant per OS family, and everything live
-  skips under `-short` and on Dependabot PRs (see the tier-selection block in
+- **Live cases are gated in the tests, not the workflow.** Live tests need
+  real tunnels from `tunnel.pizza`, which rate-limits — minting from every
+  CI matrix cell would trip 429s, so the e2e package narrows itself on CI
+  (#147, #255): one preflight mint per live cell that the scenario tests
+  and the example binaries all adopt through `LIBTUNNEL_SPEC`; the full
+  scenario tier on linux/amd64 only; the examples tier on one variant per
+  OS family, on pushes rather than pull requests, minting from
+  trycloudflare off the scenario cell; and everything live skips under
+  `-short` and on Dependabot PRs (see the tier-selection block in
   `e2e/util_test.go`). For local verification, prefer `make run serve` (one
   tunnel) over the full live suite. A `served: error code: 1033`
   from a fresh tunnel is edge route propagation lag (more likely with

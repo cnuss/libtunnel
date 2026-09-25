@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -69,7 +70,11 @@ func main() {
 		}), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "hello from libtunnel (tls)")
 		}))
-		log.Fatal(err)
+		// The tunnel closes the listener it minted when it ends; that
+		// is the shutdown below, not a failure.
+		if !errors.Is(err, net.ErrClosed) {
+			log.Fatal(err)
+		}
 	}()
 
 	fmt.Printf("local: %s\n", tun.LocalURL()) // https://127.0.0.1:<port>/ — the TLS origin
@@ -90,6 +95,11 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Printf("served: %s\n", body)
+
+	// Cancel and wait: Done delivers once the edge has been told, so the
+	// next connector on this hostname is not routed to a dead process.
+	tun.Cancel()
+	<-tun.Done()
 }
 
 // wrappedListener wraps a net.Listener (here the TLS listener) without exposing

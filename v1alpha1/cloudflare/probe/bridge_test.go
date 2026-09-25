@@ -90,12 +90,12 @@ func TestDialBridgeThroughTheProxy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	target := p.bridge.Host
+	target := p.bridges[0].Host
 	raw, err := dialViaProxy(ctx, &url.URL{Scheme: "http", Host: proxy.addr}, target)
 	if err != nil {
 		t.Fatalf("dialViaProxy: %v", err)
 	}
-	config, err := websocket.NewConfig(bridge, "http://"+p.bridge.Hostname()+"/")
+	config, err := websocket.NewConfig(bridge, "http://"+p.bridges[0].Hostname()+"/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +161,28 @@ func TestForwardCarriesTheBridge(t *testing.T) {
 	conn, err := net.DialTimeout("tcp", local, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial the forwarder: %v", err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn)
+}
+
+// TestDialBridgeFallsBackToTheDefault pins the order: the bridge on the
+// provider's host first, tunnel.pizza's when that one does not answer — a
+// provider with no bridge of its own still gets the edge through the one
+// that exists. The named bridge here refuses the upgrade; the fallback is
+// stood in for by a second test bridge, so nothing real is dialed.
+func TestDialBridgeFallsBackToTheDefault(t *testing.T) {
+	refusing := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(refusing.Close)
+	p := New().WithBridge("ws://" + refusing.Listener.Addr().String() + BridgePath)
+	fallback, _ := url.Parse(bridgeServer(t, echoServer(t)))
+	p.bridges[1] = fallback
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := p.dialBridge(ctx)
+	if err != nil {
+		t.Fatalf("dialBridge: %v", err)
 	}
 	defer conn.Close()
 	roundTrip(t, conn)

@@ -81,18 +81,56 @@ func scenarioCell() bool {
 	return !onCI() || (runtime.GOOS == "linux" && runtime.GOARCH == "amd64")
 }
 
-// exampleCell reports whether this platform runs the live examples tier —
-// one variant per OS family (the CI spec-cache step keys off the same
-// three cells).
+// exampleCell reports whether this platform and this run carry the live
+// examples tier: off CI always; on CI one variant per OS family, and only
+// for a push or a manual run — a pull request's examples would mint on
+// three cells to show what the scenario tier on one already does, and the
+// push that merges it runs them anyway.
 func exampleCell() bool {
 	if !onCI() {
 		return true
+	}
+	if os.Getenv("GITHUB_EVENT_NAME") == "pull_request" {
+		return false
 	}
 	switch runtime.GOOS + "/" + runtime.GOARCH {
 	case "linux/amd64", "windows/amd64", "darwin/arm64":
 		return true
 	}
 	return false
+}
+
+// gateExamples gates a live example and hands it the ONE shared preflight
+// mint, the way gateLive does for a scenario: the example binary inherits
+// the spec through the environment (env beats code) and registers on that
+// tunnel instead of minting its own. On a CI cell that is not the scenario
+// cell the preflight — and so the examples — mint from trycloudflare: what
+// those cells are for is the binary on that OS, which no provider changes,
+// and tunnel.pizza's budget is better spent on the tier that tests it.
+//
+// own leaves the example its own mint and no inherited spec: reclaim
+// serializes a tunnel and replays it, which is nothing without a mint of
+// its own.
+func gateExamples(t *testing.T, own bool) {
+	t.Helper()
+	skipUnlessLive(t)
+	if !exampleCell() {
+		t.Skip("live examples tier runs on one CI cell per OS family, on pushes (#147, #255)")
+	}
+	if onCI() && !scenarioCell() {
+		os.Setenv(v1.CloudflareProviderEnv, "api.trycloudflare.com")
+	}
+	if own {
+		paceLive()
+		t.Setenv(v1.SpecEnv, "")
+		t.Setenv(v1.FromEnv, "")
+		return
+	}
+	if err := preflight(); err != nil {
+		t.Fatalf("live preflight failed (skipping the expensive part): %v", err)
+	}
+	paceLive()
+	adoptPreflightSpec(t)
 }
 
 // skipUnlessLive holds the gates every live case shares: -short (the unit
@@ -351,16 +389,22 @@ func serveBody(l net.Listener, body string) *http.Server {
 }
 
 // adoptPreflightSpec hands the shared preflight mint to a tunnel through the
-// environment, so a live test's mint hints with it and the provider hands that
-// tunnel back instead of a new hostname. Same move
-// TestLiveTunnel makes — it keeps the live tier's mint count down.
+// environment, so its hint probe finds that tunnel live and the provider is
+// never asked for a new hostname. It keeps the live tier's mint count down.
+//
+// Through LIBTUNNEL_FROM, the replay mirror, not LIBTUNNEL_SPEC: the handoff
+// channel refuses a value this process exported itself, and every tunnel
+// exports the spec it resolves — so once the first in-process test had
+// adopted the preflight and re-exported it, the identical envelope read as
+// this process's own and the next test minted fresh (two mints a run that
+// looked like adoption).
 func adoptPreflightSpec(t *testing.T) {
 	t.Helper()
 	if preflightSpec == nil {
 		return
 	}
-	if entry, err := v1alpha1.SpecEnviron("cloudflare", preflightSpec); err == nil {
-		t.Setenv(v1.SpecEnv, strings.TrimPrefix(entry, v1.SpecEnv+"="))
+	if envelope, err := v1alpha1.EncodeSpec("cloudflare", preflightSpec); err == nil {
+		t.Setenv(v1.FromEnv, envelope)
 	}
 }
 
