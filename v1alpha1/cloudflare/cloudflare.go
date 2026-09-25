@@ -47,6 +47,7 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/probe"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/spec"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/trust"
 )
 
@@ -92,7 +93,12 @@ var promMu sync.Mutex
 
 // backendName tags specs minted by this backend (Name, Serialize, the
 // LIBTUNNEL_SPEC envelope) — one source of truth so the tag never drifts.
-const backendName = "cloudflare"
+const backendName = spec.Backend
+
+// Spec is the Cloudflare backend's credential set, defined in the spec
+// package so that everything under this directory can name it without
+// importing the engine; an alias, so it is the same type here.
+type Spec = spec.Spec
 
 // goneProbeDelay is how long the tunnel may have no connection at all before
 // the edge is asked whether it still has the tunnel. Long enough that an
