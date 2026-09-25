@@ -1412,7 +1412,8 @@ func TestRecordIDResumesAHostname(t *testing.T) {
 	var seen http.Header
 	srv := mintServer(t, &seen)
 
-	replayed := &Spec{RecordID: "rec-1", Hostname: "minted.tunneled.pizza"}
+	replayed := &Spec{Hostname: "minted.tunneled.pizza"}
+	replayed.WithMeta(RecordIDKey, "rec-1")
 	if _, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -1451,8 +1452,8 @@ func TestRecordIDIsStoredOnTheSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.RecordID != "rec-from-server" {
-		t.Errorf("RecordID = %q, want the one the provider returned", spec.RecordID)
+	if spec.RecordID() != "rec-from-server" {
+		t.Errorf("RecordID = %q, want the one the provider returned", spec.RecordID())
 	}
 	if !strings.Contains(spec.Serialize(), "rec-from-server") {
 		t.Errorf("Serialize() dropped the record: %s", spec.Serialize())
@@ -1548,8 +1549,8 @@ func TestSettleBudgetKeepsTheMintedSpec(t *testing.T) {
 	if spec.Hostname != "slow.tunneled.pizza" {
 		t.Errorf("Hostname = %q", spec.Hostname)
 	}
-	if spec.RecordID != "rec-slow" {
-		t.Errorf("RecordID = %q, want it carried so the caller can resume", spec.RecordID)
+	if spec.RecordID() != "rec-slow" {
+		t.Errorf("RecordID = %q, want it carried so the caller can resume", spec.RecordID())
 	}
 	if got := calls.Load(); got < 2 {
 		t.Errorf("API called %d times, want the budget to allow at least one retry", got)

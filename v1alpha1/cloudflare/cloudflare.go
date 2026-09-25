@@ -100,6 +100,10 @@ const backendName = spec.Backend
 // importing the engine; an alias, so it is the same type here.
 type Spec = spec.Spec
 
+// RecordIDKey is spec.RecordIDKey, the metadata key the hostname's record
+// rides under.
+const RecordIDKey = spec.RecordIDKey
+
 // goneProbeDelay is how long the tunnel may have no connection at all before
 // the edge is asked whether it still has the tunnel. Long enough that an
 // ordinary reconnect — cloudflared's first backoff is a second — is over
@@ -436,7 +440,7 @@ func (b *Backend) Reconnect(ctx context.Context) error {
 // resume — the one hint tunnel.pizza reads (see Spec.RecordID). Env mirror:
 // LIBTUNNEL__CLOUDFLARE_RECORD_ID.
 func (b *Backend) WithRecordID(record string) *Backend {
-	b.fields.RecordID = record
+	b.fields.WithMeta(RecordIDKey, record)
 	return b
 }
 
@@ -726,7 +730,8 @@ func (b *Backend) hint() (*Spec, error) {
 	}
 
 	fields := b.fields
-	stringEnv(v1.CloudflareRecordIDEnv, &fields.RecordID)
+	record := fields.RecordID()
+	stringEnv(v1.CloudflareRecordIDEnv, &record)
 	stringEnv(v1.CloudflareIDEnv, &fields.ID)
 	stringEnv(v1.CloudflareNameEnv, &fields.Name)
 	stringEnv(v1.CloudflareHostnameEnv, &fields.Hostname)
@@ -738,7 +743,9 @@ func (b *Backend) hint() (*Spec, error) {
 		}
 		fields.Secret = secret
 	}
-	stringField(fields.RecordID, &base.RecordID)
+	if record != "" {
+		base.WithMeta(RecordIDKey, record)
+	}
 	stringField(fields.ID, &base.ID)
 	stringField(fields.Name, &base.Name)
 	stringField(fields.Hostname, &base.Hostname)

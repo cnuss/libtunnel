@@ -318,7 +318,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	attempts := 0
 	var record string
 	if p.hint != nil {
-		record = p.hint.RecordID
+		record = p.hint.RecordID()
 	}
 	// Each class keeps its own clock, started at its first failure, so a mint
 	// that hits a rate limit and then a flaky resolver is not charged twice
@@ -349,7 +349,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			record = res.record
 		}
 		if res.spec != nil {
-			res.spec.RecordID = record
+			res.spec.WithMeta(RecordIDKey, record)
 			minted = res.spec
 		}
 		if err == nil {

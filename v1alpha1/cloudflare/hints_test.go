@@ -24,14 +24,17 @@ import (
 
 // known is a spec with every field set, so one assertion covers every hint
 // header the mint request carries.
-var known = &Spec{
-	RecordID:   "rec-1",
-	ID:         "id-1",
-	Name:       "name-1",
-	Hostname:   "known.tunneled.pizza",
-	AccountTag: "tag-1",
-	Secret:     []byte("secret-1"),
-}
+var known = func() *Spec {
+	s := &Spec{
+		ID:         "id-1",
+		Name:       "name-1",
+		Hostname:   "known.tunneled.pizza",
+		AccountTag: "tag-1",
+		Secret:     []byte("secret-1"),
+	}
+	s.WithMeta(RecordIDKey, "rec-1")
+	return s
+}()
 
 func envelope(t *testing.T, spec *Spec) string {
 	t.Helper()
@@ -67,7 +70,7 @@ func echoServer(t *testing.T) *httptest.Server {
 func wantHints(t *testing.T, seen http.Header, want *Spec) {
 	t.Helper()
 	for header, value := range map[string]string{
-		"X-Record-Id":   want.RecordID,
+		"X-Record-Id":   want.RecordID(),
 		"X-Id":          want.ID,
 		"X-Name":        want.Name,
 		"X-Hostname":    want.Hostname,
@@ -163,7 +166,7 @@ func TestCompleteFieldSetMintsWithHints(t *testing.T) {
 		t.Fatal("mint never called; a complete field set must still mint")
 	}
 	want := *known
-	want.RecordID = ""
+	want.WithMeta(RecordIDKey, "")
 	wantHints(t, seen, &want)
 	wantMinted(t, spec)
 }
@@ -237,7 +240,7 @@ func TestAdoptedSpecUnreachableFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spec() = %v, want the adopted spec when the provider cannot be reached", err)
 	}
-	if spec.Hostname != known.Hostname || spec.ID != known.ID || spec.RecordID != known.RecordID {
+	if spec.Hostname != known.Hostname || spec.ID != known.ID || spec.RecordID() != known.RecordID() {
 		t.Errorf("spec = %+v, want the adopted one verbatim", spec)
 	}
 }
