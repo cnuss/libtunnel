@@ -336,9 +336,9 @@ func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server) string {
 // TestProxyRelaysVerbatim pins what the proxy owes the one origin it fronts:
 // the request as it arrived — path, query, inbound Host, and headers a browser
 // sends on a navigation — and the response as the origin wrote it, with
-// nothing added. Routing between services behind the hostname is the
-// caller's (#257), so a bare numeric parameter is application data, a
-// Referer routes nothing, and no cookie is ever set.
+// nothing added. The proxy fronts exactly one origin, so a bare numeric
+// parameter is application data, a Referer routes nothing, and no cookie is
+// ever set.
 func TestProxyRelaysVerbatim(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%s|%s|%s", r.Host, r.URL.Path, r.URL.RawQuery)

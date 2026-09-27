@@ -136,8 +136,11 @@ func (t *TunnelImpl[T]) WithLocalURL(u *url.URL) v1.Tunnel {
 // scheme+host+"/" — the form provideURL and the engines consume. Shared by
 // WithLocalURL and the v1.LocalURLEnv override.
 func normalizeLocalURL(u *url.URL) (*url.URL, error) {
-	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	if u == nil || u.Host == "" {
 		return nil, fmt.Errorf("origin must be an http(s) URL with a host, got %v", u)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("origin must be an http(s) URL with a host, got scheme %q in %v", u.Scheme, u)
 	}
 	return &url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}, nil
 }
@@ -271,7 +274,8 @@ func (t *TunnelImpl[T]) ensureOrigin() {
 }
 
 // originURL blocks until an origin is provided and returns the URL it was
-// provided as — nil for a listener origin, or for a tunnel canceled first. The local-side getters branch on it before touching the listener.
+// provided as — nil for a listener origin, or for a tunnel canceled first.
+// The local-side getters branch on it before touching the listener.
 func (t *TunnelImpl[T]) originURL() *url.URL {
 	// The localURL field is only safe to read once originProvided is closed
 	// (the close is the happens-before edge for the write), so a cancellation

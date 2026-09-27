@@ -408,9 +408,8 @@ func TestWithLocalURLResolvesHost(t *testing.T) {
 
 // TestWithLocalURLInvalidCancels pins eager validation: a nil URL, a non-http
 // scheme, or a hostless URL cancels the tunnel instead of confusing the
-// backend later. A +ws / +wss suffix is one more unsupported scheme: it once
-// marked the origin owning WebSockets among several, and with one origin per
-// tunnel there is nothing left for it to mark (#257).
+// backend later. A scheme is http or https exactly, so one carrying a suffix
+// (http+ws) fails the same check.
 func TestWithLocalURLInvalidCancels(t *testing.T) {
 	for name, u := range map[string]*url.URL{
 		"nil":          nil,
@@ -558,19 +557,33 @@ func TestEnvLocalURLOverridesProvides(t *testing.T) {
 }
 
 // TestEnvLocalURLInvalidCancels pins loud failure for a bad override: the
-// provide slot is spent and the tunnel dies with the variable named.
+// provide slot is spent and the tunnel dies with the variable named, and with
+// the scheme it refused. The override is validated by the same check as a
+// WithLocalURL argument, so a suffixed scheme fails here as it does there.
 func TestEnvLocalURLInvalidCancels(t *testing.T) {
-	t.Setenv(v1.LocalURLEnv, "ftp://127.0.0.1:21")
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
-	tun.WithListener(listen(t))
+	for name, env := range map[string]string{
+		"badScheme": "ftp://127.0.0.1:21",
+		"wsSuffix":  "http+ws://localhost:5173",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(v1.LocalURLEnv, env)
+			tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+			tun.WithListener(listen(t))
 
-	select {
-	case <-tun.Done():
-		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), v1.LocalURLEnv) {
-			t.Errorf("Err() = %v, want a %s cause", err, v1.LocalURLEnv)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Done never closed for an invalid LIBTUNNEL_LOCAL_URL")
+			select {
+			case <-tun.Done():
+				err := tun.Err()
+				if err == nil || !strings.Contains(err.Error(), v1.LocalURLEnv) {
+					t.Errorf("Err() = %v, want a %s cause", err, v1.LocalURLEnv)
+				}
+				scheme, _, _ := strings.Cut(env, ":")
+				if err == nil || !strings.Contains(err.Error(), strconv.Quote(scheme)) {
+					t.Errorf("Err() = %v, want it to name the scheme %q", err, scheme)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Done never closed for an invalid LIBTUNNEL_LOCAL_URL")
+			}
+		})
 	}
 }
 
