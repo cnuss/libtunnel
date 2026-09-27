@@ -317,229 +317,31 @@ func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
 	}
 }
 
-// mustProxy interposes the reverse-proxy shim in front of the origin servers
-// (multiple origins get the ?n routing behavior) and returns the http:// base
-// URL a client dials.
-func mustProxy(t *testing.T, ctx context.Context, srvs ...*httptest.Server) string {
+// mustProxy interposes the reverse-proxy shim in front of the origin server
+// and returns the http:// base URL a client dials.
+func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server) string {
 	t.Helper()
-	origins := make([]*url.URL, len(srvs))
-	for i, srv := range srvs {
-		origin, err := url.Parse(srv.URL)
-		if err != nil {
-			t.Fatalf("parse origin url: %v", err)
-		}
-		origins[i] = origin
-	}
+	origin := mustURL(t, srv.URL)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := originRedirect(len(origins), newOriginProxy(origins, -1, logger, originTransport(origins)))
-	ps := &http.Server{Handler: handler}
+	ps := &http.Server{Handler: newOriginProxy(origin, logger, originTransport(origin))}
 	context.AfterFunc(ctx, func() { ps.Close() })
 	go ps.Serve(l)
 	return "http://" + l.Addr().String()
 }
 
-// TestMultiOriginRouting pins the multi-URL routing contract on the reverse
-// proxy: a bare numeric query param (?n, empty value) routes the request to
-// origins[n] and sets the sticky cookie; the sticky cookie routes param-less
-// requests; the routing param never reaches the origin; anything out of
-// range, non-numeric, or carrying a value falls through to origins[0].
-func TestMultiOriginRouting(t *testing.T) {
-	newEcho := func(name string) *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, "%s|%s", name, r.URL.RawQuery)
-		}))
-	}
-	a, b := newEcho("A"), newEcho("B")
-	defer a.Close()
-	defer b.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	base := mustProxy(t, ctx, a, b)
-
-	for name, tc := range map[string]struct {
-		path     string
-		cookie   string // inbound sticky cookie value; "" = none
-		referer  string // Referer header; a bare path is prefixed with base
-		dest     string // Sec-Fetch-Dest header; "" = not sent
-		upgrade  bool   // send a WebSocket handshake's Upgrade/Connection pair
-		wantBody string // "<origin name>|<forwarded raw query>"
-		wantSet  string // expected Set-Cookie value; "" = no Set-Cookie
-	}{
-		"naked":                  {path: "/", wantBody: "A|"},
-		"explicitSecond":         {path: "/?1", wantBody: "B|", wantSet: "1"},
-		"explicitKeepsOthers":    {path: "/?1&x=y", wantBody: "B|x=y", wantSet: "1"},
-		"valuedParamNotRouting":  {path: "/?1=foo", wantBody: "A|1=foo"},
-		"nonNumericNotRouting":   {path: "/?abc", wantBody: "A|abc"},
-		"stickyCookie":           {path: "/", cookie: "1", wantBody: "B|"},
-		"explicitBeatsCookie":    {path: "/?0", cookie: "1", wantBody: "A|", wantSet: "0"},
-		"outOfRangeFallsBack":    {path: "/?9", wantBody: "A|", wantSet: "0"},
-		"garbageCookieFallsBack": {path: "/", cookie: "x", wantBody: "A|"},
-
-		// Referer routing: a same-host referer whose query carries the bare
-		// parameter routes the request — an iframe's (or page's) subresources
-		// follow their document URL without touching the shared cookie.
-		"refererRoutesSubresource": {path: "/asset.js", referer: "/?1", wantBody: "B|"},
-		"refererBeatsCookie":       {path: "/", cookie: "0", referer: "/?1", wantBody: "B|"},
-		"paramBeatsReferer":        {path: "/?0", referer: "/?1", wantBody: "A|", wantSet: "0"},
-		"crossHostRefererIgnored":  {path: "/", referer: "https://evil.example/?1", wantBody: "A|"},
-		"valuedRefererNotRouting":  {path: "/", referer: "/?1=foo", wantBody: "A|"},
-
-		// The sticky cookie is a top-level concern: an explicit pick inside an
-		// iframe must not churn the tab-wide jar (two side-by-side iframes
-		// would fight over it).
-		"iframeExplicitNoSticky":   {path: "/?1", dest: "iframe", wantBody: "B|"},
-		"documentExplicitStickies": {path: "/?1", dest: "document", wantBody: "B|", wantSet: "1"},
-
-		// A WebSocket handshake carries no Sec-Fetch-Dest at all, which the
-		// sticky-cookie branch used to read as "a top-level navigation" (the
-		// empty case is there for curl and pre-2020 browsers). A socket is
-		// not a navigation: it must route on its own ?n but leave the
-		// tab-wide cookie alone, or the last socket to connect re-pins every
-		// later parameter-less request (#159).
-		"websocketExplicitNoSticky": {path: "/sock?1", upgrade: true, wantBody: "B|"},
-		"websocketFollowsCookie":    {path: "/sock", cookie: "1", upgrade: true, wantBody: "B|"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			req, err := http.NewRequest("GET", base+tc.path, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if tc.cookie != "" {
-				req.AddCookie(&http.Cookie{Name: originCookie, Value: tc.cookie})
-			}
-			if tc.referer != "" {
-				ref := tc.referer
-				if !strings.HasPrefix(ref, "http") {
-					ref = base + ref
-				}
-				req.Header.Set("Referer", ref)
-			}
-			if tc.dest != "" {
-				req.Header.Set("Sec-Fetch-Dest", tc.dest)
-			}
-			if tc.upgrade {
-				req.Header.Set("Connection", "Upgrade")
-				req.Header.Set("Upgrade", "websocket")
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer resp.Body.Close()
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(body) != tc.wantBody {
-				t.Errorf("body = %q, want %q", body, tc.wantBody)
-			}
-			gotSet := ""
-			for _, c := range resp.Cookies() {
-				if c.Name == originCookie {
-					gotSet = c.Value
-				}
-			}
-			if gotSet != tc.wantSet {
-				t.Errorf("Set-Cookie %s = %q, want %q", originCookie, gotSet, tc.wantSet)
-			}
-		})
-	}
-}
-
-// TestMultiOriginRedirect pins the canonicalizing redirect that defends
-// referer routing against decay: a GET document/iframe navigation with no
-// routing parameter of its own but a same-host referer that carries one is
-// answered 307 to the same URL plus that parameter — the new document's URL
-// re-pins the origin, so its own subresources keep routing. Everything else
-// passes through to the proxy.
-func TestMultiOriginRedirect(t *testing.T) {
-	newEcho := func(name string) *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, "%s|%s", name, r.URL.RawQuery)
-		}))
-	}
-	a, b := newEcho("A"), newEcho("B")
-	defer a.Close()
-	defer b.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	base := mustProxy(t, ctx, a, b)
-
-	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-
-	for name, tc := range map[string]struct {
-		method       string
-		path         string
-		referer      string // bare path, prefixed with base
-		dest         string
-		wantStatus   int
-		wantLocation string // when redirected
-		wantBody     string // when proxied
-	}{
-		"iframeNavRedirects":   {method: "GET", path: "/page2?x=y", referer: "/?1", dest: "iframe", wantStatus: 307, wantLocation: "/page2?x=y&1"},
-		"documentNavRedirects": {method: "GET", path: "/page2", referer: "/?1", dest: "document", wantStatus: 307, wantLocation: "/page2?1"},
-		"zeroIndexRedirects":   {method: "GET", path: "/page2", referer: "/?0", dest: "iframe", wantStatus: 307, wantLocation: "/page2?0"},
-		"explicitNoRedirect":   {method: "GET", path: "/page2?x=y&1", referer: "/?0", dest: "document", wantStatus: 200, wantBody: "B|x=y"},
-		"noDestNoRedirect":     {method: "GET", path: "/page2?x=y", referer: "/?1", dest: "", wantStatus: 200, wantBody: "B|x=y"},
-		"postNoRedirect":       {method: "POST", path: "/submit", referer: "/?1", dest: "document", wantStatus: 200, wantBody: "B|"},
-		"noRefererNoRedirect":  {method: "GET", path: "/page2", referer: "", dest: "document", wantStatus: 200, wantBody: "A|"},
-
-		// A path opening "//" (or the backslash variant browsers normalize to
-		// it) would echo into Location as a scheme-relative absolute URL — an
-		// open redirect. Those navigations proxy un-canonicalized instead.
-		"schemeRelativeNoRedirect": {method: "GET", path: "//evil.example/x", referer: "/?1", dest: "document", wantStatus: 200, wantBody: "B|"},
-		"backslashNoRedirect":      {method: "GET", path: "/\\evil.example/x", referer: "/?1", dest: "document", wantStatus: 200, wantBody: "B|"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			req, err := http.NewRequest(tc.method, base+tc.path, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if tc.referer != "" {
-				req.Header.Set("Referer", base+tc.referer)
-			}
-			if tc.dest != "" {
-				req.Header.Set("Sec-Fetch-Dest", tc.dest)
-			}
-			resp, err := noFollow.Do(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != tc.wantStatus {
-				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
-			}
-			if tc.wantLocation != "" {
-				if got := resp.Header.Get("Location"); got != tc.wantLocation {
-					t.Errorf("Location = %q, want %q", got, tc.wantLocation)
-				}
-				return
-			}
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(body) != tc.wantBody {
-				t.Errorf("body = %q, want %q", body, tc.wantBody)
-			}
-		})
-	}
-}
-
-// TestSingleOriginIgnoresRoutingParams pins the single-URL fast path: no
-// query inspection, no cookie — a bare numeric param is application data and
-// forwards verbatim, exactly the pre-multi-URL behavior.
-func TestSingleOriginIgnoresRoutingParams(t *testing.T) {
+// TestProxyRelaysVerbatim pins what the proxy owes the one origin it fronts:
+// the request as it arrived — path, query, inbound Host, and headers a browser
+// sends on a navigation — and the response as the origin wrote it, with
+// nothing added. Routing between services behind the hostname is the
+// caller's (#257), so a bare numeric parameter is application data, a
+// Referer routes nothing, and no cookie is ever set.
+func TestProxyRelaysVerbatim(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "solo|%s", r.URL.RawQuery)
+		fmt.Fprintf(w, "%s|%s|%s", r.Host, r.URL.Path, r.URL.RawQuery)
 	}))
 	defer srv.Close()
 
@@ -547,12 +349,11 @@ func TestSingleOriginIgnoresRoutingParams(t *testing.T) {
 	defer cancel()
 	base := mustProxy(t, ctx, srv)
 
-	// A navigation-shaped request (referer + Sec-Fetch-Dest) must not trigger
-	// the canonicalizing redirect either — single origin has no routing at all.
-	req, err := http.NewRequest("GET", base+"/?1&x=y", nil)
+	req, err := http.NewRequest("GET", base+"/deep/path?1&x=y", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.Host = "example.tunnel.test"
 	req.Header.Set("Referer", base+"/?1")
 	req.Header.Set("Sec-Fetch-Dest", "iframe")
 	resp, err := http.DefaultClient.Do(req)
@@ -564,13 +365,14 @@ func TestSingleOriginIgnoresRoutingParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != "solo|1&x=y" {
-		t.Errorf("body = %q, want %q (query forwarded verbatim)", body, "solo|1&x=y")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (no redirect)", resp.StatusCode)
 	}
-	for _, c := range resp.Cookies() {
-		if c.Name == originCookie {
-			t.Errorf("unexpected Set-Cookie %s=%s on a single-origin proxy", c.Name, c.Value)
-		}
+	if want := "example.tunnel.test|/deep/path|1&x=y"; string(body) != want {
+		t.Errorf("body = %q, want %q (Host, path and query forwarded verbatim)", body, want)
+	}
+	if got := resp.Header.Values("Set-Cookie"); len(got) != 0 {
+		t.Errorf("Set-Cookie = %q, want none", got)
 	}
 }
 
@@ -1071,124 +873,6 @@ func TestReconnectTunnelShutdown(t *testing.T) {
 	// Caller passes a live ctx; the tunnel-context guard must still unblock.
 	if err := b.Reconnect(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Reconnect after tunnel shutdown: err = %v, want context.Canceled", err)
-	}
-}
-
-// TestWebSocketOriginRouting pins the +ws designation in the proxy (#159): a
-// handshake carries no Referer and no per-tab signal of any kind, so without a
-// declaration it can only be guessed at. With one, an operator-stated fact
-// beats the per-browser cookie guess — but never an explicit ?n, so a page
-// that carries its own index (and every iframe in a multiview panel) is
-// unaffected. Non-upgrade traffic ignores the designation entirely.
-func TestWebSocketOriginRouting(t *testing.T) {
-	newEcho := func(name string) *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, "%s|%s", name, r.URL.RawQuery)
-		}))
-	}
-	a, b := newEcho("A"), newEcho("B")
-	defer a.Close()
-	defer b.Close()
-
-	origins := []*url.URL{mustURL(t, a.URL), mustURL(t, b.URL)}
-	var logs strings.Builder
-	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	// origins[1] owns WebSockets.
-	ps := &http.Server{Handler: originRedirect(len(origins), newOriginProxy(origins, 1, logger, originTransport(origins)))}
-	context.AfterFunc(ctx, func() { ps.Close() })
-	go ps.Serve(l)
-	base := "http://" + l.Addr().String()
-
-	for name, tc := range map[string]struct {
-		path     string
-		cookie   string
-		upgrade  bool
-		wantBody string
-	}{
-		"unroutableSocketGoesToDeclaredOrigin": {path: "/hmr", upgrade: true, wantBody: "B|"},
-		"declarationBeatsCookie":               {path: "/hmr", cookie: "0", upgrade: true, wantBody: "B|"},
-		"explicitIndexBeatsDeclaration":        {path: "/sock?0", upgrade: true, wantBody: "A|"},
-		"plainRequestIgnoresDeclaration":       {path: "/page", wantBody: "A|"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			req, err := http.NewRequest("GET", base+tc.path, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if tc.cookie != "" {
-				req.AddCookie(&http.Cookie{Name: originCookie, Value: tc.cookie})
-			}
-			if tc.upgrade {
-				req.Header.Set("Connection", "Upgrade")
-				req.Header.Set("Upgrade", "websocket")
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer resp.Body.Close()
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(body) != tc.wantBody {
-				t.Errorf("body = %q, want %q", body, tc.wantBody)
-			}
-		})
-	}
-}
-
-// TestUnroutableWebSocketWarns pins the diagnosis (#159): with no declaration
-// and nothing to route on, the handshake still falls back to origin 0 — a
-// client explicit enough to be broken by a refusal is working by luck today —
-// but it says so, naming the socket and the fallback. Silence is the worst
-// available failure here: the page loads, the socket connects, the app
-// half-works, and the tunnel is the last thing anybody suspects.
-func TestUnroutableWebSocketWarns(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "origin")
-	}))
-	defer srv.Close()
-	origins := []*url.URL{mustURL(t, srv.URL), mustURL(t, srv.URL)}
-
-	var logs strings.Builder
-	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	ps := &http.Server{Handler: originRedirect(len(origins), newOriginProxy(origins, -1, logger, originTransport(origins)))}
-	context.AfterFunc(ctx, func() { ps.Close() })
-	go ps.Serve(l)
-
-	req, err := http.NewRequest("GET", "http://"+l.Addr().String()+"/hmr", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-
-	got := logs.String()
-	if !strings.Contains(got, "/hmr") {
-		t.Errorf("warning does not name the socket: %q", got)
-	}
-	if !strings.Contains(got, "+ws") {
-		t.Errorf("warning does not name its own fix (+ws): %q", got)
 	}
 }
 

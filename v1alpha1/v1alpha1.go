@@ -12,9 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
@@ -34,14 +32,6 @@ type Engine[T v1.Spec] interface {
 
 	// CACerts returns the trust roots for this backend's edge connections.
 	CACerts() []*x509.Certificate
-	// Proxy is the in-process reverse proxy that fronts the origin, live once
-	// the tunnel has connected. NewInterceptCtx seeds an interception's default
-	// handler from it (proxy the request to the origin). Nil before connect.
-	Proxy() *httputil.ReverseProxy
-	// Listener is the loopback listener the engine dials to reach Proxy — the
-	// proxy's own accept socket, not the origin. Surfaced to interceptors as
-	// InterceptCtx.Target. Nil before connect.
-	Listener() net.Listener
 	// WithListener mirrors the top-level mutator: the core hands the provided
 	// listener down when the tunnel's WithListener fires. It is invoked once,
 	// in its own goroutine, and blocks until the edge connection is up
@@ -50,12 +40,11 @@ type Engine[T v1.Spec] interface {
 	// t.Emit as EventEstablished, which is what URL and Ready wait on.
 	WithListener(t *TunnelImpl[T], l net.Listener) error
 	// WithLocalURL is WithListener's counterpart for URL origins: the core
-	// hands down the validated origin URLs (each scheme http/https, host set,
-	// path "/", at least one) when the tunnel's WithLocalURL fires. urls[0]
-	// is the default origin; more than one URL asks the engine for per-request
-	// routing (see v1.Tunnel.WithLocalURL). Same contract — invoked once, in
-	// its own goroutine, blocking until the edge connection is up.
-	WithLocalURL(t *TunnelImpl[T], urls []*url.URL) error
+	// hands down the validated origin URL (scheme http/https, host set, path
+	// "/") when the tunnel's WithLocalURL fires, and the engine forwards the
+	// hostname to it and nothing else. Same contract — invoked once, in its
+	// own goroutine, blocking until the edge connection is up.
+	WithLocalURL(t *TunnelImpl[T], u *url.URL) error
 	// Stopped closes once the engine has let go of the edge after the
 	// tunnel's context ended: its connections unregistered, so the edge
 	// stops routing to them, or the grace period spent trying. Nil before
@@ -85,10 +74,7 @@ func newImpl[T v1.Spec](backend v1.Backend[T]) *TunnelImpl[T] {
 		originProvided: make(chan struct{}),
 		established:    make(chan struct{}),
 		finished:       make(chan struct{}),
-		wsOrigin:       -1,
 	}
-	// Auto-assigned interceptor Priorities count down from the top of the range.
-	t.autoPriority.Store(math.MaxUint16)
 	return t
 }
 
@@ -171,17 +157,13 @@ type TunnelImpl[T v1.Spec] struct {
 
 	// originOnce guards the one-time origin provide: the first WithListener,
 	// WithLocalURL, or start-trigger mint wins and sets exactly one of
-	// listener / localURLs; a later provide of either kind is a double-provide
+	// listener / localURL; a later provide of either kind is a double-provide
 	// and cancels the tunnel. The originProvided close is the happens-before
 	// edge for reading both fields.
 	originOnce     sync.Once
 	listener       net.Listener
-	localURLs      []*url.URL
+	localURL       *url.URL
 	originProvided chan struct{}
-	// wsOrigin is the index of the origin declared to own WebSockets (the
-	// +ws scheme suffix, #159), or -1 for none. Written under originOnce
-	// beside localURLs, so originProvided is its happens-before edge too.
-	wsOrigin int
 
 	// userCtx is the caller's context, Background until WithContext replaces
 	// it — so URL always has one to wait on, and Background's nil Done never
@@ -202,17 +184,6 @@ type TunnelImpl[T v1.Spec] struct {
 
 	caCertsOnce sync.Once
 	caCerts     []*x509.Certificate
-
-	interceptorsMu sync.Mutex
-	interceptors   v1.Interceptors
-	// autoPriority hands out Priorities to interceptors registered with Priority
-	// 0 (unset). It starts at math.MaxUint16 and steps down, so an unprioritized
-	// interceptor sits at the low-precedence end (highest number) and a
-	// later-registered one steps toward higher precedence — later wins — while
-	// any explicit small Priority outranks them all. Lower Priority = higher
-	// precedence (evaluated first), AWS-ALB style. uint32 holds the uint16 range
-	// with headroom for the step-down arithmetic; it saturates at 0.
-	autoPriority atomic.Uint32
 
 	// established closes on the first EventEstablished — the public URL
 	// verified to work from here — which is what URL and Ready wait on. The

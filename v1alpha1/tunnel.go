@@ -6,11 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -104,140 +102,29 @@ func (t *TunnelImpl[T]) WithListener(l net.Listener) v1.Tunnel {
 	return t
 }
 
-// autoPriorityStep is how far the auto lane steps down per interceptor
-// registered with Priority 0 (unset). The counter starts at math.MaxUint16, so
-// unprioritized interceptors sit at the low-precedence end and a later-registered
-// one steps toward higher precedence — later wins.
-const autoPriorityStep = 10
-
-// nextAutoPriority returns the next auto-assigned Priority, stepping the counter
-// down by autoPriorityStep and saturating at 0 (its minimum) rather than
-// underflowing the unsigned counter.
-func (t *TunnelImpl[T]) nextAutoPriority() uint16 {
-	for {
-		cur := t.autoPriority.Load()
-		var next uint32
-		if cur > autoPriorityStep {
-			next = cur - autoPriorityStep
-		}
-		if t.autoPriority.CompareAndSwap(cur, next) {
-			return uint16(next)
-		}
-	}
-}
-
-// WithInterceptor registers an interceptor, keeping the registry ordered by
-// ascending Priority (ties in registration order) so Intercept's first-match
-// scan yields the lowest-Priority — highest-precedence — match. A Priority of 0
-// (unset) is auto-assigned from the top of the range downward, so later-
-// registered unprioritized interceptors win and any explicit Priority outranks
-// them. The stable sort preserves insertion order for equal Priorities. Safe to
-// call concurrently and after the tunnel is live (see v1.Tunnel.WithInterceptor).
-func (t *TunnelImpl[T]) WithInterceptor(interceptor v1.Interceptor) v1.Tunnel {
-	if interceptor.Priority == 0 {
-		interceptor.Priority = t.nextAutoPriority()
-	}
-	t.interceptorsMu.Lock()
-	defer t.interceptorsMu.Unlock()
-	t.interceptors = append(t.interceptors, interceptor)
-	sort.SliceStable(t.interceptors, func(i, j int) bool {
-		return t.interceptors[i].Priority < t.interceptors[j].Priority
-	})
-	return t
-}
-
-// Interceptors returns a snapshot of the registry in precedence order (ascending
-// Priority, ties in registration order) — the order Intercept consults them.
-// It's a defensive copy: mutating the returned slice does not affect the live
-// registry (Interceptor is a value type; its func fields are immutable
-// references). If Interceptor ever gains a reference-type field, deep-copy it here.
-func (t *TunnelImpl[T]) Interceptors() v1.Interceptors {
-	t.interceptorsMu.Lock()
-	defer t.interceptorsMu.Unlock()
-	out := make(v1.Interceptors, len(t.interceptors))
-	copy(out, t.interceptors)
-	return out
-}
-
-// Intercept resolves the handler for a request through the interceptor
-// registry. The lowest-Priority (highest-precedence) interceptor whose Match
-// returns true runs (ties by registration order — the registry is kept sorted),
-// given the InterceptCtx (which carries the request and the default origin-proxy
-// handler); it shapes the response by calling ctx.WithHandler and returns the
-// ctx. When nothing matches — or an interceptor returns nil — the ctx's default
-// handler (proxy to the origin) stands. The registry lock is held only across
-// the match scan, not the interceptor. The returned handler is the one the
-// engine serves.
-func (t *TunnelImpl[T]) Intercept(ctx v1.InterceptCtx) http.HandlerFunc {
-	t.interceptorsMu.Lock()
-	var interceptor v1.InterceptFn
-	for _, item := range t.interceptors {
-		if item.Match(ctx.Request()) {
-			interceptor = item.Handler
-			break
-		}
-	}
-	t.interceptorsMu.Unlock()
-
-	if interceptor == nil {
-		return ctx.Handler()
-	}
-	if out := interceptor(ctx); out != nil {
-		return out.Handler()
-	}
-	return ctx.Handler()
-}
-
-// WithLocalURL provides the local origin as the URL(s) of already-running
-// local services and lazily starts the edge connection — the cloudflared
-// `tunnel --url` shape. Only the scheme and host of each URL are kept: the
-// scheme (http or https) declares how that origin is dialed, superseding the
-// backend's WithTLS, and path/query/user info are dropped. No URLs, a nil
-// URL, a scheme other than http/https, or an empty host cancels the tunnel.
-// urls[0] is the default origin; more than one URL adds per-request ?n
-// routing in the engine's reverse proxy (see v1.Tunnel.WithLocalURL).
+// WithLocalURL provides the local origin as the URL of an already-running
+// local service and lazily starts the edge connection — the cloudflared
+// `tunnel --url` shape. Only the scheme and host of the URL are kept: the
+// scheme (http or https) declares how the origin is dialed, superseding the
+// backend's WithTLS, and path/query/user info are dropped. A nil URL, a
+// scheme other than http/https, or an empty host cancels the tunnel. The
+// hostname reaches this one URL and nothing else (see v1.Tunnel.WithLocalURL).
 //
 // The origin is provided exactly once, shared with WithListener and the
 // start-trigger mint (see WithListener).
-func (t *TunnelImpl[T]) WithLocalURL(urls ...*url.URL) v1.Tunnel {
+func (t *TunnelImpl[T]) WithLocalURL(u *url.URL) v1.Tunnel {
 	provided := false
 	t.originOnce.Do(func() {
 		provided = true
 		if t.provideFromEnv() {
 			return
 		}
-		if len(urls) == 0 {
-			t.cancel(fmt.Errorf("WithLocalURL: at least one URL is required"))
+		n, err := normalizeLocalURL(u)
+		if err != nil {
+			t.cancel(fmt.Errorf("WithLocalURL: %w", err))
 			return
 		}
-		normalized := make([]*url.URL, len(urls))
-		wsOrigin := -1
-		for i, u := range urls {
-			n, ws, err := normalizeLocalURL(u)
-			if err != nil {
-				t.cancel(fmt.Errorf("WithLocalURL: %w", err))
-				return
-			}
-			if ws {
-				if wsOrigin >= 0 {
-					// Two socket-owning origins are unroutable however they
-					// are spelled, so say so at parse time with both named
-					// rather than leave somebody debugging a half-working
-					// second app.
-					t.cancel(fmt.Errorf("WithLocalURL: only one origin may be marked +ws, got %s and %s",
-						normalized[wsOrigin].Host, n.Host))
-					return
-				}
-				wsOrigin = i
-			}
-			normalized[i] = n
-		}
-		// A lone origin routes nothing, so the marker designates nothing: inert
-		// rather than an error, since the same URL list is valid either way.
-		if len(normalized) > 1 {
-			t.wsOrigin = wsOrigin
-		}
-		t.provideURLs(normalized)
+		t.provideURL(n)
 	})
 	if !provided {
 		t.cancel(fmt.Errorf("WithLocalURL: origin already provided"))
@@ -248,44 +135,11 @@ func (t *TunnelImpl[T]) WithLocalURL(urls ...*url.URL) v1.Tunnel {
 // normalizeLocalURL validates a local origin URL and reduces it to
 // scheme+host+"/" — the form provideURL and the engines consume. Shared by
 // WithLocalURL and the v1.LocalURLEnv override.
-func normalizeLocalURL(u *url.URL) (*url.URL, bool, error) {
-	if u == nil {
-		return nil, false, fmt.Errorf("origin must be an http(s) URL with a host, got %v", u)
+func normalizeLocalURL(u *url.URL) (*url.URL, error) {
+	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("origin must be an http(s) URL with a host, got %v", u)
 	}
-	scheme, ws := splitWebSocketMarker(u.Scheme)
-	if (scheme != "http" && scheme != "https") || u.Host == "" {
-		return nil, false, fmt.Errorf("origin must be an http(s) URL with a host, got %v", u)
-	}
-	return &url.URL{Scheme: scheme, Host: u.Host, Path: "/"}, ws, nil
-}
-
-// splitWebSocketMarker separates the +ws / +wss suffix that declares an origin
-// as the one owning WebSockets (#159) from the scheme that dials it, reporting
-// whether the marker was present. The ws/wss half is deliberately ignored: the
-// suffix induces a designation, it does not describe transport, so the origin
-// is dialed by its base scheme exactly as an unmarked one is. The marker rides
-// on the scheme rather than sitting in a separate index knob so it cannot
-// drift out of sync with the origin list — reordering the origins moves the
-// designation with them.
-func splitWebSocketMarker(scheme string) (base string, marked bool) {
-	switch {
-	case strings.HasSuffix(scheme, "+wss"):
-		return strings.TrimSuffix(scheme, "+wss"), true
-	case strings.HasSuffix(scheme, "+ws"):
-		return strings.TrimSuffix(scheme, "+ws"), true
-	}
-	return scheme, false
-}
-
-// WebSocketOrigin reports the index of the origin declared to own WebSockets
-// and whether one was declared. It blocks until the origin is provided, like
-// the other origin-derived getters. Exposed for Engine implementations, which
-// route a handshake carrying no routing parameter of its own to it.
-func (t *TunnelImpl[T]) WebSocketOrigin() (int, bool) {
-	if !await(t.ctx, t.originProvided) {
-		return -1, false
-	}
-	return t.wsOrigin, t.wsOrigin >= 0
+	return &url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}, nil
 }
 
 // provideFromEnv applies the v1.LocalURLEnv override: set, it provides the
@@ -300,16 +154,14 @@ func (t *TunnelImpl[T]) provideFromEnv() bool {
 	}
 	parsed, err := url.Parse(env)
 	if err == nil {
-		// The env override is a single origin, so any +ws marker on it is
-		// inert — there is nothing to route between.
-		parsed, _, err = normalizeLocalURL(parsed)
+		parsed, err = normalizeLocalURL(parsed)
 	}
 	if err != nil {
 		t.cancel(fmt.Errorf("%s: %w", v1.LocalURLEnv, err))
 		return true
 	}
 	t.Logger().Info("local origin overridden from the environment", "var", v1.LocalURLEnv, "url", parsed.String())
-	t.provideURLs([]*url.URL{parsed})
+	t.provideURL(parsed)
 	return true
 }
 
@@ -334,16 +186,15 @@ func (t *TunnelImpl[T]) provide(l net.Listener, minted bool) {
 	t.start(func() error { return t.engine.WithListener(t, l) })
 }
 
-// provideURLs adopts urls (each already validated and reduced to
-// scheme+host+"/", at least one) as the local origin and starts the edge
-// connection — provide's counterpart for URL origins. It runs inside the
-// caller's originOnce.Do, so exactly once.
-func (t *TunnelImpl[T]) provideURLs(urls []*url.URL) {
-	t.Logger().Info("configuring tunnel with local origin URLs", "urls", urls)
-	t.localURLs = urls
+// provideURL adopts u (already validated and reduced to scheme+host+"/") as
+// the local origin and starts the edge connection — provide's counterpart for
+// URL origins. It runs inside the caller's originOnce.Do, so exactly once.
+func (t *TunnelImpl[T]) provideURL(u *url.URL) {
+	t.Logger().Info("configuring tunnel with local origin URL", "url", u)
+	t.localURL = u
 	close(t.originProvided)
 
-	t.start(func() error { return t.engine.WithLocalURL(t, urls) })
+	t.start(func() error { return t.engine.WithLocalURL(t, u) })
 }
 
 // start runs the connect sequence in the background: mint the spec, dial the
@@ -419,20 +270,16 @@ func (t *TunnelImpl[T]) ensureOrigin() {
 	})
 }
 
-// originURL blocks until an origin is provided and returns the default (first)
-// URL it was provided as — nil for a listener origin, or for a tunnel canceled
-// first. The local-side getters branch on it before touching the listener.
+// originURL blocks until an origin is provided and returns the URL it was
+// provided as — nil for a listener origin, or for a tunnel canceled first. The local-side getters branch on it before touching the listener.
 func (t *TunnelImpl[T]) originURL() *url.URL {
-	// The localURLs field is only safe to read once originProvided is closed
+	// The localURL field is only safe to read once originProvided is closed
 	// (the close is the happens-before edge for the write), so a cancellation
 	// wake returns nil instead of reading the field.
 	if !await(t.ctx, t.originProvided) {
 		return nil
 	}
-	if len(t.localURLs) == 0 {
-		return nil
-	}
-	return t.localURLs[0]
+	return t.localURL
 }
 
 // boundListener blocks until a listener is provided (via WithListener or a

@@ -16,7 +16,6 @@ import (
 	"errors"
 	"log/slog"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"time"
@@ -38,8 +37,8 @@ const (
 	// at full strength.
 	EventConnected EventKind = "connected"
 	// EventServing fires when the tunnel's own side is up: the in-process
-	// reverse proxy has begun serving, with the interceptor pipeline and the
-	// origin dial behind it, so a request that reached it would be answered.
+	// reverse proxy has begun serving, with the origin dial behind it, so a
+	// request that reached it would be answered.
 	// It follows the mint and precedes any edge connection registering — the
 	// local half is ready, the public half follows with EventConnected.
 	// Hostname is empty on it: the hostname is reported once the edge
@@ -447,8 +446,7 @@ type Backend[T Spec] interface {
 	// and blocks until the edge is re-established or ctx is done (returning
 	// ctx.Err()); pass a ctx with a deadline to bound the wait. It also returns
 	// if the tunnel itself shuts down while waiting. It is an error to call
-	// before the tunnel has connected. This is the same lever surfaced to
-	// interceptors as InterceptCtx.Reconnect.
+	// before the tunnel has connected.
 	Reconnect(ctx context.Context) error
 }
 
@@ -603,143 +601,23 @@ type Tunnel interface {
 	// WithLocalURL provides the local origin as the URL of an already-running
 	// local service (e.g. http://localhost:1234) and lazily starts the edge
 	// connection — the cloudflared `tunnel --url` shape. Only the scheme and
-	// host of each URL are used: the scheme (http or https) declares how that
+	// host of the URL are used: the scheme (http or https) declares how the
 	// origin is dialed, superseding the backend's WithTLS (which applies to
 	// listener origins only), and anything else (path, query, user info) is
-	// dropped. No URLs, a nil URL, a scheme other than http/https, or an
-	// empty host cancels the tunnel.
+	// dropped. A nil URL, a scheme other than http/https, or an empty host
+	// cancels the tunnel.
 	//
-	// One URL is the plain single-origin tunnel. More than one URL shares the
-	// tunnel hostname across origins, routed per request by a bare numeric
-	// query parameter: a request whose query carries ?n with no value (e.g.
-	// https://host/?1, or https://host/path?1&x=y) is proxied to u[n] and
-	// the routing parameter is dropped from the forwarded request. A
-	// parameter-less request follows, in order: a same-host Referer carrying
-	// the parameter (a routed page's assets, XHR, and iframes follow their
-	// document URL — side-by-side iframes of different origins work in one
-	// tab), then the sticky cookie set by an explicit top-level pick (so an
-	// address-bar follow-up stays put — switching back is an explicit ?0),
-	// then u[0]. A document navigation that resolves via Referer is
-	// redirected to carry the parameter explicitly, so routing survives link
-	// clicks inside a routed page. Out-of-range indexes fall back to u[0];
-	// parameters with values (?1=foo) are application data, never routing.
-	// Local-side getters (LocalURL, LocalIP, LocalPort) derive from u[0].
-	//
-	// A WebSocket handshake carries no Referer — it is not in the handshake
-	// header set — and no per-tab signal of any kind, so it cannot be routed
-	// from headers alone. A page you control can carry the index itself (new
-	// WebSocket("/sock" + location.search)); a third-party dev server's
-	// socket (HMR, a notebook kernel, a live-reload channel) cannot be told
-	// to. For that case, declare which origin owns WebSockets by marking its
-	// scheme — http+ws, http+wss, https+ws, https+wss:
-	//
-	//	tun.WithLocalURL(api, mustParse("http+ws://localhost:5173"))
-	//
-	// The ws/wss half is ignored: the suffix induces the designation, and the
-	// origin is dialed by its base scheme exactly as an unmarked one is. The
-	// marker rides on the URL rather than a separate index so it cannot drift
-	// out of sync with the origin list. At most one origin may carry it (two
-	// socket-owning origins are unroutable however they are spelled, so that
-	// fails at parse time with both named), it is inert with a single origin,
-	// and it applies only to handshakes. Precedence for a handshake: an
-	// explicit ?n, then the marked origin, then the sticky cookie, then u[0]
-	// — so a page carrying its own index, and every tile of a multiview
-	// panel, is unaffected. A handshake never writes the cookie, and one that
-	// cannot be routed at all is logged at warn rather than failing silently.
+	// The hostname reaches exactly this one URL: every request is relayed to
+	// it verbatim, inbound Host intact. A caller that wants several services
+	// behind one hostname, or a handler in front of its origin, serves that
+	// router itself and passes its URL (or a listener, via WithListener).
 	//
 	// The origin is provided exactly once — see WithListener, including the
-	// LIBTUNNEL_LOCAL_URL environment override, which supersedes these
-	// arguments too (with a single URL). A URL origin has no tunnel-owned
-	// listener: Listener must not be called (it cancels the tunnel), and
-	// Close is not the teardown path. To shut a URL-origin tunnel down, set a
-	// context with WithContext and cancel it; otherwise it runs until the
-	// process exits or the tunnel fails.
-	WithLocalURL(u ...*url.URL) Tunnel
-
-	// WithInterceptor registers an Interceptor (a Match predicate paired with an
-	// InterceptFn) in front of the in-process reverse proxy that fronts the
-	// origin. For every inbound request the tunnel walks its interceptors in
-	// registration order and runs the first whose Match returns true; requests
-	// that match none are proxied to the origin unchanged. May be called more
-	// than once to layer interceptors, and may be called after the tunnel is
-	// live. Bundling the pair in one value lets callers ship reusable
-	// interceptors as constructors — tun.WithInterceptor(addHeaders()). Returns
-	// the tunnel for chaining.
-	WithInterceptor(interceptor Interceptor) Tunnel
-
-	// Interceptors returns a snapshot of the registered interceptors in
-	// precedence order — ascending Priority, ties in registration order, the
-	// order requests are matched against. Any auto-assigned Priority (from a
-	// zero-Priority registration) is resolved in the returned values, for
-	// visibility into the effective ordering.
-	Interceptors() Interceptors
+	// LIBTUNNEL_LOCAL_URL environment override, which supersedes this
+	// argument too. A URL origin has no tunnel-owned listener: Listener must
+	// not be called (it cancels the tunnel), and Close is not the teardown
+	// path. To shut a URL-origin tunnel down, set a context with WithContext
+	// and cancel it; otherwise it runs until the process exits or the tunnel
+	// fails.
+	WithLocalURL(u *url.URL) Tunnel
 }
-
-// MatchFn reports whether an interceptor applies to a request. It runs on the
-// proxy goroutine for every inbound request, so it must be fast and must not
-// mutate r.
-type MatchFn = func(r *http.Request) bool
-
-// InterceptCtx is the per-request handle passed to an interceptor. It embeds the
-// request's context.Context (so it carries deadlines and cancellation and can be
-// passed anywhere a context is wanted), exposes the request and response writer,
-// and carries the handler that will serve the request — seeded to proxy the
-// origin. An interceptor shapes the response by calling WithHandler, and reaches
-// past the single request through the tunnel-level levers (Reconnect, Target).
-type InterceptCtx interface {
-	context.Context
-
-	// Reconnect forcefully cycles the engine's edge connection(s) and blocks
-	// until re-established or ctx is done (see Backend.Reconnect).
-	Reconnect(ctx context.Context) error
-	// Target is the loopback listener the engine dials to reach the origin
-	// proxy — the proxy's own accept socket, not the origin. An interceptor can
-	// cycle it (close to force the engine to re-dial).
-	Target() net.Listener
-
-	// WithHandler replaces the handler that will serve this request and returns
-	// the ctx for chaining. Unset, the handler proxies the request to the origin.
-	WithHandler(h http.HandlerFunc) InterceptCtx
-	// Handler is the handler currently set to serve the request.
-	Handler() http.HandlerFunc
-
-	// Writer is the response writer for the request.
-	Writer() http.ResponseWriter
-	// Request is the inbound request.
-	Request() *http.Request
-}
-
-// InterceptFn shapes how a matched request is served. It receives the request's
-// InterceptCtx — request, response writer, embedded context, and tunnel levers —
-// and returns a ctx whose Handler serves the request, typically the same ctx
-// after a WithHandler call. Returning the ctx unchanged (or nil) keeps the
-// default: the request is proxied to the origin, just as if nothing had matched.
-// So an interceptor can match broadly, inspect, and opt out per request.
-type InterceptFn = func(ctx InterceptCtx) InterceptCtx
-
-// Interceptor pairs a match predicate with the handler it selects.
-type Interceptor struct {
-	Match   MatchFn
-	Handler InterceptFn
-	// Priority orders interceptors when more than one could match, AWS-ALB style:
-	// the LOWEST Priority is consulted first, so it wins. Interceptors of equal
-	// Priority keep registration order.
-	//
-	// 0 is not a precedence — it is the zero value that means "unset". An unset
-	// Priority is auto-assigned from the top of the uint16 range downward, so
-	// unprioritized interceptors sit at the low-precedence end: a later-registered
-	// one wins over an earlier one, and any interceptor given an explicit Priority
-	// outranks them all.
-	//
-	// So 1 is the highest settable precedence and 65535 the lowest; larger =
-	// lower precedence. To pin an interceptor above every default, give it a
-	// small Priority (1); to make it a fallback, a large one.
-	Priority uint16
-}
-
-// Interceptors is the registry consulted per request, in precedence order: the
-// lowest-Priority Interceptor whose Match returns true wins (1 is highest, larger
-// is lower), ties broken by registration order. Priority 0 means unset — those
-// interceptors are auto-assigned from the top of the range down, so among them
-// the later-registered wins.
-type Interceptors = []Interceptor

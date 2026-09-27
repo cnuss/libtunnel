@@ -4,12 +4,8 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
-	"io"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/http/httptest"
-	"net/http/httputil"
 	"net/url"
 	"slices"
 	"strconv"
@@ -28,10 +24,8 @@ import (
 // immediately.
 type fakeEngine struct {
 	got         chan net.Listener
-	gotURL      chan []*url.URL
+	gotURL      chan *url.URL
 	spec        *cloudflare.Spec
-	proxy       *httputil.ReverseProxy
-	listener    net.Listener
 	reconnected bool
 	// tokens records every WithToken the tunnel forwarded, in order.
 	tokens []string
@@ -45,7 +39,7 @@ type fakeEngine struct {
 }
 
 func newFakeEngine(spec *cloudflare.Spec) *fakeEngine {
-	return &fakeEngine{got: make(chan net.Listener, 1), gotURL: make(chan []*url.URL, 1), spec: spec}
+	return &fakeEngine{got: make(chan net.Listener, 1), gotURL: make(chan *url.URL, 1), spec: spec}
 }
 
 func (e *fakeEngine) Name() string                                { return "fake" }
@@ -58,8 +52,6 @@ func (e *fakeEngine) WithToken(token string) v1.Backend[*cloudflare.Spec] {
 	return e
 }
 func (e *fakeEngine) Reconnect(context.Context) error { e.reconnected = true; return nil }
-func (e *fakeEngine) Proxy() *httputil.ReverseProxy   { return e.proxy }
-func (e *fakeEngine) Listener() net.Listener          { return e.listener }
 func (e *fakeEngine) Stopped() <-chan struct{}        { return e.stopped }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
@@ -68,8 +60,8 @@ func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l ne
 	}
 	return nil
 }
-func (e *fakeEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], urls []*url.URL) error {
-	e.gotURL <- urls
+func (e *fakeEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], u *url.URL) error {
+	e.gotURL <- u
 	if !e.manual {
 		t.Emit(v1.Event{Kind: v1.EventEstablished})
 	}
@@ -378,8 +370,8 @@ func TestWithLocalURLGettersDeriveFromURL(t *testing.T) {
 
 	select {
 	case got := <-engine.gotURL:
-		if len(got) != 1 || got[0].String() != "http://127.0.0.1:1234/" {
-			t.Errorf("engine received %v, want [http://127.0.0.1:1234/]", got)
+		if got.String() != "http://127.0.0.1:1234/" {
+			t.Errorf("engine received %v, want http://127.0.0.1:1234/", got)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("engine never received the origin URL")
@@ -388,71 +380,6 @@ func TestWithLocalURLGettersDeriveFromURL(t *testing.T) {
 	case l := <-engine.got:
 		t.Errorf("engine received listener %v for a URL origin", l.Addr())
 	default:
-	}
-}
-
-// TestWithLocalURLMultipleGettersUseFirst pins the multi-URL contract: the
-// local getters derive from the first URL (the default origin), and the
-// engine receives every URL, normalized, in argument order.
-func TestWithLocalURLMultipleGettersUseFirst(t *testing.T) {
-	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
-	conn := v1alpha1.New(engine).WithLocalURL(
-		&url.URL{Scheme: "http", Host: "127.0.0.1:1234"},
-		&url.URL{Scheme: "https", Host: "127.0.0.1:5678"},
-	)
-
-	if got := conn.LocalPort(); got != 1234 {
-		t.Errorf("LocalPort() = %d, want 1234 (the first URL's port)", got)
-	}
-	if got := conn.LocalURL(); got.String() != "http://127.0.0.1:1234/" {
-		t.Errorf("LocalURL() = %v, want http://127.0.0.1:1234/ (the first URL)", got)
-	}
-
-	select {
-	case got := <-engine.gotURL:
-		want := []string{"http://127.0.0.1:1234/", "https://127.0.0.1:5678/"}
-		if len(got) != len(want) {
-			t.Fatalf("engine received %d URLs, want %d", len(got), len(want))
-		}
-		for i, u := range got {
-			if u.String() != want[i] {
-				t.Errorf("engine URL[%d] = %v, want %v", i, u, want[i])
-			}
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("engine never received the origin URLs")
-	}
-}
-
-// TestWithLocalURLZeroURLsCancels pins eager validation of the variadic form:
-// no URLs is not an origin.
-func TestWithLocalURLZeroURLsCancels(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
-	tun.WithLocalURL()
-
-	select {
-	case <-tun.Done():
-		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "at least one URL") {
-			t.Errorf("Err() = %v, want the zero-URL validation failure", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Done never closed for a zero-URL WithLocalURL")
-	}
-}
-
-// TestWithLocalURLInvalidSecondCancels pins that every URL is validated, not
-// only the first.
-func TestWithLocalURLInvalidSecondCancels(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
-	tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"}, nil)
-
-	select {
-	case <-tun.Done():
-		if err := tun.Err(); err == nil || !strings.Contains(err.Error(), "http(s) URL") {
-			t.Errorf("Err() = %v, want the URL validation failure", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Done never closed for an invalid second origin URL")
 	}
 }
 
@@ -481,12 +408,16 @@ func TestWithLocalURLResolvesHost(t *testing.T) {
 
 // TestWithLocalURLInvalidCancels pins eager validation: a nil URL, a non-http
 // scheme, or a hostless URL cancels the tunnel instead of confusing the
-// backend later.
+// backend later. A +ws / +wss suffix is one more unsupported scheme: it once
+// marked the origin owning WebSockets among several, and with one origin per
+// tunnel there is nothing left for it to mark (#257).
 func TestWithLocalURLInvalidCancels(t *testing.T) {
 	for name, u := range map[string]*url.URL{
-		"nil":       nil,
-		"badScheme": {Scheme: "ftp", Host: "127.0.0.1:21"},
-		"noHost":    {Scheme: "http"},
+		"nil":          nil,
+		"badScheme":    {Scheme: "ftp", Host: "127.0.0.1:21"},
+		"noHost":       {Scheme: "http"},
+		"wsMarker":     {Scheme: "http+ws", Host: "127.0.0.1:5173"},
+		"wssMarkerTLS": {Scheme: "https+wss", Host: "127.0.0.1:5173"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
@@ -608,8 +539,8 @@ func TestEnvLocalURLOverridesProvides(t *testing.T) {
 
 			select {
 			case got := <-engine.gotURL:
-				if len(got) != 1 || got[0].String() != "http://127.0.0.1:4321/" {
-					t.Errorf("engine received %v, want the env override [http://127.0.0.1:4321/]", got)
+				if got.String() != "http://127.0.0.1:4321/" {
+					t.Errorf("engine received %v, want the env override http://127.0.0.1:4321/", got)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("engine never received the env origin URL")
@@ -911,8 +842,6 @@ func (failingEngine) Provider() v1.Provider[*cloudflare.Spec] {
 	return failingProvider{}
 }
 func (failingEngine) CACerts() []*x509.Certificate                    { return nil }
-func (failingEngine) Proxy() *httputil.ReverseProxy                   { return nil }
-func (failingEngine) Listener() net.Listener                          { return nil }
 func (failingEngine) Stopped() <-chan struct{}                        { return nil }
 func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]     { return e }
 func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return e }
@@ -921,7 +850,7 @@ func (failingEngine) Reconnect(context.Context) error                 { return n
 func (failingEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }
-func (failingEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], urls []*url.URL) error {
+func (failingEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], u *url.URL) error {
 	return nil
 }
 
@@ -959,237 +888,6 @@ func FuzzHostnameParsing(f *testing.F) {
 			t.Errorf("Port() = %d, out of range", port)
 		}
 	})
-}
-
-// --- interceptors ---
-
-// proxyEngine returns a fake engine whose Proxy serves a fixed body, so the
-// default (fall-through) handler NewInterceptCtx seeds has a real origin to hit.
-func proxyEngine(t *testing.T, body string) *fakeEngine {
-	t.Helper()
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, body)
-	}))
-	t.Cleanup(origin.Close)
-	u, err := url.Parse(origin.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	e := newFakeEngine(&cloudflare.Spec{})
-	e.proxy = httputil.NewSingleHostReverseProxy(u)
-	return e
-}
-
-// serveIntercept resolves req through tun's interceptor pipeline (built over
-// engine's InterceptCtx) and serves it, returning the recorded response.
-func serveIntercept(tun *v1alpha1.TunnelImpl[*cloudflare.Spec], engine *fakeEngine, req *http.Request) *httptest.ResponseRecorder {
-	rr := httptest.NewRecorder()
-	tun.Intercept(v1alpha1.NewInterceptCtx(engine, rr, req))(rr, req)
-	return rr
-}
-
-func TestInterceptFallsThroughToProxy(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-
-	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
-	if rr.Body.String() != "origin" {
-		t.Fatalf("body = %q, want %q (no interceptor → proxy)", rr.Body.String(), "origin")
-	}
-}
-
-func intercMark(s string) v1.InterceptFn {
-	return func(ctx v1.InterceptCtx) v1.InterceptCtx {
-		return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, s) })
-	}
-}
-
-// TestInterceptLaterDefaultWins: two Priority-0 interceptors are auto-assigned
-// from the top of the range downward, so the later-registered one has the lower
-// (higher-precedence) Priority and wins.
-func TestInterceptLaterDefaultWins(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-	always := func(*http.Request) bool { return true }
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("first")})
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("second")})
-
-	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
-	if rr.Body.String() != "second" {
-		t.Fatalf("body = %q, want %q (later default wins via auto Priority)", rr.Body.String(), "second")
-	}
-}
-
-// TestInterceptLowerPriorityWins: with ALB ordering the lowest Priority wins,
-// regardless of registration order.
-func TestInterceptLowerPriorityWins(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-	always := func(*http.Request) bool { return true }
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("low-prec"), Priority: 50})
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("high-prec"), Priority: 5})
-
-	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "high-prec" {
-		t.Fatalf("body = %q, want %q (lower Priority = higher precedence wins)", rr.Body.String(), "high-prec")
-	}
-}
-
-// TestInterceptExplicitBeatsDefault: any explicit Priority outranks an
-// auto-assigned default (which sits at the top of the range).
-func TestInterceptExplicitBeatsDefault(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-	always := func(*http.Request) bool { return true }
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("default")})                    // auto ~MaxUint16
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("explicit"), Priority: 40_000}) // still far below auto
-
-	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "explicit" {
-		t.Fatalf("body = %q, want %q (explicit Priority outranks an auto default)", rr.Body.String(), "explicit")
-	}
-}
-
-// TestInterceptorsAccessor: Interceptors() exposes the registry in precedence
-// order (ascending Priority), with auto-assigned Priorities resolved.
-func TestInterceptorsAccessor(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-	always := func(*http.Request) bool { return true }
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("d1")})                 // auto, top-down
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("mid"), Priority: 100}) // explicit mid
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("top"), Priority: 1})   // explicit top
-	tun.WithInterceptor(v1.Interceptor{Match: always, Handler: intercMark("d2")})                 // auto, below d1
-
-	got := tun.Interceptors()
-	if len(got) != 4 {
-		t.Fatalf("Interceptors() len = %d, want 4", len(got))
-	}
-	// Ascending Priority: top(1) < mid(100) < d2(auto) < d1(auto).
-	for i := 1; i < len(got); i++ {
-		if got[i-1].Priority > got[i].Priority {
-			t.Fatalf("Interceptors() not in ascending Priority order: %d then %d", got[i-1].Priority, got[i].Priority)
-		}
-	}
-	if got[0].Priority != 1 {
-		t.Errorf("first Priority = %d, want the explicit 1 (highest precedence)", got[0].Priority)
-	}
-	if got[0].Priority == 0 || got[len(got)-1].Priority == 0 {
-		t.Error("auto-assigned Priority should be resolved (non-zero) in the snapshot")
-	}
-}
-
-// TestInterceptWrapsDefaultHandler pins the README's middleware pattern: wrap
-// ctx.Handler() (the origin proxy) to add a response header, then serve it —
-// the header lands AND the origin body is relayed.
-func TestInterceptWrapsDefaultHandler(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-	tun.WithInterceptor(v1.Interceptor{
-		Match: func(*http.Request) bool { return true },
-		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
-			next := ctx.Handler()
-			return ctx.WithHandler(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("X-Served-By", "libtunnel")
-				next(w, r)
-			})
-		},
-	})
-
-	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
-	if got := rr.Header().Get("X-Served-By"); got != "libtunnel" {
-		t.Errorf("X-Served-By = %q, want the injected header", got)
-	}
-	if rr.Body.String() != "origin" {
-		t.Errorf("body = %q, want the origin body relayed through the wrapper", rr.Body.String())
-	}
-}
-
-func TestInterceptMatchPredicate(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-	tun.WithInterceptor(v1.Interceptor{
-		Match: func(r *http.Request) bool { return r.URL.Path == "/hooked" },
-		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
-			return ctx.WithHandler(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "hooked") })
-		},
-	})
-
-	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/hooked", nil)); rr.Body.String() != "hooked" {
-		t.Errorf("matching path body = %q, want %q", rr.Body.String(), "hooked")
-	}
-	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/other", nil)); rr.Body.String() != "origin" {
-		t.Errorf("non-matching path body = %q, want %q (fall-through)", rr.Body.String(), "origin")
-	}
-}
-
-// TestInterceptDeclineFallsThrough: a matched interceptor that inspects but
-// never calls WithHandler leaves the default (origin) handler in place.
-func TestInterceptDeclineFallsThrough(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-
-	inspected := false
-	tun.WithInterceptor(v1.Interceptor{
-		Match: func(*http.Request) bool { return true },
-		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
-			inspected = true
-			return ctx // no WithHandler → default stands
-		},
-	})
-
-	rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil))
-	if !inspected {
-		t.Fatal("interceptor never ran")
-	}
-	if rr.Body.String() != "origin" {
-		t.Fatalf("body = %q, want %q (decline → fall through)", rr.Body.String(), "origin")
-	}
-}
-
-// TestInterceptNilReturnFallsThrough: returning nil is equivalent to declining.
-func TestInterceptNilReturnFallsThrough(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	tun := v1alpha1.New(engine)
-	tun.WithInterceptor(v1.Interceptor{
-		Match:   func(*http.Request) bool { return true },
-		Handler: func(v1.InterceptCtx) v1.InterceptCtx { return nil },
-	})
-
-	if rr := serveIntercept(tun, engine, httptest.NewRequest("GET", "/", nil)); rr.Body.String() != "origin" {
-		t.Fatalf("body = %q, want %q (nil return → fall through)", rr.Body.String(), "origin")
-	}
-}
-
-// TestInterceptCtxExposesLevers: the ctx surfaces the request, the proxy
-// listener via Target, and reaches the engine's Reconnect.
-func TestInterceptCtxExposesLevers(t *testing.T) {
-	engine := proxyEngine(t, "origin")
-	l := listen(t)
-	engine.listener = l
-	tun := v1alpha1.New(engine)
-
-	var gotTarget net.Listener
-	var gotReq *http.Request
-	tun.WithInterceptor(v1.Interceptor{
-		Match: func(*http.Request) bool { return true },
-		Handler: func(ctx v1.InterceptCtx) v1.InterceptCtx {
-			gotTarget = ctx.Target()
-			gotReq = ctx.Request()
-			_ = ctx.Reconnect(ctx)
-			return ctx.WithHandler(func(http.ResponseWriter, *http.Request) {})
-		},
-	})
-
-	req := httptest.NewRequest("GET", "/x", nil)
-	serveIntercept(tun, engine, req)
-	if gotTarget != l {
-		t.Error("InterceptCtx.Target did not return the engine listener")
-	}
-	if gotReq != req {
-		t.Error("InterceptCtx.Request did not return the inbound request")
-	}
-	if !engine.reconnected {
-		t.Error("InterceptCtx.Reconnect did not reach the engine")
-	}
 }
 
 // TestWithContextAlreadyCanceledCancelsSynchronously pins the fix for #153: a
@@ -1235,106 +933,6 @@ func TestWithContextAlreadyCanceledNeverReportsReady(t *testing.T) {
 	}
 	if u := conn.URL(); u != nil {
 		t.Errorf("URL() = %v, want nil", u)
-	}
-}
-
-// TestWithLocalURLWebSocketMarker pins the +ws origin designation (#159): the
-// suffix rides on the scheme so it cannot drift out of sync with the origin
-// list the way a separate index knob would, the origin is still dialed by its
-// base scheme, and the designated index is what the engine reads to route a
-// handshake that carries no routing parameter of its own.
-func TestWithLocalURLWebSocketMarker(t *testing.T) {
-	for name, scheme := range map[string]string{
-		"httpWs":   "http+ws",
-		"httpWss":  "http+wss",
-		"httpsWs":  "https+ws",
-		"httpsWss": "https+wss",
-	} {
-		t.Run(name, func(t *testing.T) {
-			engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
-			tun := v1alpha1.New(engine)
-			tun.WithLocalURL(
-				&url.URL{Scheme: "http", Host: "127.0.0.1:4000"},
-				&url.URL{Scheme: scheme, Host: "127.0.0.1:5173"},
-			)
-
-			// The ws/wss half is a designation, not a transport: the origin is
-			// dialed exactly as its base scheme says.
-			wantBase := "http"
-			if strings.HasPrefix(scheme, "https") {
-				wantBase = "https"
-			}
-			select {
-			case got := <-engine.gotURL:
-				if len(got) != 2 {
-					t.Fatalf("engine received %d URLs, want 2", len(got))
-				}
-				if got[1].Scheme != wantBase {
-					t.Errorf("designated origin scheme = %q, want the base %q", got[1].Scheme, wantBase)
-				}
-				if got[1].Host != "127.0.0.1:5173" {
-					t.Errorf("designated origin host = %q, want 127.0.0.1:5173", got[1].Host)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("engine never received the origin URLs")
-			}
-
-			if ix, ok := tun.WebSocketOrigin(); !ok || ix != 1 {
-				t.Errorf("WebSocketOrigin() = (%d, %t), want (1, true)", ix, ok)
-			}
-		})
-	}
-}
-
-// TestWithLocalURLNoWebSocketMarker pins the default: nothing designated, so
-// the engine keeps guessing exactly as it does today.
-func TestWithLocalURLNoWebSocketMarker(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
-	tun.WithLocalURL(
-		&url.URL{Scheme: "http", Host: "127.0.0.1:4000"},
-		&url.URL{Scheme: "http", Host: "127.0.0.1:5173"},
-	)
-	if ix, ok := tun.WebSocketOrigin(); ok {
-		t.Errorf("WebSocketOrigin() = (%d, true), want no designation", ix)
-	}
-}
-
-// TestWithLocalURLTwoWebSocketMarkersCancel pins the parse-time rejection: two
-// socket-owning origins are unroutable however they are spelled, so the
-// failure names both instead of leaving somebody to debug a half-working
-// second app.
-func TestWithLocalURLTwoWebSocketMarkersCancel(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
-	tun.WithLocalURL(
-		&url.URL{Scheme: "http+ws", Host: "127.0.0.1:4000"},
-		&url.URL{Scheme: "https+wss", Host: "127.0.0.1:5173"},
-	)
-
-	select {
-	case <-tun.Done():
-		err := tun.Err()
-		if err == nil || !strings.Contains(err.Error(), "127.0.0.1:4000") || !strings.Contains(err.Error(), "127.0.0.1:5173") {
-			t.Errorf("Err() = %v, want both designated origins named", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Done never closed for two +ws origins")
-	}
-}
-
-// TestWithLocalURLSingleWebSocketMarkerInert pins the single-origin case: with
-// nothing to route between, the marker designates nothing and is accepted
-// rather than treated as a mistake.
-func TestWithLocalURLSingleWebSocketMarkerInert(t *testing.T) {
-	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
-	conn := v1alpha1.New(engine).WithLocalURL(&url.URL{Scheme: "http+ws", Host: "127.0.0.1:5173"})
-
-	select {
-	case <-conn.Done():
-		t.Fatalf("tunnel canceled for a lone +ws origin: %v", conn.Err())
-	case <-time.After(100 * time.Millisecond):
-	}
-	if got := conn.LocalURL(); got.String() != "http://127.0.0.1:5173/" {
-		t.Errorf("LocalURL() = %v, want the base scheme kept", got)
 	}
 }
 
