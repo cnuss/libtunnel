@@ -13,12 +13,10 @@ backend — Cloudflare quick tunnels first, driven entirely in-process (no
 
 The API is pure-lazy: every getter resolves on first use, and the edge
 connection starts on first demand — `WithListener` provides the origin
-listener explicitly, `WithLocalURL` points at one or more already-running
-local origins instead (the `cloudflared tunnel --url` shape; extra origins are
-reachable per request via a bare `?n` query parameter — assets and iframes
-follow their document URL via Referer, top-level visits stick via cookie),
-and `Listener`, `URL`, and `Ready` mint a loopback listener if no origin
-was provided.
+listener explicitly, `WithLocalURL` points at an already-running local
+origin instead (the `cloudflared tunnel --url` shape), and `Listener`, `URL`,
+and `Ready` mint a loopback listener if no origin was provided. Either way the
+hostname reaches exactly one origin.
 Configuration is write-once: each `With*` mutator takes effect at most once
 and is a no-op after its value is fixed, whether by an earlier call or by the
 tunnel's first use of the default.
@@ -126,17 +124,9 @@ type Tunnel interface {
     WithContext(ctx context.Context) Tunnel  // URL waits end-to-end, honors ctx
     WithToken(token string) Tunnel           // mint credential: Authorization: token <t>
     WithListener(l net.Listener) Tunnel      // bring your own listener
-    WithLocalURL(u ...*url.URL) Tunnel       // attach to running local origins
+    WithLocalURL(u *url.URL) Tunnel          // attach to a running local origin
                                              // (http://localhost:1234); mutually
-                                             // exclusive with WithListener; u[0]
-                                             // is the default, ?n routes to u[n]
-                                             // (sticky cookie, param dropped;
-                                             // WebSockets need the app's help
-                                             // — see below)
-
-    // hook requests in front of the origin proxy; layerable, not write-once
-    WithInterceptor(interceptor Interceptor) Tunnel
-    Interceptors() Interceptors // snapshot in precedence order (ascending Priority)
+                                             // exclusive with WithListener
 }
 
 type Provider[T Spec] interface { Spec(ctx context.Context) (T, error) }
@@ -205,156 +195,20 @@ Every class except `ErrClosed` answers `errors.Is(err, libtunnel.ErrFailed)`.
 Retries are bounded by class rather than by the caller's context, so a mint
 that can never succeed fails with a reason instead of hanging.
 
-## Multiple origins
+## One origin per hostname
 
-`WithLocalURL` takes more than one URL. `u[0]` is the default; a bare numeric
-query parameter picks another, is dropped from the forwarded request, and pins
-what follows:
+An in-process reverse proxy always fronts the origin, and it forwards to that
+one origin only: every request is relayed as it arrived — path, query, and the
+inbound `Host` intact — and every response as the origin wrote it. An `https`
+origin is dialed over TLS without verification, the same as cloudflared's own
+origin dial.
 
-```go
-conn := libtunnel.New(libtunnel.Cloudflare()).
-    WithLocalURL(api, admin) // https://<host>/ -> api, https://<host>/?1 -> admin
-```
-
-Resolution order per request: an explicit `?n`, then a same-host `Referer`
-carrying one (so a routed page's assets, XHR, and iframes follow their own
-document URL — side-by-side iframes of different origins work in one tab), then
-the sticky `libtunnel-origin` cookie set by an explicit top-level pick, then
-`u[0]`. A document navigation resolved via `Referer` is redirected to carry the
-parameter, so routing survives link clicks.
-
-**WebSockets are the exception.** A handshake carries no `Referer` — it is not
-in the handshake header set — so a socket opened without the parameter falls
-through to the cookie, which is per-browser, not per-tab or per-iframe. A page
-you control can carry the index itself:
-
-```js
-new WebSocket("wss://" + location.host + "/sock" + location.search)
-```
-
-A third-party dev server's socket (HMR, a notebook kernel, a live-reload
-channel) cannot be told to do that. For those, declare which origin owns
-WebSockets by marking its scheme — `http+ws`, `http+wss`, `https+ws`,
-`https+wss`:
-
-```go
-vite, _ := url.Parse("http+ws://localhost:5173")
-conn := libtunnel.New(libtunnel.Cloudflare()).WithLocalURL(api, vite)
-```
-
-The `ws`/`wss` half is ignored — the suffix induces the designation, and the
-origin is dialed by its base scheme exactly as an unmarked one is. The marker
-rides on the URL rather than a separate index knob so it cannot drift out of
-sync with the origin list: reorder the origins and the designation moves with
-them. At most one origin may carry it (two socket-owning origins are
-unroutable however they are spelled, so that fails at parse time with both
-named), and it is inert with a single origin.
-
-Precedence for a handshake is `?n` → the marked origin → cookie → `u[0]`: an
-explicit index still wins, so a page carrying its own — and every tile of a
-multiview panel — is unaffected, while an operator-stated fact beats the
-per-browser cookie guess. A handshake never writes the cookie, and a socket
-that cannot be routed at all is logged at warn naming its own fix, rather than
-silently connecting to the wrong origin and leaving the tunnel as the last
-thing anybody suspects.
-
-What this does not fix: two socket-using apps behind one tunnel. That needs an
-address the browser inherits on its own (a hostname per origin), which is a
-backend capability rather than something the proxy can synthesize.
-
-## Interceptors
-
-An in-process reverse proxy always fronts the origin. `WithInterceptor` hooks
-that path: for every request the tunnel runs the highest-`Priority` interceptor
-whose `MatchFn` returns true; anything unmatched is proxied to the origin
-unchanged. Ordering is AWS-ALB style: the **lowest** `Priority` wins — `1` is the
-highest precedence, `65535` the lowest. `Priority` 0 is not a precedence; it's
-the zero value meaning **unset**, and those are auto-assigned from the top of the
-`uint16` range downward, so unprioritized interceptors sit at the low-precedence
-end — a later-added one wins over an earlier one, and any explicit `Priority`
-outranks them all. Interceptors layer (call it more than once) and, unlike the
-write-once `With*` mutators, may be added after the tunnel is live.
-`tun.Interceptors()` returns the registry in precedence order for visibility.
-
-```go
-type MatchFn     = func(r *http.Request) bool
-type InterceptFn = func(ctx InterceptCtx) InterceptCtx
-
-// WithInterceptor takes an Interceptor — the {Match, Handler} pair — so reusable
-// interceptors ship as constructors: tun.WithInterceptor(addHeaders()).
-type Interceptor struct {
-    Match    MatchFn
-    Handler  InterceptFn
-    Priority uint16 // ALB-style: lowest wins (1 highest); 0 = unset, auto-assigned from the top down
-}
-
-// InterceptCtx is the per-request handle. It embeds the request's
-// context.Context and carries the request, the response writer, and the
-// handler that will serve it — seeded to proxy the origin.
-type InterceptCtx interface {
-    context.Context
-
-    Reconnect(ctx context.Context) error // cycle the edge conn(s), block until back up
-    Target() net.Listener                // the proxy's loopback socket (not the origin)
-
-    WithHandler(h http.HandlerFunc) InterceptCtx // replace the serving handler
-    Handler() http.HandlerFunc                   // the handler currently set
-
-    Writer() http.ResponseWriter
-    Request() *http.Request
-}
-```
-
-An `InterceptFn` receives the `InterceptCtx` and shapes how the request is
-served: call `WithHandler` to take it over, or return the ctx unchanged (or
-`nil`) to leave the default in place — the request is proxied to the origin,
-exactly as if nothing had matched. So an interceptor can match broadly, inspect,
-and opt out per request.
-
-Ship an interceptor as a constructor that returns an `Interceptor`. The common
-shape wraps the default handler (`ic.Handler()`, which proxies to the origin) —
-plain net/http middleware:
-
-```go
-// addHeader sets a response header on every request, then serves the origin.
-func addHeader(key, val string) libtunnel.Interceptor {
-    return libtunnel.Interceptor{
-        Match: func(*http.Request) bool { return true },
-        Handler: func(ic libtunnel.InterceptCtx) libtunnel.InterceptCtx {
-            next := ic.Handler() // the default: proxy to the origin
-            return ic.WithHandler(func(w http.ResponseWriter, r *http.Request) {
-                w.Header().Set(key, val)
-                next(w, r)
-            })
-        },
-    }
-}
-
-tun := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
-tun.WithInterceptor(addHeader("X-Served-By", "libtunnel"))
-```
-
-Reach past the request through the ctx levers — e.g. force an edge reconnect on
-`?watch=true`, then serve normally:
-
-```go
-func reconnectOnWatch() libtunnel.Interceptor {
-    return libtunnel.Interceptor{
-        Match: func(r *http.Request) bool { return r.URL.Query().Get("watch") == "true" },
-        Handler: func(ic libtunnel.InterceptCtx) libtunnel.InterceptCtx {
-            next := ic.Handler()
-            return ic.WithHandler(func(w http.ResponseWriter, r *http.Request) {
-                ctx, cancel := context.WithTimeout(ic, 30*time.Second)
-                defer cancel()
-                if err := ic.Reconnect(ctx); err != nil {
-                    return // request can't proceed — stop, no further writes
-                }
-                next(w, r)
-            })
-        },
-    }
-}
-```
+Several services behind one hostname, or a handler in front of the origin
+(headers, auth, rewrites), are the caller's to build: serve an
+`http.Handler` that routes or wraps as it likes, and hand the tunnel its
+address with `WithLocalURL` or its listener with `WithListener`. The tunnel
+knows nothing of what sits behind that address, so the rules stay the
+caller's own.
 
 ## Parent→child handoff
 

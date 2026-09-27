@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"log/slog"
 	"net"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
@@ -198,13 +197,11 @@ func (e loggerEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]     { return e 
 func (e loggerEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e loggerEngine) WithToken(string) v1.Backend[*cloudflare.Spec] { return e }
 func (loggerEngine) Reconnect(context.Context) error                 { return nil }
-func (loggerEngine) Proxy() *httputil.ReverseProxy                   { return nil }
-func (loggerEngine) Listener() net.Listener                          { return nil }
 func (loggerEngine) Stopped() <-chan struct{}                        { return nil }
 func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }
-func (e loggerEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], urls []*url.URL) error {
+func (e loggerEngine) WithLocalURL(t *v1alpha1.TunnelImpl[*cloudflare.Spec], u *url.URL) error {
 	return nil
 }
 

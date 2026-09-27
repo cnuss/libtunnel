@@ -24,7 +24,6 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -297,14 +296,10 @@ type Backend struct {
 	token string
 	// Runtime state wired at connect. reconnected feeds the supervisor's
 	// external-control channel, edge tracks edge connections, and reconnectCtx
-	// is the tunnel context Reconnect waits on; proxy is the origin reverse proxy
-	// and listener is the loopback socket cloudflared dials to reach it. All nil
-	// until connect runs.
+	// is the tunnel context Reconnect waits on. All nil until connect runs.
 	reconnected  chan supervisor.ReconnectSignal
 	edge         *edgeWatcher
 	reconnectCtx context.Context
-	proxy        *httputil.ReverseProxy
-	listener     net.Listener
 	// stopped closes once the supervisor has returned: its edge connections
 	// unregistered and closed, or the grace period spent. Nil until connect.
 	stopped chan struct{}
@@ -322,14 +317,6 @@ type Backend struct {
 	// succeed on the new connection anyway.
 	establishing atomic.Bool
 }
-
-// Proxy returns the origin reverse proxy (nil before connect). Implements the
-// v1alpha1 Engine contract.
-func (b *Backend) Proxy() *httputil.ReverseProxy { return b.proxy }
-
-// Listener returns the loopback listener cloudflared dials to reach the proxy
-// (nil before connect). Implements the v1alpha1 Engine contract.
-func (b *Backend) Listener() net.Listener { return b.listener }
 
 // Stopped closes once the edge has been let go of (nil before connect).
 // Implements the v1alpha1 Engine contract.
@@ -854,20 +841,20 @@ func (b *Backend) WithListener(t *v1alpha1.TunnelImpl[*Spec], l net.Listener) er
 	if b.tls {
 		scheme = "https"
 	}
-	return b.connect(t, []*url.URL{{Scheme: scheme, Host: l.Addr().String()}})
+	return b.connect(t, &url.URL{Scheme: scheme, Host: l.Addr().String()})
 }
 
-// WithLocalURL dials the Cloudflare edge and proxies it onto already-running
-// local origins. The URLs arrive validated and reduced to scheme+host by the
-// core, so each scheme — not WithTLS — declares how that origin is dialed.
-func (b *Backend) WithLocalURL(t *v1alpha1.TunnelImpl[*Spec], urls []*url.URL) error {
-	return b.connect(t, urls)
+// WithLocalURL dials the Cloudflare edge and proxies it onto an
+// already-running local origin. The URL arrives validated and reduced to
+// scheme+host by the core, so its scheme — not WithTLS — declares how the
+// origin is dialed.
+func (b *Backend) WithLocalURL(t *v1alpha1.TunnelImpl[*Spec], u *url.URL) error {
+	return b.connect(t, u)
 }
 
 // connect is the shared engine body behind WithListener and WithLocalURL:
-// originURLs are the local services the edge proxies to — originURLs[0] the
-// default, the rest reachable via ?n routing (see newOriginProxy).
-func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) error {
+// origin is the one local service the edge proxies to.
+func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error {
 	if b.envErr != nil {
 		return b.envErr
 	}
@@ -881,13 +868,11 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 	if err != nil {
 		return fmt.Errorf("reverse proxy: %w", err)
 	}
-	transport := originTransport(originURLs)
+	transport := originTransport(origin)
 	// Wire runtime state onto the backend: reconnected feeds the supervisor's
 	// external-control channel (see NewSupervisor below), edge counts Connected
-	// events via the Observer sink, reconnectCtx is the tunnel context, and
-	// proxy/listener back the Engine's Proxy/Listener (seeding each interception's
-	// default handler and Target). Once set, b.Reconnect and the interceptor
-	// pipeline are live.
+	// events via the Observer sink, and reconnectCtx is the tunnel context.
+	// Once set, b.Reconnect is live.
 	b.reconnected = make(chan supervisor.ReconnectSignal)
 	b.edge = newEdgeWatcher()
 	b.reconnectCtx = t.Context()
@@ -902,9 +887,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 			close(stopped)
 		}
 	}()
-	wsOrigin, _ := t.WebSocketOrigin()
-	b.proxy = newOriginProxy(originURLs, wsOrigin, t.Logger(), transport)
-	b.listener = l
+	proxy := newOriginProxy(origin, t.Logger(), transport)
 	// The loop-through's nonce: random per tunnel, so only this proxy's own
 	// verification requests short-circuit here and anything else carrying
 	// the header is forwarded like any request.
@@ -913,11 +896,8 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		return fmt.Errorf("loop-through nonce: %w", err)
 	}
 	loop := hex.EncodeToString(nonce)
-	handler := loopThrough(loop, originRedirect(len(originURLs), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Intercept(v1alpha1.NewInterceptCtx(b, w, r))(w, r)
-	})))
 	srv := &http.Server{
-		Handler: handler,
+		Handler: loopThrough(loop, proxy),
 		// Called once, on the serving goroutine, as Serve begins on l and
 		// before its first Accept — the one hook net/http offers for "now
 		// serving". The tunnel's context as the base means every request
@@ -934,7 +914,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], originURLs []*url.URL) 
 		srv.Close()
 	}()
 	go srv.Serve(l)
-	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origins", originURLs)
+	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origin", origin)
 	service := (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
 	ctx := t.Context()
 	log := zerologger(t.Logger())
@@ -1364,94 +1344,17 @@ const edgeBlockedHint = "your machine/network is getting its egress to the tunne
 	"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/ " +
 	"(WithEdgeProtocol pins the transport when only one of UDP or TCP is allowed)"
 
-// newOriginProxy builds the reverse proxy that always fronts the origins (see
-// connect, which serves it on a plaintext listener cloudflared dials). When an
-// origin scheme is https the Transport dials it over TLS with InsecureSkipVerify,
-// matching the engine's always-off origin verification. Every response is
-// relayed verbatim — status, headers, body untouched.
-//
-// With more than one origin the proxy routes per request, resolving the index
-// as: a bare numeric query parameter (?n, empty value, dropped from the
-// forwarded query), else — for a WebSocket handshake — the origin declared to
-// own WebSockets (wsOrigin, the +ws scheme marker, -1 for none), else a
-// same-host Referer carrying one (an iframe's or page's subresources follow
-// their document URL — per-tab, no shared state), else the sticky
-// originCookie, else originURLs[0]. The declaration sits above the cookie
-// deliberately: the cookie is a per-browser guess, the declaration an
-// operator-stated fact, and a fact beats a guess. It sits below an explicit
-// parameter so a page carrying its own index — and every tile of a multiview
-// panel — is unaffected. An explicit parameter on
-// a top-level navigation answers with the sticky cookie so parameter-less
-// follow-ups (an address-bar visit, a bookmark) stay on the same origin — an
-// iframe's pick does not, or side-by-side iframes would fight over the shared
-// jar. Anything out of range falls back to originURLs[0]. A single origin
-// skips all of it — the pre-routing proxy.
-func newOriginProxy(originURLs []*url.URL, wsOrigin int, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
-	p := &httputil.ReverseProxy{
+// newOriginProxy builds the reverse proxy that always fronts the origin (see
+// connect, which serves it on a plaintext listener cloudflared dials). When
+// the origin scheme is https the Transport dials it over TLS with
+// InsecureSkipVerify, matching the engine's always-off origin verification.
+// Every request goes to the one origin and every response is relayed
+// verbatim — status, headers, body untouched. Routing between several local
+// services is the caller's to do behind that origin, not the tunnel's.
+func newOriginProxy(origin *url.URL, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
-			origin := originURLs[0]
-			if len(originURLs) > 1 {
-				// A segment Atoi accepts is exactly a bare numeric parameter:
-				// valued ones ("1=foo") carry '=' and fail the parse. The first
-				// wins; every routing segment is dropped from the forward.
-				ix, explicit := 0, false
-				kept := make([]string, 0, 4)
-				for seg := range strings.SplitSeq(r.In.URL.RawQuery, "&") {
-					if n, err := strconv.Atoi(seg); err == nil {
-						if !explicit {
-							ix, explicit = n, true
-						}
-						continue
-					}
-					if seg != "" {
-						kept = append(kept, seg)
-					}
-				}
-				upgrade := r.In.Header.Get("Upgrade") != ""
-				if !explicit {
-					switch n, ok := refererIndex(r.In); {
-					case upgrade && wsOrigin >= 0:
-						// A handshake carries no Referer and no per-tab signal
-						// of any kind, so the declaration is the only thing
-						// that can route it.
-						ix = wsOrigin
-					case ok:
-						ix = n
-					default:
-						cookie, err := r.In.Cookie(originCookie)
-						if err == nil {
-							if n, err := strconv.Atoi(cookie.Value); err == nil {
-								ix = n
-							}
-						}
-						if upgrade && err != nil {
-							// Nothing to route on: no parameter, no
-							// declaration, no cookie. It still goes to origin
-							// 0 — a client explicit enough to be broken by a
-							// refusal is working by luck today — but silence
-							// here is the worst available failure: the page
-							// loads, the socket connects to the wrong origin,
-							// the app half-works, and the tunnel is the last
-							// thing anybody suspects (#159).
-							log.Warn("websocket could not be routed and fell back to the default origin; mark the origin that owns websockets with the +ws scheme suffix (http+ws://host)",
-								"url", r.In.URL.String(), "origin", originURLs[0].Redacted())
-						}
-					}
-				}
-				if ix < 0 || ix >= len(originURLs) {
-					ix = 0
-				}
-				origin = originURLs[ix]
-				r.Out.URL.RawQuery = strings.Join(kept, "&")
-				if explicit && navigation(r.In) {
-					// ModifyResponse below answers an explicit top-level pick
-					// with the sticky cookie; the outbound context carries the
-					// index over.
-					r.Out = r.Out.WithContext(context.WithValue(r.Out.Context(), stickyCookieKey{}, ix))
-				}
-				log.Debug("routing to origin", "ix", ix, "url", r.In.URL.String())
-			}
 			r.SetURL(origin)
 			// Preserve the inbound Host: the origin (e.g. an apiserver) may key
 			// on it, and the stdlib default would rewrite it to the origin host.
@@ -1459,112 +1362,13 @@ func newOriginProxy(originURLs []*url.URL, wsOrigin int, log *slog.Logger, trans
 		},
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelDebug),
 	}
-	if len(originURLs) > 1 {
-		p.ModifyResponse = func(resp *http.Response) error {
-			if ix, ok := resp.Request.Context().Value(stickyCookieKey{}).(int); ok {
-				cookie := &http.Cookie{Name: originCookie, Value: strconv.Itoa(ix), Path: "/"}
-				resp.Header.Add("Set-Cookie", cookie.String())
-			}
-			return nil
-		}
-	}
-	return p
 }
 
-// originRedirect canonicalizes referer-routed navigations onto an explicit ?n
-// URL, defending referer routing against decay: a GET/HEAD document or iframe
-// navigation with no routing parameter of its own but a same-host referer
-// that carries one (a link click inside a routed page) is answered 307 to the
-// same URL plus that parameter. The new document's URL then re-pins the
-// origin, so its own subresources — whose Referer is the new URL — keep
-// routing instead of falling back to the default. Redirected navigations
-// bypass the interceptor pipeline; everything else passes through. A single
-// origin passes everything through.
-func originRedirect(n int, next http.Handler) http.Handler {
-	if n < 2 {
-		return next
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		dest := r.Header.Get("Sec-Fetch-Dest")
-		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
-			(dest == "document" || dest == "iframe" || dest == "frame") {
-			if _, explicit := bareIndex(r.URL.RawQuery); !explicit {
-				// A path opening "//" (or "/\", which browsers normalize to
-				// it) would echo into Location as a scheme-relative absolute
-				// URL — an open redirect off the tunnel host. Those
-				// navigations proxy un-canonicalized.
-				if ix, ok := refererIndex(r); ok &&
-					!strings.HasPrefix(r.URL.Path, "//") && !strings.HasPrefix(r.URL.Path, "/\\") {
-					u := *r.URL
-					if u.RawQuery != "" {
-						u.RawQuery += "&"
-					}
-					u.RawQuery += strconv.Itoa(ix)
-					http.Redirect(w, r, u.RequestURI(), http.StatusTemporaryRedirect)
-					return
-				}
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// refererIndex resolves the routing index from a same-host Referer header:
-// the document URL of the page (or iframe) the request originates from, whose
-// query carries the bare ?n parameter. A cross-host referer never routes.
-func refererIndex(r *http.Request) (int, bool) {
-	ref, err := url.Parse(r.Header.Get("Referer"))
-	if err != nil || ref.Host != r.Host {
-		return 0, false
-	}
-	return bareIndex(ref.RawQuery)
-}
-
-// bareIndex scans a raw query for the first bare numeric segment — the ?n
-// routing directive. Valued parameters ("1=foo") carry '=' and fail the
-// parse: application data, never routing.
-func bareIndex(rawQuery string) (int, bool) {
-	for seg := range strings.SplitSeq(rawQuery, "&") {
-		if n, err := strconv.Atoi(seg); err == nil {
-			return n, true
-		}
-	}
-	return 0, false
-}
-
-// navigation reports whether a request is a top-level navigation — the only
-// kind whose explicit ?n pick may write the tab-wide sticky cookie.
-// Sec-Fetch-Dest names it outright in a modern browser; an absent header is
-// treated as one so a client that predates the header (curl, an old browser)
-// can still pin an origin. A WebSocket handshake is the exception that
-// forces the check: it carries no Sec-Fetch-Dest at all, so the absent case
-// used to catch every socket, letting whichever socket connected last re-pin
-// every later parameter-less request (#159). An upgrade is never a
-// navigation, whatever else it omits.
-func navigation(r *http.Request) bool {
-	if r.Header.Get("Upgrade") != "" {
-		return false
-	}
-	dest := r.Header.Get("Sec-Fetch-Dest")
-	return dest == "" || dest == "document"
-}
-
-// originCookie is the sticky-routing cookie a multi-origin proxy sets when a
-// request carries an explicit ?n routing parameter (see newOriginProxy).
-const originCookie = "libtunnel-origin"
-
-// stickyCookieKey carries an explicit routing pick from Rewrite to
-// ModifyResponse on the outbound request context.
-type stickyCookieKey struct{}
-
-// originTransport dials the origins, adding TLS (InsecureSkipVerify, matching
-// the engine's always-off origin verification) when any origin scheme is https
-// (the TLS config only engages on https dials, so http origins share it).
-func originTransport(originURLs []*url.URL) http.RoundTripper {
-	for _, u := range originURLs {
-		if u.Scheme == "https" {
-			return &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-		}
+// originTransport dials the origin, adding TLS (InsecureSkipVerify, matching
+// the engine's always-off origin verification) when its scheme is https.
+func originTransport(origin *url.URL) http.RoundTripper {
+	if origin.Scheme == "https" {
+		return &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 	return http.DefaultTransport
 }

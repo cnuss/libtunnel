@@ -16,11 +16,9 @@
 //
 // Everything is lazy: New returns immediately, and the edge connection starts
 // on first demand — WithListener provides the origin listener explicitly,
-// WithLocalURL points at one or more already-running local origins instead
-// (the cloudflared `tunnel --url` shape; extra origins are reachable per
-// request via a bare ?n query parameter — assets and iframes follow their
-// document URL via Referer, top-level visits stick via cookie), and Listener,
-// URL, and Ready mint a loopback listener if no origin was provided.
+// WithLocalURL points at an already-running local origin instead (the
+// cloudflared `tunnel --url` shape: the hostname reaches that one URL), and
+// Listener, URL, and Ready mint a loopback listener if no origin was provided.
 //
 //	l, _ := net.Listen("tcp", "127.0.0.1:0")
 //	conn := libtunnel.New(libtunnel.Cloudflare()).WithListener(l)
@@ -168,16 +166,6 @@ const (
 	EdgeQUIC  = cloudflare.EdgeQUIC  // UDP; the edge closes it when the tunnel goes away
 	EdgeHTTP2 = cloudflare.EdgeHTTP2 // TCP; works where UDP is dropped
 	EdgeAuto  = cloudflare.EdgeAuto  // cloudflared chooses, and falls back
-)
-
-// The interceptor types (see TunnelV1.WithInterceptor) are re-exported from v1
-// so callers can name them without importing v1.
-type (
-	MatchFn      = v1.MatchFn      // request predicate: does this interceptor apply
-	InterceptFn  = v1.InterceptFn  // shapes how a matched request is served
-	Interceptor  = v1.Interceptor  // a {Match, Handler} pair
-	Interceptors = v1.Interceptors // ordered registry; first match wins
-	InterceptCtx = v1.InterceptCtx // per-request handle: request, levers, handler
 )
 
 // The failure classes TunnelV1.Err reports (see v1.ErrFailed) are re-exported
