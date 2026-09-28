@@ -29,6 +29,9 @@ type fakeEngine struct {
 	reconnected bool
 	// tokens records every WithToken the tunnel forwarded, in order.
 	tokens []string
+	// headers records every WithHeader the tunnel forwarded, in order, as
+	// "key: value".
+	headers []string
 	// manual leaves EventEstablished to the test instead of firing it on
 	// connect, for the cases that observe the gap between the two.
 	manual bool
@@ -53,6 +56,7 @@ func (e *fakeEngine) WithToken(token string) v1.Backend[*cloudflare.Spec] {
 }
 func (e *fakeEngine) Reconnect(context.Context) error { e.reconnected = true; return nil }
 func (e *fakeEngine) Stopped() <-chan struct{}        { return e.stopped }
+func (e *fakeEngine) AddHeader(key, value string)     { e.headers = append(e.headers, key+": "+value) }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
 	if !e.manual {
@@ -856,6 +860,7 @@ func (failingEngine) Provider() v1.Provider[*cloudflare.Spec] {
 }
 func (failingEngine) CACerts() []*x509.Certificate                    { return nil }
 func (failingEngine) Stopped() <-chan struct{}                        { return nil }
+func (failingEngine) AddHeader(string, string)                        {}
 func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]     { return e }
 func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e failingEngine) WithToken(string) v1.Backend[*cloudflare.Spec] { return e }
@@ -1040,6 +1045,32 @@ func TestWithTokenForwardsOnce(t *testing.T) {
 	if got := late.tokens; len(got) != 0 {
 		t.Errorf("backend saw tokens %v after the spec fetch, want none", got)
 	}
+}
+
+// TestWithHeaderForwardsUntilTheSpecFetch pins the Tunnel-level header knob:
+// every WithHeader reaches the backend, in order and repeats included, until
+// the spec is fetched — the provider built from the backend's knobs — after
+// which a call has nothing to land on and forwards nothing. A tunnel with no
+// engine (a foreign backend, or From's failed placeholder) takes the call and
+// does nothing.
+func TestWithHeaderForwardsUntilTheSpecFetch(t *testing.T) {
+	eng := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	tun := v1alpha1.New(eng)
+	tun.WithHeader("User-Agent", "tunneld/v1").WithHeader("X-Opaque", "true").WithHeader("X-Opaque", "again")
+	want := []string{"User-Agent: tunneld/v1", "X-Opaque: true", "X-Opaque: again"}
+	if got := eng.headers; !slices.Equal(got, want) {
+		t.Fatalf("backend saw headers %q, want %q", got, want)
+	}
+
+	if got := tun.Hostname(); got != "demo.tunneled.pizza" {
+		t.Fatalf("Hostname = %q", got)
+	}
+	tun.WithHeader("X-Late", "true")
+	if got := eng.headers; !slices.Equal(got, want) {
+		t.Errorf("backend saw headers %q after the spec fetch, want still %q", got, want)
+	}
+
+	v1alpha1.Failed(errors.New("no backend")).WithHeader("User-Agent", "x")
 }
 
 // TestCancelIsDeliberate pins Cancel as the caller's clean shutdown: Done

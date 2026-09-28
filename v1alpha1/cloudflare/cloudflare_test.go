@@ -219,6 +219,26 @@ func TestWithHeaderSentToMint(t *testing.T) {
 	}
 }
 
+// TestAddHeaderIsWithHeader pins the engine-contract spelling: AddHeader, which
+// is how Tunnel.WithHeader reaches the backend, lands on the mint request
+// exactly as WithHeader does.
+func TestAddHeaderIsWithHeader(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b := New().WithProvider(srv.URL)
+	b.AddHeader("X-Opaque", "true")
+	if _, err := b.Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Get("X-Opaque"); got != "true" {
+		t.Errorf("X-Opaque = %q, want %q", got, "true")
+	}
+}
+
 // TestWithHeaderOverridesDefault pins that a caller User-Agent replaces the
 // default product token, rather than adding a second value, and the libtunnel
 // comment still follows it.

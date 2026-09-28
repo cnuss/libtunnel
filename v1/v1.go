@@ -580,6 +580,16 @@ type Tunnel interface {
 	// carries it, and a child's own mint sends its own. The LIBTUNNEL_TOKEN
 	// environment variable beats it.
 	WithToken(token string) Tunnel
+	// WithHeader adds a request header to the mint call the backend makes —
+	// the same header Backend-level setters add, reachable here for a tunnel
+	// whose backend the caller never held (From builds its own). Repeatable:
+	// calls accumulate, and repeating a key adds another value. For
+	// User-Agent the value replaces the product token and libtunnel's
+	// comment still follows it. It must be called before the first spec
+	// fetch, which fixes the mint request; a later call is a no-op. The
+	// backend's environment mirror for headers beats it per key. A backend
+	// that makes no mint call accepts and ignores it.
+	WithHeader(key, value string) Tunnel
 	// WithListener provides the local origin as a listener and lazily starts
 	// the edge connection. The origin scheme is not inferred from the
 	// listener — declare it on the backend with WithTLS / WithHTTP2 (both
