@@ -66,8 +66,8 @@ var cloudflaredVersion = func() string {
 
 // userAgent identifies this client in the reports it posts to a provider's
 // NEL collector — the field the Reporting API reserves for the browser's
-// User-Agent. The module version from the build info, so it tracks releases
-// rather than a constant.
+// User-Agent — and in the mint request to tunnel.pizza. The module version
+// from the build info, so it tracks releases rather than a constant.
 var userAgent = func() string {
 	version := "devel"
 	if bi, ok := debug.ReadBuildInfo(); ok {

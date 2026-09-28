@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -160,6 +161,14 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		token = v
 	}
 
+	// tunnel.pizza is libtunnel's own provider, so it hears which libtunnel is
+	// asking; any other endpoint speaks the trycloudflare protocol and is
+	// told a cloudflared, the client that protocol was built for.
+	agent := fmt.Sprintf("cloudflared/%s", cloudflaredVersion)
+	if u, err := url.Parse(endpoint); err == nil && u.Hostname() == "tunnel.pizza" {
+		agent = userAgent
+	}
+
 	client := http.Client{
 		// Reported to the provider the way a browser would: a 429, a
 		// timeout, a name that did not resolve, a certificate it would not
@@ -198,7 +207,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			return mintResult{}, fmt.Errorf("failed to create request: %w", err)
 		}
 		req.Header.Add("Content-Type", "application/json")
-		req.Header.Add("User-Agent", fmt.Sprintf("cloudflared/%s", cloudflaredVersion))
+		req.Header.Add("User-Agent", agent)
 		if token != "" {
 			req.Header.Set("Authorization", "token "+token)
 		}
