@@ -214,13 +214,14 @@ func TestWithHeaderSentToMint(t *testing.T) {
 	if seen.Get("Content-Type") != "application/json" {
 		t.Errorf("Content-Type = %q, want the default to stand", seen.Get("Content-Type"))
 	}
-	if !strings.HasPrefix(seen.Get("User-Agent"), "cloudflared/") {
-		t.Errorf("User-Agent = %q, want the cloudflared default", seen.Get("User-Agent"))
+	if got, want := seen.Get("User-Agent"), "cloudflared/"+cloudflaredVersion+" "+agentComment(); got != want {
+		t.Errorf("User-Agent = %q, want the cloudflared default %q", got, want)
 	}
 }
 
-// TestWithHeaderOverridesDefault pins that a caller header replaces the default
-// for its key (User-Agent here), rather than adding a second value.
+// TestWithHeaderOverridesDefault pins that a caller User-Agent replaces the
+// default product token, rather than adding a second value, and the libtunnel
+// comment still follows it.
 func TestWithHeaderOverridesDefault(t *testing.T) {
 	clearSpecEnv(t)
 	var seen http.Header
@@ -231,8 +232,8 @@ func TestWithHeaderOverridesDefault(t *testing.T) {
 	if _, err := New().WithProvider(srv.URL).WithHeader("User-Agent", "tush/1").Provider().Spec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := seen.Values("User-Agent"); len(got) != 1 || got[0] != "tush/1" {
-		t.Errorf("User-Agent = %v, want exactly [tush/1] (caller replaces the default)", got)
+	if got := seen.Values("User-Agent"); len(got) != 1 || got[0] != "tush/1 "+agentComment() {
+		t.Errorf("User-Agent = %v, want exactly [tush/1 %s] (caller replaces the product token)", got, agentComment())
 	}
 }
 

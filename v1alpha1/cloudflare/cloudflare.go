@@ -64,11 +64,11 @@ var cloudflaredVersion = func() string {
 	return "unknown"
 }()
 
-// userAgent identifies this client in the reports it posts to a provider's
-// NEL collector — the field the Reporting API reserves for the browser's
-// User-Agent — and in the mint request to tunnel.pizza. The module version
-// from the build info, so it tracks releases rather than a constant.
-var userAgent = func() string {
+// agentComment is the User-Agent comment every mint request ends with, and
+// what NEL reports posted to a provider's collector carry: which libtunnel
+// is asking, on what platform, whatever product token leads. The module
+// version from the build info, so it tracks releases rather than a constant.
+var agentComment = sync.OnceValue(func() string {
 	version := "devel"
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		for _, dep := range bi.Deps {
@@ -82,8 +82,8 @@ var userAgent = func() string {
 			}
 		}
 	}
-	return fmt.Sprintf("libtunnel/%s (%s/%s; %s)", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
-}()
+	return fmt.Sprintf("(libtunnel/%s; %s/%s; %s)", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+})
 
 // promMu serializes the prometheus.DefaultRegisterer swap below: cloudflared
 // registers metrics against the global registerer at construction, which
@@ -534,9 +534,9 @@ func (b *Backend) resolveEdgeProtocol() (EdgeProtocol, error) {
 // repeating a key adds another value. Env mirror: LIBTUNNEL__CLOUDFLARE_HEADERS,
 // a comma-separated K=V list, whose entries beat code per key. Applied over the
 // headers the mint sets itself (Content-Type, User-Agent) and over the hint
-// headers, so a caller may override any of
-// them — overriding User-Agent changes how the endpoint sees the
-// connector version.
+// headers, so a caller may override any of them. User-Agent is the exception
+// that keeps a part: the caller's value replaces the product token, and the
+// "(libtunnel/<version>; <os>/<arch>; <go>)" comment still follows it.
 func (b *Backend) WithHeader(key, value string) *Backend {
 	if b.headers == nil {
 		b.headers = http.Header{}
