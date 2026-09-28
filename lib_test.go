@@ -85,6 +85,31 @@ func TestFromEmptyMints(t *testing.T) {
 	}
 }
 
+// TestFromCarriesHeaders pins Tunnel.WithHeader through the façade: a tunnel
+// built by From, whose backend the caller never holds, still sends the header
+// on its mint, and a User-Agent replaces the product token ahead of
+// libtunnel's comment.
+func TestFromCarriesHeaders(t *testing.T) {
+	var seen http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"fresh.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv(v1.CloudflareProviderEnv, srv.URL)
+
+	tun := libtunnel.From("").WithHeader("User-Agent", "tunneld/test").WithHeader("X-Opaque", "true")
+	if got := tun.Hostname(); got != "fresh.tunneled.pizza" {
+		t.Fatalf("Hostname() = %q, want the mint's", got)
+	}
+	if got := seen.Get("User-Agent"); !strings.HasPrefix(got, "tunneld/test (") {
+		t.Errorf("User-Agent = %q, want the caller's product token first", got)
+	}
+	if got := seen.Get("X-Opaque"); got != "true" {
+		t.Errorf("X-Opaque = %q, want %q", got, "true")
+	}
+}
+
 func TestFromBadInput(t *testing.T) {
 	if err := libtunnel.From("{not json").Err(); err == nil {
 		t.Error("From(malformed) Err() = nil, want a parse error")

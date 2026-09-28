@@ -53,6 +53,11 @@ type Engine[T v1.Spec] interface {
 	// before exiting leaves no dead connections behind for the next
 	// connector on the same tunnel to be routed to.
 	Stopped() <-chan struct{}
+	// AddHeader adds a request header to the backend's mint call. The core
+	// calls it for each Tunnel.WithHeader until the spec fetch builds the
+	// provider, and never after, so a backend reads its headers once, there.
+	// A backend with no mint call ignores it.
+	AddHeader(key, value string)
 }
 
 // New returns an unstarted tunnel for the given backend, which also supplies
@@ -150,7 +155,12 @@ type TunnelImpl[T v1.Spec] struct {
 	// it to the backend; the spec fetch fixes the empty default so nothing
 	// lands on a provider already built.
 	tokenOnce sync.Once
-	backend   v1.Backend[T]
+	// headerMu guards headersFixed: WithHeader forwards to the engine while
+	// it is false, and the spec fetch sets it before building the provider,
+	// so a header either reaches the mint request or is dropped, never half.
+	headerMu     sync.Mutex
+	headersFixed bool
+	backend      v1.Backend[T]
 	// engine is backend asserted to the alpha contract, established once in
 	// New. Nil means a foreign backend — the tunnel is born canceled.
 	engine Engine[T]

@@ -43,6 +43,18 @@ func (t *TunnelImpl[T]) WithToken(token string) v1.Tunnel {
 	return t
 }
 
+// WithHeader forwards a mint request header to the engine, until the spec
+// fetch fixes the provider; after that it has nothing to land on and is a
+// no-op, as WithToken is. A foreign backend (no engine) ignores it.
+func (t *TunnelImpl[T]) WithHeader(key, value string) v1.Tunnel {
+	t.headerMu.Lock()
+	defer t.headerMu.Unlock()
+	if !t.headersFixed && t.engine != nil {
+		t.engine.AddHeader(key, value)
+	}
+	return t
+}
+
 // WithContext threads a caller context into the tunnel: URL honors it,
 // returning nil if the context is done before the tunnel is reachable. It is
 // also the tunnel's shutdown handle: canceling the context tears the tunnel
@@ -450,8 +462,11 @@ func (t *TunnelImpl[T]) Spec() T {
 			return
 		}
 		// The provider is built from the backend's knobs right here, so a
-		// WithToken after this point has nothing to land on.
+		// WithToken or WithHeader after this point has nothing to land on.
 		t.tokenOnce.Do(func() {})
+		t.headerMu.Lock()
+		t.headersFixed = true
+		t.headerMu.Unlock()
 		provider := t.backend.Provider()
 		// Providers that can log (retry warnings, rate limits) pick up the
 		// tunnel's logger here — they're built by the backend before any

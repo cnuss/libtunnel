@@ -551,6 +551,11 @@ func (b *Backend) WithHeader(key, value string) *Backend {
 	return b
 }
 
+// AddHeader is WithHeader for the core's engine contract: Tunnel.WithHeader
+// reaches the backend through it, so a tunnel built by From — whose backend
+// the caller never holds — can still carry headers on the mint.
+func (b *Backend) AddHeader(key, value string) { b.WithHeader(key, value) }
+
 // WithToken sets the credential the mint request carries, as "Authorization:
 // token <value>", so a provider that gates minting can tell who is asking.
 // Applied with the mint's own defaults (Content-Type, User-Agent), so an

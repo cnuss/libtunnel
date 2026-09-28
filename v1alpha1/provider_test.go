@@ -198,6 +198,7 @@ func (e loggerEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return e 
 func (e loggerEngine) WithToken(string) v1.Backend[*cloudflare.Spec] { return e }
 func (loggerEngine) Reconnect(context.Context) error                 { return nil }
 func (loggerEngine) Stopped() <-chan struct{}                        { return nil }
+func (loggerEngine) AddHeader(string, string)                        {}
 func (e loggerEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }
