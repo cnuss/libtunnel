@@ -64,11 +64,9 @@ var cloudflaredVersion = func() string {
 	return "unknown"
 }()
 
-// agentComment is the User-Agent comment every mint request ends with, and
-// what NEL reports posted to a provider's collector carry: which libtunnel
-// is asking, on what platform, whatever product token leads. The module
-// version from the build info, so it tracks releases rather than a constant.
-var agentComment = sync.OnceValue(func() string {
+// libtunnelVersion is this module's version from the build info, so the
+// User-Agent tracks releases rather than a constant.
+var libtunnelVersion = sync.OnceValue(func() string {
 	version := "devel"
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		for _, dep := range bi.Deps {
@@ -82,7 +80,14 @@ var agentComment = sync.OnceValue(func() string {
 			}
 		}
 	}
-	return fmt.Sprintf("(libtunnel/%s; %s/%s; %s)", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+	return version
+})
+
+// agentComment is the User-Agent comment every mint request ends with, and
+// what NEL reports posted to a provider's collector carry: which libtunnel
+// is asking, on what platform, whatever product token leads.
+var agentComment = sync.OnceValue(func() string {
+	return fmt.Sprintf("(libtunnel/%s; %s/%s; %s)", libtunnelVersion(), runtime.GOOS, runtime.GOARCH, runtime.Version())
 })
 
 // promMu serializes the prometheus.DefaultRegisterer swap below: cloudflared

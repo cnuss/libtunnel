@@ -168,11 +168,11 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	// other endpoint speaks the trycloudflare protocol and is told cloudflared,
 	// the client that protocol was built for. A caller's User-Agent takes the
 	// product token's place, and the libtunnel comment follows either way.
-	product := "cloudflared"
+	product := "cloudflared/" + cloudflaredVersion
 	if u, err := url.Parse(endpoint); err == nil && u.Hostname() == "tunnel.pizza" {
-		product = "libtunnel"
+		product = "libtunnel/" + libtunnelVersion()
 	}
-	agent := cmp.Or(p.Headers.Get("User-Agent"), product+"/"+cloudflaredVersion) + " " + agentComment()
+	agent := cmp.Or(p.Headers.Get("User-Agent"), product) + " " + agentComment()
 
 	client := http.Client{
 		// Reported to the provider the way a browser would: a 429, a
