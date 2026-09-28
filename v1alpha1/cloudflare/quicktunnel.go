@@ -88,7 +88,7 @@ type QuickTunnelProvider struct {
 	// applied over the headers set here
 	// (Content-Type, User-Agent), so a caller-supplied key replaces the
 	// default for that key — except User-Agent, where the caller's value
-	// replaces the product token and the libtunnel comment still follows.
+	// replaces the product token and the comment still follows.
 	// Nil adds nothing.
 	Headers http.Header
 	// Token rides the mint request as "Authorization: token <value>"
@@ -167,12 +167,18 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	// tunnel.pizza is libtunnel's own provider, so it is told libtunnel; any
 	// other endpoint speaks the trycloudflare protocol and is told cloudflared,
 	// the client that protocol was built for. A caller's User-Agent takes the
-	// product token's place, and the libtunnel comment follows either way.
+	// product token's place. The comment names libtunnel unless the product
+	// token already does.
 	product := "cloudflared/" + cloudflaredVersion
 	if u, err := url.Parse(endpoint); err == nil && u.Hostname() == "tunnel.pizza" {
 		product = "libtunnel/" + libtunnelVersion()
 	}
-	agent := cmp.Or(p.Headers.Get("User-Agent"), product) + " " + agentComment()
+	product = cmp.Or(p.Headers.Get("User-Agent"), product)
+	comment := "libtunnel/" + libtunnelVersion() + "; " + agentPlatform()
+	if strings.HasPrefix(product, "libtunnel/") {
+		comment = agentPlatform()
+	}
+	agent := product + " (" + comment + ")"
 
 	client := http.Client{
 		// Reported to the provider the way a browser would: a 429, a

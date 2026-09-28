@@ -214,7 +214,7 @@ func TestWithHeaderSentToMint(t *testing.T) {
 	if seen.Get("Content-Type") != "application/json" {
 		t.Errorf("Content-Type = %q, want the default to stand", seen.Get("Content-Type"))
 	}
-	if got, want := seen.Get("User-Agent"), "cloudflared/"+cloudflaredVersion+" "+agentComment(); got != want {
+	if got, want := seen.Get("User-Agent"), "cloudflared/"+cloudflaredVersion+" (libtunnel/"+libtunnelVersion()+"; "+agentPlatform()+")"; got != want {
 		t.Errorf("User-Agent = %q, want the cloudflared default %q", got, want)
 	}
 }
@@ -232,8 +232,27 @@ func TestWithHeaderOverridesDefault(t *testing.T) {
 	if _, err := New().WithProvider(srv.URL).WithHeader("User-Agent", "tush/1").Provider().Spec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := seen.Values("User-Agent"); len(got) != 1 || got[0] != "tush/1 "+agentComment() {
-		t.Errorf("User-Agent = %v, want exactly [tush/1 %s] (caller replaces the product token)", got, agentComment())
+	want := "tush/1 (libtunnel/" + libtunnelVersion() + "; " + agentPlatform() + ")"
+	if got := seen.Values("User-Agent"); len(got) != 1 || got[0] != want {
+		t.Errorf("User-Agent = %v, want exactly [%s] (caller replaces the product token)", got, want)
+	}
+}
+
+// TestUserAgentNamesLibtunnelOnce pins that a product token already naming
+// libtunnel (tunnel.pizza's default, or a caller's) leaves it out of the
+// comment, so the header does not say it twice.
+func TestUserAgentNamesLibtunnelOnce(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := New().WithProvider(srv.URL).WithHeader("User-Agent", "libtunnel/test").Provider().Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := seen.Get("User-Agent"), "libtunnel/test ("+agentPlatform()+")"; got != want {
+		t.Errorf("User-Agent = %q, want %q", got, want)
 	}
 }
 

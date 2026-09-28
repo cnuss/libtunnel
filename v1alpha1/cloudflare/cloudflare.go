@@ -83,11 +83,10 @@ var libtunnelVersion = sync.OnceValue(func() string {
 	return version
 })
 
-// agentComment is the User-Agent comment every mint request ends with, and
-// what NEL reports posted to a provider's collector carry: which libtunnel
-// is asking, on what platform, whatever product token leads.
-var agentComment = sync.OnceValue(func() string {
-	return fmt.Sprintf("(libtunnel/%s; %s/%s; %s)", libtunnelVersion(), runtime.GOOS, runtime.GOARCH, runtime.Version())
+// agentPlatform closes the User-Agent comment on every mint request and in
+// the NEL reports posted to a provider's collector: what the client runs on.
+var agentPlatform = sync.OnceValue(func() string {
+	return fmt.Sprintf("%s/%s; %s", runtime.GOOS, runtime.GOARCH, runtime.Version())
 })
 
 // promMu serializes the prometheus.DefaultRegisterer swap below: cloudflared
@@ -542,6 +541,8 @@ func (b *Backend) resolveEdgeProtocol() (EdgeProtocol, error) {
 // headers, so a caller may override any of them. User-Agent is the exception
 // that keeps a part: the caller's value replaces the product token, and the
 // "(libtunnel/<version>; <os>/<arch>; <go>)" comment still follows it.
+// The comment drops its libtunnel entry when the product token is already
+// libtunnel/….
 func (b *Backend) WithHeader(key, value string) *Backend {
 	if b.headers == nil {
 		b.headers = http.Header{}
