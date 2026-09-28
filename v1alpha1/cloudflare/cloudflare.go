@@ -64,11 +64,9 @@ var cloudflaredVersion = func() string {
 	return "unknown"
 }()
 
-// userAgent identifies this client in the reports it posts to a provider's
-// NEL collector — the field the Reporting API reserves for the browser's
-// User-Agent. The module version from the build info, so it tracks releases
-// rather than a constant.
-var userAgent = func() string {
+// libtunnelVersion is this module's version from the build info, so the
+// User-Agent tracks releases rather than a constant.
+var libtunnelVersion = sync.OnceValue(func() string {
 	version := "devel"
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		for _, dep := range bi.Deps {
@@ -82,8 +80,14 @@ var userAgent = func() string {
 			}
 		}
 	}
-	return fmt.Sprintf("libtunnel/%s (%s/%s; %s)", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
-}()
+	return version
+})
+
+// agentPlatform closes the User-Agent comment on every mint request and in
+// the NEL reports posted to a provider's collector: what the client runs on.
+var agentPlatform = sync.OnceValue(func() string {
+	return fmt.Sprintf("%s/%s; %s", runtime.GOOS, runtime.GOARCH, runtime.Version())
+})
 
 // promMu serializes the prometheus.DefaultRegisterer swap below: cloudflared
 // registers metrics against the global registerer at construction, which
@@ -534,9 +538,11 @@ func (b *Backend) resolveEdgeProtocol() (EdgeProtocol, error) {
 // repeating a key adds another value. Env mirror: LIBTUNNEL__CLOUDFLARE_HEADERS,
 // a comma-separated K=V list, whose entries beat code per key. Applied over the
 // headers the mint sets itself (Content-Type, User-Agent) and over the hint
-// headers, so a caller may override any of
-// them — overriding User-Agent changes how the endpoint sees the
-// connector version.
+// headers, so a caller may override any of them. User-Agent is the exception
+// that keeps a part: the caller's value replaces the product token, and the
+// "(libtunnel/<version>; <os>/<arch>; <go>)" comment still follows it.
+// The comment drops its libtunnel entry when the product token is already
+// libtunnel/….
 func (b *Backend) WithHeader(key, value string) *Backend {
 	if b.headers == nil {
 		b.headers = http.Header{}

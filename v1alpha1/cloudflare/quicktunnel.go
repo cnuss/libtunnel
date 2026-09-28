@@ -1,6 +1,7 @@
 package cloudflare
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -85,7 +87,9 @@ type QuickTunnelProvider struct {
 	// LIBTUNNEL__CLOUDFLARE_HEADERS mirror — see mintHeaders). They are
 	// applied over the headers set here
 	// (Content-Type, User-Agent), so a caller-supplied key replaces the
-	// default for that key. Nil adds nothing.
+	// default for that key — except User-Agent, where the caller's value
+	// replaces the product token and the comment still follows.
+	// Nil adds nothing.
 	Headers http.Header
 	// Token rides the mint request as "Authorization: token <value>"
 	// (WithToken / its LIBTUNNEL_TOKEN mirror, env beats code). Set with
@@ -160,6 +164,22 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		token = v
 	}
 
+	// tunnel.pizza is libtunnel's own provider, so it is told libtunnel; any
+	// other endpoint speaks the trycloudflare protocol and is told cloudflared,
+	// the client that protocol was built for. A caller's User-Agent takes the
+	// product token's place. The comment names libtunnel unless the product
+	// token already does.
+	product := "cloudflared/" + cloudflaredVersion
+	if u, err := url.Parse(endpoint); err == nil && u.Hostname() == "tunnel.pizza" {
+		product = "libtunnel/" + libtunnelVersion()
+	}
+	product = cmp.Or(p.Headers.Get("User-Agent"), product)
+	comment := "libtunnel/" + libtunnelVersion() + "; " + agentPlatform()
+	if strings.HasPrefix(product, "libtunnel/") {
+		comment = agentPlatform()
+	}
+	agent := product + " (" + comment + ")"
+
 	client := http.Client{
 		// Reported to the provider the way a browser would: a 429, a
 		// timeout, a name that did not resolve, a certificate it would not
@@ -183,7 +203,7 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			// real per-attempt bound.
 			TLSHandshakeTimeout:   5 * time.Second,
 			ResponseHeaderTimeout: 15 * time.Second,
-		}, userAgent, log),
+		}, agent, log),
 		Timeout: 15 * time.Second,
 	}
 
@@ -198,7 +218,6 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 			return mintResult{}, fmt.Errorf("failed to create request: %w", err)
 		}
 		req.Header.Add("Content-Type", "application/json")
-		req.Header.Add("User-Agent", fmt.Sprintf("cloudflared/%s", cloudflaredVersion))
 		if token != "" {
 			req.Header.Set("Authorization", "token "+token)
 		}
@@ -228,6 +247,9 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 				req.Header.Add(k, v)
 			}
 		}
+		// After the caller's headers: their User-Agent is already folded
+		// into agent, as the product token ahead of the libtunnel comment.
+		req.Header.Set("User-Agent", agent)
 
 		resp, err := client.Do(req)
 		if err != nil {
