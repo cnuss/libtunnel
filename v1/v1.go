@@ -337,6 +337,13 @@ const (
 	// tunnel rather than falling back silently — an operator naming a
 	// transport means it.
 	CloudflareEdgeProtocolEnv = "LIBTUNNEL__CLOUDFLARE_EDGE_PROTOCOL"
+
+	// CloudflareMintWaitEnv sets how long a hostname minted anywhere but
+	// tunnel.pizza waits before it is handed back (time.ParseDuration syntax,
+	// default 5s): tunnel.pizza answers once the record has spread, another
+	// endpoint may answer before. "0" skips the wait. An unparsable value
+	// fails spec resolution.
+	CloudflareMintWaitEnv = "LIBTUNNEL__CLOUDFLARE_MINT_WAIT"
 )
 
 // Lifecycle is the shape of anything long-lived: when it is up, when it is

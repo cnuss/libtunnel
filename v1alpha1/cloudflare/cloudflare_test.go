@@ -1653,6 +1653,31 @@ func TestTokenStaysWithOwnProvider(t *testing.T) {
 	}
 }
 
+// TestMintWaitOffOwnProvider pins the head start a hostname minted anywhere
+// but tunnel.pizza gets: the mint waits LIBTUNNEL__CLOUDFLARE_MINT_WAIT before
+// handing it back, and a value that doesn't parse fails the mint.
+func TestMintWaitOffOwnProvider(t *testing.T) {
+	clearSpecEnv(t)
+	var seen http.Header
+	srv := mintServer(t, &seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	t.Setenv(v1.CloudflareMintWaitEnv, "300ms")
+	start := time.Now()
+	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := time.Since(start); got < 300*time.Millisecond {
+		t.Errorf("mint returned after %v, want it to wait at least 300ms", got)
+	}
+
+	t.Setenv(v1.CloudflareMintWaitEnv, "soon")
+	if _, err := (&QuickTunnelProvider{URL: srv.URL}).Spec(ctx); err == nil || !strings.Contains(err.Error(), v1.CloudflareMintWaitEnv) {
+		t.Errorf("err = %v, want an unparsable %s to fail the mint", err, v1.CloudflareMintWaitEnv)
+	}
+}
+
 // TestWithHeaderBeatsWithToken pins that an explicit Authorization header,
 // from code or the env mirror, is sent as the only value wherever the mint is
 // aimed — the token beside it is a default the header replaces, and off

@@ -338,6 +338,7 @@ starts as given.
 | `LIBTUNNEL__CLOUDFLARE_PROVIDER` | `WithProvider()` — quick-tunnel provider host, default `tunnel.pizza` (endpoint `https://<host>/tunnel` synthesized; a value with a scheme is used verbatim) |
 | `LIBTUNNEL__CLOUDFLARE_HEADERS` | `WithHeader()`, on the backend or the tunnel — request headers on the mint call, comma-separated `K=V` (e.g. `X-Opaque=true`, or `X-Ephemeral=true` to mark the mint unreclaimable once reaped); entries beat code per key. No escaping — values can't contain `,` or `=`. |
 | `LIBTUNNEL__CLOUDFLARE_EDGE_PROTOCOL` | `WithEdgeProtocol()` — pins the edge transport: `quic`, `http2`, or `auto`. Unset is `auto`, where cloudflared chooses and falls back on its own. Pin `http2` where UDP is dropped, `quic` to refuse the fallback. An unrecognized value fails the tunnel. |
+| `LIBTUNNEL__CLOUDFLARE_MINT_WAIT` | How long a hostname minted anywhere but `tunnel.pizza` waits before it is handed back (Go duration, default `5s`): `tunnel.pizza` answers once the DNS record has spread, another endpoint may answer before. `0` skips it; an unparsable value fails spec resolution. |
 
 The Cloudflare backend also has a bare activation switch, `LIBTUNNEL__CLOUDFLARE=1`,
 used by the binary below to select it without a spec handoff.

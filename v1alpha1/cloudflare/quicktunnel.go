@@ -157,6 +157,16 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		endpoint = quickTunnelURL
 	}
 	own := endpoint == quickTunnelURL
+	// tunnel.pizza answers once the hostname's record has spread; another
+	// endpoint may answer before, so its hostname gets a head start.
+	mintWait := 5 * time.Second
+	if v := os.Getenv(v1.CloudflareMintWaitEnv); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", v1.CloudflareMintWaitEnv, err)
+		}
+		mintWait = d
+	}
 
 	// Same reasoning as the endpoint: a provider built directly still honors
 	// the env mirror, so LIBTUNNEL_TOKEN is not a silent exception — nor is
@@ -325,6 +335,14 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 				}
 			}
 			if !throttled {
+				if !own && mintWait > 0 {
+					log.Info("waiting for the hostname's DNS record to spread", "endpoint", endpoint, "hostname", out.spec.Hostname, "delay", mintWait)
+					select {
+					case <-time.After(mintWait):
+					case <-ctx.Done():
+						return out, ctx.Err()
+					}
+				}
 				return out, nil
 			}
 			// The spec is complete and the tunnel exists; the hostname just

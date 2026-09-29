@@ -41,8 +41,10 @@ func stubProvider() (stop func()) {
 		fmt.Fprintf(w, `{"success":true,"result":{"hostname":%q}}`, r.Header.Get("X-Hostname"))
 	}))
 	os.Setenv("LIBTUNNEL__CLOUDFLARE_PROVIDER", srv.URL)
+	os.Setenv("LIBTUNNEL__CLOUDFLARE_MINT_WAIT", "0")
 	return func() {
 		os.Unsetenv("LIBTUNNEL__CLOUDFLARE_PROVIDER")
+		os.Unsetenv("LIBTUNNEL__CLOUDFLARE_MINT_WAIT")
 		srv.Close()
 	}
 }

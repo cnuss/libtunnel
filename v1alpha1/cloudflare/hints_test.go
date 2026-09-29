@@ -347,9 +347,11 @@ func TestWithRecordIDRidesAsHint(t *testing.T) {
 
 // TestMain answers every hint probe "gone" so the hint tests reach the stub
 // mint without an edge; the tests below that care about the verdict set
-// their own.
+// their own. The stub mint is never tunnel.pizza, so it skips the mint
+// wait.
 func TestMain(m *testing.M) {
 	probeHint = func(context.Context, *probe.Prober, *Spec, *slog.Logger) error { return probe.ErrGone }
+	os.Setenv(v1.CloudflareMintWaitEnv, "0")
 	os.Exit(m.Run())
 }
 
