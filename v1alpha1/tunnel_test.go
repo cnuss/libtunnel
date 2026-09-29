@@ -966,7 +966,7 @@ func TestEventListenersAreLayered(t *testing.T) {
 	tun.WithEventListener(func(v1.Event) { order = append(order, "second") })
 	tun.WithEventListener(nil) // ignored rather than panicking later
 
-	tun.Emit(v1.Event{Kind: v1.EventServing})
+	tun.Emit(v1.Event{Kind: v1.EventConnected})
 	if len(order) != 2 || order[0] != "first" || order[1] != "second" {
 		t.Errorf("listeners ran %v, want [first second]", order)
 	}
@@ -981,7 +981,7 @@ func TestEventListenerPanicIsContained(t *testing.T) {
 	tun.WithEventListener(func(v1.Event) { panic("listener blew up") })
 	tun.WithEventListener(func(v1.Event) { reached = true })
 
-	tun.Emit(v1.Event{Kind: v1.EventServing})
+	tun.Emit(v1.Event{Kind: v1.EventConnected})
 	if !reached {
 		t.Error("a panicking listener stopped the ones after it")
 	}

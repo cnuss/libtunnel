@@ -18,10 +18,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/netip"
 	"net/url"
 	"os"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -871,17 +871,11 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 	if b.envErr != nil {
 		return b.envErr
 	}
-	// An in-process reverse proxy always fronts the origin. It re-dials the
-	// origin (adding TLS when the origin scheme is https) and relays the
-	// response verbatim. cloudflared -> proxy is always plaintext (the proxy
-	// listens on a plain TCP socket), so the ingress service is rewritten to
-	// http regardless of the origin's scheme — a leftover https would make
-	// cloudflared TLS-dial the plaintext proxy → 502.
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return fmt.Errorf("reverse proxy: %w", err)
-	}
-	transport := originTransport(origin)
+	// cloudflared dials the origin itself: the request reaches it as the edge
+	// sent it — the visitor's Host and forwarding headers intact — and an
+	// https origin is dialed without verification (noTLSVerify, see
+	// ingressFor).
+	service := (&url.URL{Scheme: origin.Scheme, Host: origin.Host}).String()
 	// Wire runtime state onto the backend: reconnected feeds the supervisor's
 	// external-control channel (see NewSupervisor below), edge counts Connected
 	// events via the Observer sink, and reconnectCtx is the tunnel context.
@@ -900,35 +894,15 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 			close(stopped)
 		}
 	}()
-	proxy := newOriginProxy(origin, t.Logger(), transport)
-	// The loop-through's nonce: random per tunnel, so only this proxy's own
-	// verification requests short-circuit here and anything else carrying
-	// the header is forwarded like any request.
+	// The loop-through's path: random per tunnel, so only this tunnel's own
+	// verification requests match the ingress rule that answers them, and
+	// every other path goes to the origin.
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return fmt.Errorf("loop-through nonce: %w", err)
 	}
-	loop := hex.EncodeToString(nonce)
-	srv := &http.Server{
-		Handler: loopThrough(loop, proxy),
-		// Called once, on the serving goroutine, as Serve begins on l and
-		// before its first Accept — the one hook net/http offers for "now
-		// serving". The tunnel's context as the base means every request
-		// ends with the tunnel, not just the listener.
-		BaseContext: func(net.Listener) context.Context {
-			t.Emit(v1.Event{Kind: v1.EventServing})
-			return t.Context()
-		},
-	}
-	// Closed once the edge is let go of rather than when the context ends:
-	// requests in flight during the grace period still need answering.
-	go func() {
-		<-stopped
-		srv.Close()
-	}()
-	go srv.Serve(l)
-	t.Logger().Info("reverse proxy interposed", "listen", l.Addr().String(), "origin", origin)
-	service := (&url.URL{Scheme: "http", Host: l.Addr().String()}).String()
+	loop := loopPrefix + hex.EncodeToString(nonce)
+	t.Logger().Info("origin wired", "origin", service)
 	ctx := t.Context()
 	log := zerologger(t.Logger())
 	spec := t.Spec()
@@ -1083,7 +1057,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 				if alive && b.establishing.CompareAndSwap(false, true) {
 					go func() {
 						defer b.establishing.Store(false)
-						b.establish(ctx, t, loopThroughClient(prober), "https://"+spec.GetHostname()+"/", loop, t.Logger())
+						b.establish(ctx, t, loopThroughClient(prober), "https://"+spec.GetHostname()+loop, t.Logger())
 					}()
 				}
 				if full {
@@ -1149,26 +1123,10 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 			OriginDialerService: originDialer,
 		}
 
-		// HTTP/2 follows the backend's explicit WithHTTP2 setting (default
-		// false); the service URL's scheme picks https vs http. TLS
-		// verification is always off — a local origin may carry a self-signed
-		// cert.
-		noTLSVerify := true
-		http2Origin := b.http2
-
 		internalRules := []ingress.Rule{}
-		parsed, err := ingress.ParseIngress(&config.Configuration{
-			OriginRequest: config.OriginRequestConfig{
-				NoTLSVerify: &noTLSVerify,
-				Http2Origin: &http2Origin,
-			},
-			WarpRouting: config.WarpRoutingConfig{},
-			Ingress: []config.UnvalidatedIngressRule{
-				{Service: service},
-			},
-		})
+		parsed, err := ingressFor(service, loop, b.http2)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse ingress for %s: %w", service, err)
+			return nil, err
 		}
 		orchestrator, err := orchestration.NewOrchestrator(runCtx, &orchestration.Config{
 			Ingress:             &parsed,
@@ -1232,20 +1190,28 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 	return nil
 }
 
-// loopThrough answers the tunnel's own verification requests before anything
-// else sees them: the exact nonce gets a 204 that echoes it, so the prober
-// can tell the proxy's answer from anything the edge might say in its place.
-// The origin is never asked.
-func loopThrough(nonce string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(establishHeader) == nonce {
-			w.Header().Set(establishHeader, nonce)
-			w.Header().Set("Cache-Control", "no-store")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
+// ingressFor is cloudflared's ingress for one origin: the loop-through path
+// answered 204 by cloudflared itself, so the origin never sees the tunnel's
+// own verification, and every other request sent to service. HTTP/2 to the
+// origin follows WithHTTP2; the service's scheme picks http or https, and TLS
+// verification is off — a local origin may carry a self-signed cert.
+func ingressFor(service, loop string, http2 bool) (ingress.Ingress, error) {
+	noTLSVerify := true
+	parsed, err := ingress.ParseIngress(&config.Configuration{
+		OriginRequest: config.OriginRequestConfig{
+			NoTLSVerify: &noTLSVerify,
+			Http2Origin: &http2,
+		},
+		WarpRouting: config.WarpRoutingConfig{},
+		Ingress: []config.UnvalidatedIngressRule{
+			{Path: "^" + regexp.QuoteMeta(loop) + "$", Service: "http_status:204"},
+			{Service: service},
+		},
 	})
+	if err != nil {
+		return ingress.Ingress{}, fmt.Errorf("failed to parse ingress for %s: %w", service, err)
+	}
+	return parsed, nil
 }
 
 // loopThroughClient is the client the verification goes out on. It resolves
@@ -1273,15 +1239,15 @@ func loopThroughClient(p *probe.Prober) *http.Client {
 	}
 }
 
-// establish sends the loop-through to url until the proxy answers it, then
-// reports EventEstablished. It has no bound of its own: a caller that wants
-// one puts it on the tunnel's context.
-func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client, url, nonce string, log *slog.Logger) {
+// establish sends the loop-through to url until this tunnel's cloudflared
+// answers it, then reports EventEstablished. It has no bound of its own: a
+// caller that wants one puts it on the tunnel's context.
+func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client, url string, log *slog.Logger) {
 	start := time.Now()
 	attempts := 0
 	for {
 		attempts++
-		err := verify(ctx, client, url, nonce)
+		err := verify(ctx, client, url)
 		if err == nil {
 			log.Info("tunnel established", "url", url, "attempts", attempts, "after", time.Since(start).Round(time.Millisecond))
 			t.Emit(v1.Event{Kind: v1.EventEstablished})
@@ -1302,14 +1268,14 @@ func (b *Backend) establish(ctx context.Context, t emitter, client *http.Client,
 	}
 }
 
-// verify makes one loop-through and reports whether the proxy answered it —
-// the nonce back on a 204 — rather than the edge answering in its place.
-func verify(ctx context.Context, client *http.Client, url, nonce string) error {
+// verify makes one loop-through and reports whether this tunnel's
+// cloudflared answered it — a 204 on the tunnel's own path, which only its
+// ingress answers — rather than the edge answering in its place.
+func verify(ctx context.Context, client *http.Client, url string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set(establishHeader, nonce)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -1322,25 +1288,21 @@ func verify(ctx context.Context, client *http.Client, url, nonce string) error {
 		// tunnel the colo does not know yet.
 		return fmt.Errorf("answered %s, want %d", resp.Status, http.StatusNoContent)
 	}
-	if got := resp.Header.Get(establishHeader); got != nonce {
-		return fmt.Errorf("answered without this tunnel's nonce (%q): something else is serving the name", got)
-	}
 	return nil
 }
 
 // The loop-through that verifies the public URL. Every establishInterval a
-// request goes to the URL with a nonce only this tunnel's proxy recognizes;
-// the proxy answers 204 itself, so the origin never sees it. Until the edge
-// has fanned the tunnel's location out to its colos it answers 530 in the
-// proxy's place, and the loop tries again.
+// request goes to a path only this tunnel's ingress knows (loopPrefix plus a
+// random nonce); cloudflared answers it 204 itself, so the origin never sees
+// it. Until the edge has fanned the tunnel's location out to its colos it
+// answers 530 in cloudflared's place, and the loop tries again.
 //
 // A var, not a const, so a test can shorten it rather than sleep through it
 // — captured on the Backend at construction.
 var establishInterval = 1 * time.Second
 
-// establishHeader carries the loop-through nonce. Any other value is an
-// ordinary request.
-const establishHeader = "X-Libtunnel-Loop"
+// loopPrefix starts the loop-through's path.
+const loopPrefix = "/.well-known/libtunnel/"
 
 // emitter is the half of the tunnel the probe needs: somewhere to report.
 type emitter interface{ Emit(v1.Event) }
@@ -1356,35 +1318,6 @@ const edgeBlockedHint = "your machine/network is getting its egress to the tunne
 	"blocked or dropped. Make sure to allow egress connectivity as per " +
 	"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/ " +
 	"(WithEdgeProtocol pins the transport when only one of UDP or TCP is allowed)"
-
-// newOriginProxy builds the reverse proxy that always fronts the origin (see
-// connect, which serves it on a plaintext listener cloudflared dials). When
-// the origin scheme is https the Transport dials it over TLS with
-// InsecureSkipVerify, matching the engine's always-off origin verification.
-// Every request goes to the one origin and every response is relayed
-// verbatim — status, headers, body untouched. Routing between several local
-// services is the caller's to do behind that origin, not the tunnel's.
-func newOriginProxy(origin *url.URL, log *slog.Logger, transport http.RoundTripper) *httputil.ReverseProxy {
-	return &httputil.ReverseProxy{
-		Transport: transport,
-		Rewrite: func(r *httputil.ProxyRequest) {
-			r.SetURL(origin)
-			// Preserve the inbound Host: the origin (e.g. an apiserver) may key
-			// on it, and the stdlib default would rewrite it to the origin host.
-			r.Out.Host = r.In.Host
-		},
-		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelDebug),
-	}
-}
-
-// originTransport dials the origin, adding TLS (InsecureSkipVerify, matching
-// the engine's always-off origin verification) when its scheme is https.
-func originTransport(origin *url.URL) http.RoundTripper {
-	if origin.Scheme == "https" {
-		return &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	}
-	return http.DefaultTransport
-}
 
 // noopImpl satisfies the metrics interfaces cloudflared insists on with
 // do-nothing implementations.

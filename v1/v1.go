@@ -36,22 +36,14 @@ const (
 	// slot, and the registration that fills the set again is the tunnel back
 	// at full strength.
 	EventConnected EventKind = "connected"
-	// EventServing fires when the tunnel's own side is up: the in-process
-	// reverse proxy has begun serving, with the origin dial behind it, so a
-	// request that reached it would be answered.
-	// It follows the mint and precedes any edge connection registering — the
-	// local half is ready, the public half follows with EventConnected.
-	// Hostname is empty on it: the hostname is reported once the edge
-	// registers, which comes after.
-	EventServing EventKind = "serving"
 	// EventDisconnected fires when the last edge connection ends — the tunnel
 	// has no connection to the edge. One connection dropping while others hold
 	// is not reported: the tunnel is degraded, not down, and the engine is
 	// already redialing.
 	EventDisconnected EventKind = "disconnected"
 	// EventEstablished fires when the public URL is verified to work from
-	// here: a request sent to it came back through the edge, the tunnel and
-	// the reverse proxy — which answered it itself, so the origin saw
+	// here: a request sent to it came back through the edge and this
+	// tunnel's own connector — which answered it itself, so the origin saw
 	// nothing. It is the moment a visitor would get through, which
 	// EventConnected is not: after every edge connection registers,
 	// Cloudflare still has to tell its other colos where the tunnel lives,

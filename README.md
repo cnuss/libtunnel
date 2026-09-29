@@ -203,11 +203,13 @@ that can never succeed fails with a reason instead of hanging.
 
 ## One origin per hostname
 
-An in-process reverse proxy always fronts the origin, and it forwards to that
-one origin only: every request is relayed as it arrived — path, query, and the
-inbound `Host` intact — and every response as the origin wrote it. An `https`
-origin is dialed over TLS without verification, the same as cloudflared's own
-origin dial.
+The tunnel stays out of the HTTP path: cloudflared dials the one origin
+directly, so every request arrives as the edge sent it — path, query, the
+visitor's `Host`, and the `X-Forwarded-For` / `X-Forwarded-Proto` headers
+intact — and every response goes back as the origin wrote it. An `https`
+origin is dialed over TLS without verification. The one request the origin
+never sees is the tunnel's own verification, which cloudflared answers on a
+random path under `/.well-known/libtunnel/`.
 
 Several services behind one hostname, or a handler in front of the origin
 (headers, auth, rewrites), are the caller's to build: serve an

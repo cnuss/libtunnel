@@ -148,7 +148,6 @@ type (
 
 const (
 	EventHostnameReady = v1.EventHostnameReady // the hostname is expected to resolve
-	EventServing       = v1.EventServing       // the local side is up: proxy listening, origin wired
 	EventConnected     = v1.EventConnected     // every edge connection is up
 	EventDisconnected  = v1.EventDisconnected  // no edge connection is up
 	EventEstablished   = v1.EventEstablished   // the public URL works from here; origin untouched

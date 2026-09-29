@@ -448,6 +448,10 @@ func startWatchOrigin(t *testing.T) (*httptest.Server, *atomic.Int64) {
 			fmt.Fprint(w, "hello via local URL")
 			return
 		}
+		if r.URL.Path == "/forwarded" {
+			fmt.Fprintf(w, "proto=%s for=%t", r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-For") != "")
+			return
+		}
 		if r.URL.Path != "/watch" {
 			http.NotFound(w, r)
 			return
