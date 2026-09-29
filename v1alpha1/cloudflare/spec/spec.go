@@ -95,6 +95,14 @@ func (s *Spec) GetHostname() string {
 	return s.Hostname
 }
 
+// GetSecret implements v1.Spec.
+func (s *Spec) GetSecret() []byte {
+	if s == nil {
+		return nil
+	}
+	return s.Secret
+}
+
 // Serialize implements v1.Spec: the tagged-envelope JSON for this spec, tagged
 // "cloudflare" — the same form as LIBTUNNEL_SPEC, so it round-trips through
 // libtunnel.From.

@@ -381,6 +381,8 @@ type Spec interface {
 	// GetHostname returns the public hostname (host or host:port) the tunnel
 	// serves under.
 	GetHostname() string
+	// GetSecret returns the tunnel secret, or nil when the backend has none.
+	GetSecret() []byte
 	// Serialize returns the spec as a tagged-envelope JSON string — the same
 	// form carried by LIBTUNNEL_SPEC. The result round-trips through
 	// libtunnel.From and can be dropped straight into the env var.
@@ -512,6 +514,10 @@ type Tunnel interface {
 	// spec (see Spec.Messages): as sent, in its order, nil when nothing. A
 	// getter like Hostname: the first use resolves the spec.
 	Messages() []string
+	// Secret is the tunnel secret (see Spec.GetSecret), nil when the backend
+	// has none. It is a credential — whoever holds it can run the tunnel. A
+	// getter like Hostname: the first use resolves the spec.
+	Secret() []byte
 	// CACerts returns the trust roots the backend uses for its edge
 	// connections.
 	CACerts() []*x509.Certificate
