@@ -1,6 +1,7 @@
 package v1alpha1_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"errors"
@@ -1279,5 +1280,17 @@ func TestMessagesComeOffTheSpec(t *testing.T) {
 	}
 	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.pizza"})).Messages(); got != nil {
 		t.Errorf("Messages = %v with nothing said, want nil", got)
+	}
+}
+
+// TestSecretComesOffTheSpec pins the accessor: the secret is read off the
+// spec as is, and a spec with none reads as nil.
+func TestSecretComesOffTheSpec(t *testing.T) {
+	spec := &cloudflare.Spec{Hostname: "demo.tunneled.pizza", Secret: []byte("s3cr3t")}
+	if got := v1alpha1.New(newFakeEngine(spec)).Secret(); !bytes.Equal(got, spec.Secret) {
+		t.Errorf("Secret = %q, want %q", got, spec.Secret)
+	}
+	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.pizza"})).Secret(); got != nil {
+		t.Errorf("Secret = %q with no secret, want nil", got)
 	}
 }

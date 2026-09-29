@@ -103,6 +103,7 @@ type Tunnel interface {
     Hostname() string
     Domain() string
     Port() int
+    Secret() []byte // the spec's secret; nil when the backend has none
     CACerts() []*x509.Certificate
 
     Listener() net.Listener // start trigger: mints a loopback listener if none provided
@@ -140,6 +141,7 @@ type Backend[T Spec] interface { // opaque; the engine contract is alpha-interna
 }
 type Spec interface {
     GetHostname() string
+    GetSecret() []byte // nil when the backend has none
     Serialize() string // tagged-envelope JSON; == a LIBTUNNEL_SPEC value
 }
 

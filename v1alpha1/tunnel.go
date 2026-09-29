@@ -500,6 +500,11 @@ func (t *TunnelImpl[T]) Messages() []string {
 	return t.Spec().Messages()
 }
 
+// Secret is the spec's secret, nil when its backend has none.
+func (t *TunnelImpl[T]) Secret() []byte {
+	return t.Spec().GetSecret()
+}
+
 // Host is the first label of Hostname.
 func (t *TunnelImpl[T]) Host() string {
 	return hostOf(t.Hostname())
