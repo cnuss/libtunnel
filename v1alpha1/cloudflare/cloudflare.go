@@ -560,8 +560,10 @@ func (b *Backend) AddHeader(key, value string) { b.WithHeader(key, value) }
 // token <value>", so a provider that gates minting can tell who is asking.
 // Applied with the mint's own defaults (Content-Type, User-Agent), so an
 // explicit WithHeader("Authorization", …) or the LIBTUNNEL__CLOUDFLARE_HEADERS
-// mirror replaces it, the way they replace every default. Env mirror:
-// LIBTUNNEL_TOKEN (env beats code). Never part of the spec or its handoff.
+// mirror replaces it, the way they replace every default. Sent to
+// tunnel.pizza only: any other endpoint (WithProvider) could replay it, so it
+// gets none. Env mirror: LIBTUNNEL_TOKEN (env beats code). Never part of the
+// spec or its handoff.
 func (b *Backend) WithToken(token string) v1.Backend[*Spec] {
 	b.token = token
 	return b

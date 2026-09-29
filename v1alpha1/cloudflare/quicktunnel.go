@@ -11,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -94,7 +93,8 @@ type QuickTunnelProvider struct {
 	// Token rides the mint request as "Authorization: token <value>"
 	// (WithToken / its LIBTUNNEL_TOKEN mirror, env beats code). Set with
 	// the mint's own defaults, so a Headers entry for Authorization replaces
-	// it. Empty sends none.
+	// it. Empty sends none, and neither does an endpoint other than
+	// tunnel.pizza.
 	Token string
 	// Log receives retry warnings. Nil is silent.
 	Log *slog.Logger
@@ -156,21 +156,29 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 	if endpoint == "" {
 		endpoint = quickTunnelURL
 	}
+	own := endpoint == quickTunnelURL
+
 	// Same reasoning as the endpoint: a provider built directly still honors
 	// the env mirror, so LIBTUNNEL_TOKEN is not a silent exception — nor is
-	// the Actions token it falls back to.
+	// the Actions token it falls back to. Either is a credential for
+	// tunnel.pizza, and any other endpoint is a third party that could replay
+	// it, so only quickTunnelURL is sent one. An explicit Authorization header
+	// (Headers) is the caller's choice and goes wherever it is aimed.
 	token := p.Token
 	if v := v1.Token(); v != "" {
 		token = v
 	}
+	if !own {
+		token = ""
+	}
 
 	// tunnel.pizza is libtunnel's own provider, so it is told libtunnel; any
-	// other endpoint speaks the trycloudflare protocol and is told cloudflared,
-	// the client that protocol was built for. A caller's User-Agent takes the
+	// other endpoint speaks the trycloudflare protocol and is told
+	// cloudflared, the client that protocol was built for. A caller's User-Agent takes the
 	// product token's place. The comment names libtunnel unless the product
 	// token already does.
 	product := "cloudflared/" + cloudflaredVersion
-	if u, err := url.Parse(endpoint); err == nil && u.Hostname() == "tunnel.pizza" {
+	if own {
 		product = "libtunnel/" + libtunnelVersion()
 	}
 	product = cmp.Or(p.Headers.Get("User-Agent"), product)

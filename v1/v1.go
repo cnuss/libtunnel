@@ -261,8 +261,8 @@ const (
 	HTTP2Env = "LIBTUNNEL_HTTP2"
 	// TokenEnv mirrors Tunnel.WithToken: the credential sent on the mint
 	// request as "Authorization: token <value>" (env beats code). Every
-	// resolution mints, so it always rides; it is never part of the spec or
-	// its handoff.
+	// resolution mints, so it always rides to tunnel.pizza (no other mint
+	// endpoint is sent it); it is never part of the spec or its handoff.
 	TokenEnv = "LIBTUNNEL_TOKEN"
 	// ActionsTokenEnv is what TokenEnv falls back to: the token GitHub
 	// Actions issues to a job, which lets a provider judge a mint by the
@@ -441,7 +441,8 @@ type Backend[T Spec] interface {
 	// "Authorization: token <value>". It rides every mint; a spec the edge
 	// vouches for is adopted without one. Never part of the spec or its
 	// handoff. A backend whose provider
-	// has no notion of a token accepts and ignores it. Chainable. The
+	// has no notion of a token accepts and ignores it; Cloudflare sends it to
+	// tunnel.pizza only, never to another mint endpoint. Chainable. The
 	// LIBTUNNEL_TOKEN environment variable beats it.
 	WithToken(token string) Backend[T]
 	// Reconnect forcefully cycles the engine's connection(s) to the tunnel edge

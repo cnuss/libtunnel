@@ -310,7 +310,7 @@ rebuild. (The one exception is noted below.)
 | `LIBTUNNEL_LOCAL_URL` | `WithLocalURL()` | Origin override, applied at origin-provide time: supersedes a `WithListener` listener, a `WithLocalURL` argument, and the start-trigger mint. Invalid value cancels the tunnel. |
 | `LIBTUNNEL_TLS` | `WithTLS()` | Bool (`strconv.ParseBool`). Fixed at backend construction; later `WithTLS` calls are no-ops. Unparsable value fails at connect. |
 | `LIBTUNNEL_HTTP2` | `WithHTTP2()` | Same rules as `LIBTUNNEL_TLS`. |
-| `LIBTUNNEL_TOKEN` | `WithToken()` | Credential on the mint request, sent as `Authorization: token <value>`. Rides every mint; a spec the edge vouches for is adopted without one. Never part of the spec or its handoff. An explicit `WithHeader("Authorization", …)` / `LIBTUNNEL__CLOUDFLARE_HEADERS` entry replaces it. Unset, it falls back to `ACTIONS_RUNTIME_TOKEN`, so a mint from a GitHub Actions job is judged by that credential rather than by the runner's address — GitHub hands the variable to a JS action and not to a `run:` step, so a workflow has to export it. |
+| `LIBTUNNEL_TOKEN` | `WithToken()` | Credential on the mint request, sent as `Authorization: token <value>` — to `tunnel.pizza` only; any other mint endpoint is sent none. Rides every mint; a spec the edge vouches for is adopted without one. Never part of the spec or its handoff. An explicit `WithHeader("Authorization", …)` / `LIBTUNNEL__CLOUDFLARE_HEADERS` entry replaces it. Unset, it falls back to `ACTIONS_RUNTIME_TOKEN`, so a mint from a GitHub Actions job is judged by that credential rather than by the runner's address — GitHub hands the variable to a JS action and not to a `run:` step, so a workflow has to export it. |
 | `LIBTUNNEL_LOG` | `WithLogger()` | `debug`\|`info`\|`warn`\|`error`: the default logger becomes a stderr text logger at that level instead of silent. *The exception:* an explicit `WithLogger` keeps its handler — env carries a level, not a sink. |
 | `LIBTUNNEL_NO_REPORT` | — | Set to anything to stop the mint client reporting network errors to the provider. On by default: like a browser, it honors the provider's `NEL` + `Report-To` headers and posts a 4xx, timeout, DNS or TLS failure to the collector they name (for tunnel.pizza, Cloudflare's, into the zone's NEL analytics). Never carries credentials. |
 | `LIBTUNNEL_HOSTNAME` | — | Export-only mirror of the minted spec's hostname, for tooling; never read. |
@@ -423,15 +423,16 @@ make run reclaim
 
 ```sh
 make test   # library unit + fuzz tests (fast, in-package; -short skips live)
-make e2e    # live tier: real tunnels through the real edge
+LIBTUNNEL_TOKEN=<token> make e2e  # live tier: real tunnels through the real edge
 ```
 
 `make e2e` runs `go test -count=1 -v ./e2e`. The `-count=1` defeats the test
 cache, since the harness builds the example binaries at runtime and the cache
 key wouldn't otherwise pick up example source changes. The e2e tier is live
 tunnels only — everything mints from `tunnel.pizza` (rate-limited), so the
-live cases skip under `-short` (which `make test` passes; offline
-spec-handoff coverage lives in the unit tier and always runs), and on CI each
+live cases are opt-in: they skip unless `LIBTUNNEL_TOKEN` is set, and under
+`-short` (which `make test` passes; offline spec-handoff coverage lives in the
+unit tier and always runs) regardless. On CI each
 platform runs at most one live tier (see `e2e/util_test.go`).
 
 ## Contributing

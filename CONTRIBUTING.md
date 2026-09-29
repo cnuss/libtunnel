@@ -70,7 +70,7 @@ git clone https://github.com/cnuss/libtunnel.git
 cd libtunnel
 make test   # library unit + fuzz tests (fast, in-package; -short skips live)
 make race   # offline tiers under the race detector (the CI race lane, locally)
-make e2e    # live tier: real tunnels (no -short); on CI, narrowed per platform
+LIBTUNNEL_TOKEN=<token> make e2e  # live tier: real tunnels; on CI, narrowed per platform
 ```
 
 Run a specific example locally:
@@ -91,7 +91,8 @@ Three tiers, each with a distinct job — don't blur them:
   no network).
 - **`examples/`** — real-world, simple-ish API usage written for humans. An
   example demonstrates; it never asserts. Assertion logic belongs in `e2e/`.
-- **`e2e/`** — **live tunnels only**, skipped under `-short` (`make test`)
+- **`e2e/`** — **live tunnels only**, skipped without `LIBTUNNEL_TOKEN` or
+  under `-short` (`make test`)
   and not meant for human consumption. The harness builds and runs the
   example binaries against the real edge and asserts on their output, plus
   live scenario tests (shared-tunnel subtests, TLS origin, resurrection,
@@ -128,7 +129,7 @@ Easy to get wrong from the diff alone:
   scenario tier on linux/amd64 only; the examples tier on one variant per
   OS family, on pushes rather than pull requests, minting from
   trycloudflare off the scenario cell; and everything live skips under
-  `-short` and on Dependabot PRs (see the tier-selection block in
+  `-short`, without `LIBTUNNEL_TOKEN`, and on Dependabot PRs (see the tier-selection block in
   `e2e/util_test.go`). For local verification, prefer `make run serve` (one
   tunnel) over the full live suite. A `served: error code: 1033`
   from a fresh tunnel is edge route propagation lag (more likely with
@@ -166,7 +167,8 @@ example is copy-pasteable on its own).
 Print a single recognizable line so the e2e harness can assert on it, then add
 a row to the `cases` table in `e2e/e2e_test.go` (name + expected substring) and
 to the README's example table. Mark the case `live: true` if it mints a real
-tunnel — those skip under `-short` and off their CI cells.
+tunnel — those skip under `-short`, without `LIBTUNNEL_TOKEN`, and off their
+CI cells.
 
 ## Branch / PR flow
 

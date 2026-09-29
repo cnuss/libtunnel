@@ -1,11 +1,11 @@
 package e2e_test
 
 // Live scenario tests: real quick tunnels against the Cloudflare edge, run by
-// `make e2e` (skipped under -short; on CI only the linux/amd64 cell runs
-// them — see the tier-selection block in util_test.go). These are
-// deliberately complicated — origin restarts, streaming relays, launcher
-// subprocesses — and not meant for human consumption; the examples stay
-// simple.
+// `make e2e` (skipped under -short or without LIBTUNNEL_TOKEN; on CI only the
+// linux/amd64 cell runs them — see the tier-selection block in util_test.go).
+// These are deliberately complicated — origin restarts, streaming relays,
+// launcher subprocesses — and not meant for human consumption; the examples
+// stay simple.
 //
 // The quick-tunnel API and edge provisioning are burst-sensitive, so the
 // tests are stingy with mints: preflight mints ONE spec and every test
