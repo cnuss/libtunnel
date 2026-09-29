@@ -40,6 +40,7 @@ func mintServer(t *testing.T, spec *cloudflare.Spec) {
 	}))
 	t.Cleanup(srv.Close)
 	t.Setenv(v1.CloudflareProviderEnv, srv.URL)
+	t.Setenv(v1.CloudflareMintWaitEnv, "0")
 }
 
 // TestFromSerializeRoundTrip pins the Serialize -> From loop: a serialized spec
@@ -97,6 +98,7 @@ func TestFromCarriesHeaders(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	t.Setenv(v1.CloudflareProviderEnv, srv.URL)
+	t.Setenv(v1.CloudflareMintWaitEnv, "0")
 
 	tun := libtunnel.From("").WithHeader("User-Agent", "tunneld/test").WithHeader("X-Opaque", "true")
 	if got := tun.Hostname(); got != "fresh.tunneled.pizza" {

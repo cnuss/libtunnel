@@ -59,7 +59,8 @@ test:
 race:
 	CGO_ENABLED=1 go test -race -short ./...
 
-# End-to-end: the harness builds and drives every example binary. -count=1 disables
+# End-to-end: the harness builds and drives every example binary; every live
+# case skips unless LIBTUNNEL_TOKEN is set (the opt-in). -count=1 disables
 # go test caching, since the harness builds the example binaries at runtime and the
 # cache key wouldn't otherwise pick up example source changes. -timeout 20m gives
 # the live tier headroom: it runs serially with 30s inter-test pacing (shared

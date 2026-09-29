@@ -98,7 +98,7 @@ func TestExamples(t *testing.T) {
 	cases := []struct {
 		name   string
 		want   string
-		live   bool                           // needs a real tunnel; skipped under -short (see skipUnlessLive)
+		live   bool                           // needs a real tunnel; skipped under -short or without LIBTUNNEL_TOKEN (see skipUnlessLive)
 		own    bool                           // mints its own rather than adopting the preflight's (see gateExamples)
 		verify func(t *testing.T, out string) // optional deeper assertions on the same run
 	}{

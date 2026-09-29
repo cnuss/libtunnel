@@ -64,9 +64,10 @@ func gateLive(t *testing.T) {
 	adoptPreflightSpec(t)
 }
 
-// Tier selection (#147): no env opt-in — the -short flag draws the line. The
-// unit lane (`make test`, and CI's race lane) passes -short and stays
-// offline; `make e2e` runs without it and goes live. On CI (the standard
+// Tier selection (#147): nothing goes live without LIBTUNNEL_TOKEN set (see
+// skipUnlessLive). The unit lane (`make test`, and CI's race lane) passes
+// -short and stays offline regardless; `make e2e` runs without it and goes
+// live when the token is set, as CI's e2e step sets it. On CI (the standard
 // CI=true env) the tests below narrow further by platform, keeping every
 // scrap of tier logic out of the workflow: the full scenario tier runs on
 // one cell — linux/amd64 — and the examples tier on one variant of each OS
@@ -134,13 +135,18 @@ func gateExamples(t *testing.T, own bool) {
 }
 
 // skipUnlessLive holds the gates every live case shares: -short (the unit
-// lane must stay offline) and Dependabot PRs (dependency bumps can't change
-// tunnel behavior, and their mints burn the provider's concurrency budget —
-// and flake on its incidents — for nothing).
+// lane must stay offline), LIBTUNNEL_TOKEN (the opt-in, so a bare go test
+// ./... never mints; the Actions token v1 falls back to doesn't count), and
+// Dependabot PRs (dependency bumps can't change tunnel behavior, and their
+// mints burn the provider's concurrency budget — and flake on its incidents
+// — for nothing).
 func skipUnlessLive(t *testing.T) {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("live case (mints a real quick tunnel); run without -short (make e2e)")
+	}
+	if os.Getenv(v1.TokenEnv) == "" {
+		t.Skip("live case (mints a real quick tunnel); set " + v1.TokenEnv + " to opt in")
 	}
 	if dependabotRun() {
 		t.Skip("Dependabot PR: dependency bumps can't change tunnel behavior; skipping live mints")
