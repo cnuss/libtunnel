@@ -1,25 +1,13 @@
 package cloudflare
 
-// Offline tests for the origin reverse proxy (newOriginProxy) below build
-// the proxy directly and speak plain HTTP to its listener address — no
-// cloudflared, no tunnel mint, no real edge. There is no edge offline, so they
-// cannot assert edge-flush timing; they assert the proxy relays the origin's
-// response faithfully: right status, right framing, byte-identical body, and —
-// for a streaming origin — every event delivered in order.
-
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -354,218 +342,6 @@ func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
 	}
 	if err := conn.Err(); err == nil || !strings.Contains(err.Error(), v1.TLSEnv) {
 		t.Errorf("Err() = %v, want a %s parse cause", err, v1.TLSEnv)
-	}
-}
-
-// mustProxy interposes the reverse-proxy shim in front of the origin server
-// and returns the http:// base URL a client dials.
-func mustProxy(t *testing.T, ctx context.Context, srv *httptest.Server) string {
-	t.Helper()
-	origin := mustURL(t, srv.URL)
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ps := &http.Server{Handler: newOriginProxy(origin, logger, originTransport(origin))}
-	context.AfterFunc(ctx, func() { ps.Close() })
-	go ps.Serve(l)
-	return "http://" + l.Addr().String()
-}
-
-// TestProxyRelaysVerbatim pins what the proxy owes the one origin it fronts:
-// the request as it arrived — path, query, inbound Host, and headers a browser
-// sends on a navigation — and the response as the origin wrote it, with
-// nothing added. The proxy fronts exactly one origin, so a bare numeric
-// parameter is application data, a Referer routes nothing, and no cookie is
-// ever set.
-func TestProxyRelaysVerbatim(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "%s|%s|%s", r.Host, r.URL.Path, r.URL.RawQuery)
-	}))
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	base := mustProxy(t, ctx, srv)
-
-	req, err := http.NewRequest("GET", base+"/deep/path?1&x=y", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Host = "example.tunnel.test"
-	req.Header.Set("Referer", base+"/?1")
-	req.Header.Set("Sec-Fetch-Dest", "iframe")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200 (no redirect)", resp.StatusCode)
-	}
-	if want := "example.tunnel.test|/deep/path|1&x=y"; string(body) != want {
-		t.Errorf("body = %q, want %q (Host, path and query forwarded verbatim)", body, want)
-	}
-	if got := resp.Header.Values("Set-Cookie"); len(got) != 0 {
-		t.Errorf("Set-Cookie = %q, want none", got)
-	}
-}
-
-func qint(r *http.Request, key string, def int) int {
-	if v := r.URL.Query().Get(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return def
-}
-
-// TestPassthroughContentLength proves a FIXED (Content-Length) origin response
-// is relayed VERBATIM through the shim: a normal, complete response — right
-// status and a byte-identical body — not a mangled one.
-func TestPassthroughContentLength(t *testing.T) { runPassthrough(t, false) }
-
-// TestPassthroughContentLength_TLS is the regression for #106: an apiserver
-// /healthz-shaped response (TLS origin, fixed Content-Length body "ok"). The
-// shim must dial the origin over TLS (InsecureSkipVerify) and relay verbatim.
-func TestPassthroughContentLength_TLS(t *testing.T) { runPassthrough(t, true) }
-
-func runPassthrough(t *testing.T, useTLS bool) {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// A small, single write with no Flush lets net/http set a fixed
-		// Content-Length (the non-chunked, /healthz shape).
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		io.WriteString(w, "ok")
-	})
-	var srv *httptest.Server
-	if useTLS {
-		srv = httptest.NewTLSServer(handler)
-	} else {
-		srv = httptest.NewServer(handler)
-	}
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	base := mustProxy(t, ctx, srv)
-
-	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/healthz", nil)
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("request through shim failed: %v", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status %d, want 200 (verbatim relay of the fixed origin response)", resp.StatusCode)
-	}
-	if string(body) != "ok" {
-		t.Fatalf("body %q, want %q (relay must be byte-identical)", body, "ok")
-	}
-	if resp.ContentLength != 2 {
-		t.Errorf("Content-Length %d, want 2 (fixed framing preserved verbatim)", resp.ContentLength)
-	}
-	if te := resp.TransferEncoding; len(te) != 0 {
-		t.Errorf("Transfer-Encoding %v, want none (fixed response must not be re-chunked)", te)
-	}
-}
-
-// streamEvent is one NDJSON event the streaming origin emits.
-type streamEvent struct {
-	Seq int    `json:"seq"`
-	Ts  string `json:"ts"`
-}
-
-// TestStreamingPassthrough proves a chunked, unbuffered streaming origin
-// response (the kube-watch shape) is proxied straight through: every event
-// arrives, in order. This is a single straight stream through the reverse proxy.
-func TestStreamingPassthrough(t *testing.T) {
-	const total = 12
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fl, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-			return
-		}
-		n := qint(r, "n", total)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fl.Flush()
-		enc := json.NewEncoder(w) // appends '\n' -> NDJSON, like a watch stream
-		for i := 0; i < n; i++ {
-			if err := enc.Encode(streamEvent{Seq: i, Ts: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
-				return
-			}
-			fl.Flush()
-			select {
-			case <-r.Context().Done():
-				return
-			case <-time.After(50 * time.Millisecond):
-			}
-		}
-	})
-	srv := httptest.NewServer(handler)
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	base := mustProxy(t, ctx, srv)
-
-	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/watch?n="+strconv.Itoa(total), nil)
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("request through shim failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status %d, want 200", resp.StatusCode)
-	}
-
-	var ordered []int
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		var ev streamEvent
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			t.Fatalf("non-JSON line through the proxy (framing corrupted): %q", line)
-		}
-		ordered = append(ordered, ev.Seq)
-	}
-	if err := sc.Err(); err != nil {
-		t.Fatalf("body read ended with %v (after %d events)", err, len(ordered))
-	}
-
-	if len(ordered) != total {
-		t.Fatalf("collected %d events, want %d (a straight proxied stream must deliver all)", len(ordered), total)
-	}
-	for i, seq := range ordered {
-		if seq != i {
-			t.Fatalf("event %d arrived as seq %d — out of order", i, seq)
-		}
 	}
 }
 
@@ -914,16 +690,6 @@ func TestReconnectTunnelShutdown(t *testing.T) {
 	if err := b.Reconnect(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Reconnect after tunnel shutdown: err = %v, want context.Canceled", err)
 	}
-}
-
-// mustURL parses a test origin URL.
-func mustURL(t *testing.T, raw string) *url.URL {
-	t.Helper()
-	u, err := url.Parse(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return u
 }
 
 // shortBudgets swaps the retry budgets for millisecond ones so a test can
@@ -1367,55 +1133,37 @@ func (r *recorder) kinds() []v1.EventKind {
 	return kinds(r.events)
 }
 
-// TestLoopThroughAnswersOnlyItsNonce pins the whole reason the loop-through
-// is acceptable: the exact nonce is answered by the proxy and the origin sees
-// nothing, while any other value — or none — is an ordinary request that the
-// origin does see.
-func TestLoopThroughAnswersOnlyItsNonce(t *testing.T) {
-	var origin atomic.Int32
-	h := loopThrough("secret-nonce", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin.Add(1)
-		w.WriteHeader(http.StatusTeapot)
-	}))
-
-	do := func(header string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		if header != "" {
-			req.Header.Set(establishHeader, header)
+// TestIngressAnswersOnlyItsLoop pins the whole reason the loop-through is
+// acceptable: the tunnel's own path is answered 204 by cloudflared and never
+// reaches the origin, while any other path — a neighbour of it included — is
+// the origin's, and an https origin keeps its scheme.
+func TestIngressAnswersOnlyItsLoop(t *testing.T) {
+	const loop = loopPrefix + "0123abcd"
+	ing, err := ingressFor("https://127.0.0.1:8443", loop, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		path, want string
+	}{
+		{loop, "http_status:204"},
+		{loop + "x", "https://127.0.0.1:8443"},
+		{loopPrefix + "other", "https://127.0.0.1:8443"},
+		{"/", "https://127.0.0.1:8443"},
+		{"/.well-known/libtunnelx0123abcd", "https://127.0.0.1:8443"},
+	} {
+		rule, _ := ing.FindMatchingRule("demo.tunneled.pizza", tc.path)
+		if got := rule.Service.String(); got != tc.want {
+			t.Errorf("%s goes to %s, want %s", tc.path, got, tc.want)
 		}
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		return rec
-	}
-
-	rec := do("secret-nonce")
-	if rec.Code != http.StatusNoContent || rec.Header().Get(establishHeader) != "secret-nonce" {
-		t.Errorf("exact nonce: %d with echo %q, want 204 echoing the nonce", rec.Code, rec.Header().Get(establishHeader))
-	}
-	if got := origin.Load(); got != 0 {
-		t.Fatalf("the origin saw %d requests for the exact nonce, want 0", got)
-	}
-
-	if rec := do("wrong"); rec.Code != http.StatusTeapot {
-		t.Errorf("wrong nonce: %d, want the origin's answer", rec.Code)
-	}
-	if rec := do(""); rec.Code != http.StatusTeapot {
-		t.Errorf("no header: %d, want the origin's answer", rec.Code)
-	}
-	if got := origin.Load(); got != 2 {
-		t.Errorf("the origin saw %d ordinary requests, want 2", got)
 	}
 }
 
 // TestEstablishRidesOutTheEdge pins the loop against what the edge does
-// before the route is live: it answers in the proxy's place. Two of those,
-// then the proxy's own 204, and the event fires once — with the origin never
-// asked at any point.
+// before the route is live: it answers in cloudflared's place. Two of those,
+// then the ingress's own 204, and the event fires once.
 func TestEstablishRidesOutTheEdge(t *testing.T) {
-	var origin, hits atomic.Int32
-	proxy := loopThrough("n", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin.Add(1)
-	}))
+	var hits atomic.Int32
 	edge := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hits.Add(1) <= 2 {
 			// Cloudflare's own page for a tunnel it cannot route yet.
@@ -1423,7 +1171,8 @@ func TestEstablishRidesOutTheEdge(t *testing.T) {
 			fmt.Fprint(w, "<html>error code: 1033</html>")
 			return
 		}
-		proxy.ServeHTTP(w, r)
+		// What the tunnel's own ingress answers for its loop path.
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer edge.Close()
 
@@ -1432,16 +1181,13 @@ func TestEstablishRidesOutTheEdge(t *testing.T) {
 	rec := &recorder{}
 	log := slog.New(slog.DiscardHandler)
 
-	b.establish(context.Background(), rec, edge.Client(), edge.URL+"/", "n", log)
+	b.establish(context.Background(), rec, edge.Client(), edge.URL+loopPrefix+"n", log)
 
 	if got := rec.kinds(); len(got) != 1 || got[0] != v1.EventEstablished {
 		t.Fatalf("events %v, want exactly [established]", got)
 	}
 	if got := hits.Load(); got != 3 {
 		t.Errorf("edge saw %d requests, want 3: two refused, one through", got)
-	}
-	if got := origin.Load(); got != 0 {
-		t.Errorf("the origin saw %d requests, want 0", got)
 	}
 }
 
@@ -1516,64 +1262,6 @@ func TestEdgeWatcherCountsDisconnects(t *testing.T) {
 	}
 	if got := w.attemptCount(); got != 0 {
 		t.Errorf("attempts = %d, want disconnects not to be counted as attempts", got)
-	}
-}
-
-// TestServingFiresOnceTheProxyServes pins the local half of readiness: the
-// reverse proxy has begun serving before any edge connection is attempted,
-// so a listener hears EventServing after the mint and ahead of everything
-// the edge reports, with no hostname on it yet. The listener cancels the
-// tunnel on the spot, which is what keeps this off the edge and fast.
-func TestServingFiresOnceTheProxyServes(t *testing.T) {
-	clearSpecEnv(t)
-	var seenHeaders http.Header
-	t.Setenv(v1.CloudflareProviderEnv, mintServer(t, &seenHeaders).URL)
-
-	tun := v1alpha1.New(New())
-	var mu sync.Mutex
-	var seen []v1.Event
-	stop := errors.New("stop at serving")
-	tun.WithEventListener(func(e v1.Event) {
-		mu.Lock()
-		seen = append(seen, e)
-		mu.Unlock()
-		if e.Kind == v1.EventServing {
-			tun.Cancel(stop)
-		}
-	})
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	tun.WithListener(l)
-
-	select {
-	case <-tun.Done():
-	case <-time.After(10 * time.Second):
-		t.Fatal("tunnel never ended after the listener canceled it")
-	}
-	if !errors.Is(tun.Err(), stop) {
-		t.Fatalf("Err = %v, want the listener's cancel", tun.Err())
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	got := kinds(seen)
-	if len(got) == 0 || got[0] != v1.EventServing {
-		t.Fatalf("events %v, want serving first", got)
-	}
-	if seen[0].Hostname != "" {
-		t.Errorf("EventServing carried hostname %q, want empty until the edge registers", seen[0].Hostname)
-	}
-	for _, k := range got {
-		if k == v1.EventConnected {
-			t.Errorf("events %v: %s reported after the tunnel was canceled at serving", got, k)
-		}
-	}
-	if seenHeaders == nil {
-		t.Error("the mint never ran, so serving cannot have followed it")
 	}
 }
 
@@ -1723,7 +1411,7 @@ func TestEstablishKeepsTryingUntilCanceled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 
-	b.establish(ctx, rec, edge.Client(), edge.URL+"/", "n", slog.New(slog.DiscardHandler))
+	b.establish(ctx, rec, edge.Client(), edge.URL+loopPrefix+"n", slog.New(slog.DiscardHandler))
 	if ctx.Err() == nil {
 		t.Error("establish returned before its context ended")
 	}

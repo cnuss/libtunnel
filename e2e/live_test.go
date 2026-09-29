@@ -275,12 +275,13 @@ func TestLiveBinary(t *testing.T) {
 // already-running local HTTP server the tunnel does not own, provided as a
 // URL (the `cloudflared tunnel --url` equivalent; no listener crosses the
 // tunnel API) — and runs every scenario that shape carries on ONE tunnel: a
-// plain round trip, then the LIVE proof that the reverse proxy fronting the
-// origin relays a real streaming (kubernetes-watch-shaped) chunked HTTP 200
-// faithfully — every event, in order — through the live cloudflared + edge
-// path. The stream case does NOT assert defeat of any edge buffering (the
-// proxy doesn't, and shouldn't be expected to); edge buffering may bunch
-// arrival, but every event still lands exactly once and in order. The client
+// plain round trip, the forwarding headers the edge sets reaching the origin,
+// then the LIVE proof that a real streaming (kubernetes-watch-shaped) chunked
+// HTTP 200 arrives faithfully — every event, in order — through the live
+// cloudflared + edge path. The stream case does NOT assert defeat of any edge
+// buffering (nothing here does, and shouldn't be expected to); edge buffering
+// may bunch arrival, but every event still lands exactly once and in order.
+// The client
 // re-issues the IDENTICAL request as needed (the kubectl re-watch shape) to
 // collect the whole stream.
 func TestLiveLocalURL(t *testing.T) {
@@ -307,7 +308,7 @@ func TestLiveLocalURL(t *testing.T) {
 		t.Fatalf("tunnel never became ready: tunnel err=%v, ctx err=%v", conn.Err(), ctx.Err())
 	}
 	base := strings.TrimRight(pub.String(), "/")
-	t.Logf("tunnel up via reverse proxy: %s", base)
+	t.Logf("tunnel up: %s", base)
 	// 60s: this fresh connector adopts the shared hostname, so warmup may ride
 	// out a transient 5xx while the edge re-resolves the sticky route.
 	warmup(t, ctx, base+"/watch?n=1&ms=1", 60*time.Second)
@@ -316,9 +317,15 @@ func TestLiveLocalURL(t *testing.T) {
 		eventuallyBody(t, base+"/body", "hello via local URL", 30*time.Second)
 	})
 
+	t.Run("ForwardingHeaders", func(t *testing.T) {
+		// The visitor came over https from somewhere: the origin is told both,
+		// so an app building absolute URLs from X-Forwarded-Proto gets https.
+		eventuallyBody(t, base+"/forwarded", "proto=https for=true", 30*time.Second)
+	})
+
 	t.Run("WatchStream", func(t *testing.T) {
-		// One kube watch: 20 events, 500ms apart (~10s of stream). The proxy must
-		// relay every event, in order, exactly once (edge buffering may bunch their
+		// One kube watch: 20 events, 500ms apart (~10s of stream). Every event
+		// must arrive, in order, exactly once (edge buffering may bunch their
 		// arrival — that is the edge's doing, not a relay fault).
 		const total = 20
 		watchURL := base + "/watch?probe=watch&n=20&ms=500"
@@ -337,7 +344,7 @@ func TestLiveLocalURL(t *testing.T) {
 
 		t.Logf("collected %d/%d events; origin requests=%d", len(seen), total, originHits.Load())
 		if len(seen) != total {
-			t.Fatalf("collected %d events, want %d (the proxy must relay the whole stream)", len(seen), total)
+			t.Fatalf("collected %d events, want %d (the whole stream must arrive)", len(seen), total)
 		}
 		for i, seq := range ordered {
 			if seq != i {
