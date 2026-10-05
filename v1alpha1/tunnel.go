@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"slices"
@@ -498,6 +499,11 @@ func (t *TunnelImpl[T]) Hostname() string {
 // Messages is what the provider said with the spec, as sent.
 func (t *TunnelImpl[T]) Messages() []string {
 	return t.Spec().Messages()
+}
+
+// Headers is what the provider answered the mint with, as sent.
+func (t *TunnelImpl[T]) Headers() http.Header {
+	return t.Spec().Headers()
 }
 
 // Secret is the spec's secret, nil when its backend has none.

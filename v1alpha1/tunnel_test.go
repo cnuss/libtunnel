@@ -7,7 +7,9 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1280,6 +1282,21 @@ func TestMessagesComeOffTheSpec(t *testing.T) {
 	}
 	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.pizza"})).Messages(); got != nil {
 		t.Errorf("Messages = %v with nothing said, want nil", got)
+	}
+}
+
+// TestHeadersComeOffTheSpec pins the accessor: the mint's response headers
+// are read off the tunnel as the spec carries them, and resolving the spec
+// is what the first call does, like Messages.
+func TestHeadersComeOffTheSpec(t *testing.T) {
+	spec := &cloudflare.Spec{Hostname: "demo.tunneled.pizza"}
+	spec.WithResponseHeader("X-Www-Authenticate", `Basic realm="demo.tunneled.pizza"`)
+	tun := v1alpha1.New(newFakeEngine(spec))
+	if got := tun.Headers(); !reflect.DeepEqual(got, http.Header{"X-Www-Authenticate": {`Basic realm="demo.tunneled.pizza"`}}) {
+		t.Errorf("Headers = %v, want the spec's", got)
+	}
+	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.pizza"})).Headers(); got != nil {
+		t.Errorf("Headers = %v with none sent, want nil", got)
 	}
 }
 

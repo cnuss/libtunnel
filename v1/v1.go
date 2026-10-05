@@ -524,6 +524,10 @@ type Tunnel interface {
 	// spec (see Spec.Messages): as sent, in its order, nil when nothing. A
 	// getter like Hostname: the first use resolves the spec.
 	Messages() []string
+	// Headers is every response header the provider answered the mint
+	// with (see Spec.Headers): unfiltered, a copy, nil when none. A getter
+	// like Hostname: the first use resolves the spec.
+	Headers() http.Header
 	// Secret is the tunnel secret (see Spec.GetSecret), nil when the backend
 	// has none. It is a credential — whoever holds it can run the tunnel. A
 	// getter like Hostname: the first use resolves the spec.
