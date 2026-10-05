@@ -104,6 +104,8 @@ type Tunnel interface {
     Domain() string
     Port() int
     Secret() []byte // the spec's secret; nil when the backend has none
+    Headers() http.Header // every response header the mint answered with,
+                          // unfiltered; rides the spec, so a replay has them
     CACerts() []*x509.Certificate
 
     Listener() net.Listener // start trigger: mints a loopback listener if none provided

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1486,5 +1487,85 @@ func TestMessagesRideTheMintWithoutACode(t *testing.T) {
 	_, err = New().WithProvider(failing.URL).Provider().Spec(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "1002: no; and this") {
 		t.Errorf("failure = %v, want the coded entry with its code and the other as is", err)
+	}
+}
+
+// TestMintKeepsEveryResponseHeader pins that a successful mint's response
+// headers ride the spec unfiltered: the provider's own (X-Record-Id, which
+// still lands in metadata as before, and X-Www-Authenticate), the server's
+// (Content-Type, Date), and every value of one sent twice, in order. They
+// survive the envelope, which is how a replay reads them back.
+func TestMintKeepsEveryResponseHeader(t *testing.T) {
+	clearSpecEnv(t)
+	const challenge = `Basic realm="minted.tunneled.pizza", pw="$pbkdf2-sha256$i=600000$c2FsdA$aGFzaA"`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Record-Id", "rec-9")
+		w.Header().Set("X-Www-Authenticate", challenge)
+		w.Header().Add("Set-Cookie", "a=1")
+		w.Header().Add("Set-Cookie", "b=2")
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	spec, err := New().WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := spec.Headers()
+	if h.Get("X-Record-Id") != "rec-9" || h.Get("X-Www-Authenticate") != challenge {
+		t.Errorf("provider headers = %v, want X-Record-Id and X-Www-Authenticate as sent", h)
+	}
+	if h.Get("Content-Type") == "" || h.Get("Date") == "" {
+		t.Errorf("headers = %v, want the server's own too: nothing is filtered", h)
+	}
+	if got := h.Values("Set-Cookie"); !reflect.DeepEqual(got, []string{"a=1", "b=2"}) {
+		t.Errorf("Set-Cookie = %q, want both, in order", got)
+	}
+	if spec.RecordID() != "rec-9" {
+		t.Errorf("RecordID = %q, want rec-9: the record's own carrier is unchanged", spec.RecordID())
+	}
+
+	// Offline, the way TestReplayFallsBackWhenProviderUnreachable does it: a
+	// listener closed before the mint, so the replay is handed back verbatim.
+	shortBudgets(t, 50*time.Millisecond)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	replayed, err := From(spec).WithProvider("http://" + addr).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatalf("offline replay: %v", err)
+	}
+	if !reflect.DeepEqual(replayed.Headers(), h) {
+		t.Errorf("headers after an offline replay = %v, want %v", replayed.Headers(), h)
+	}
+}
+
+// TestMintHeadersAreTheAnsweringResponses pins that a mint which retries
+// keeps the headers of the response that produced its spec, not those of a
+// throttle before it, and not a merge of the two.
+func TestMintHeadersAreTheAnsweringResponses(t *testing.T) {
+	clearSpecEnv(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("X-Attempt", "throttled")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("X-Attempt", "answered")
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.pizza","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	spec, err := New().WithProvider(srv.URL).Provider().Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Headers().Values("X-Attempt"); !reflect.DeepEqual(got, []string{"answered"}) {
+		t.Errorf("X-Attempt = %q, want only the answering response's", got)
 	}
 }

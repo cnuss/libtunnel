@@ -2,6 +2,8 @@ package spec
 
 import (
 	"encoding/json"
+	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -61,7 +63,7 @@ func TestRecordIDRidesTheEnvelopeNotTheSpec(t *testing.T) {
 func TestNoRecordIDWritesNoMetadata(t *testing.T) {
 	s := &Spec{ID: "id-1", Hostname: "h.tunneled.pizza"}
 	envelope := s.Serialize()
-	if strings.Contains(envelope, "metadata") || strings.Contains(envelope, "messages") {
+	if strings.Contains(envelope, "metadata") || strings.Contains(envelope, "messages") || strings.Contains(envelope, "headers") {
 		t.Errorf("envelope carries something beside a spec that has nothing: %s", envelope)
 	}
 	_, raw, aside, err := v1alpha1.DecodeSpec(envelope)
@@ -72,8 +74,8 @@ func TestNoRecordIDWritesNoMetadata(t *testing.T) {
 	if err := v1alpha1.Unpack(raw, aside, got); err != nil {
 		t.Fatal(err)
 	}
-	if got.RecordID() != "" || got.Messages() != nil {
-		t.Errorf("record %q, messages %v, want none", got.RecordID(), got.Messages())
+	if got.RecordID() != "" || got.Messages() != nil || got.Headers() != nil {
+		t.Errorf("record %q, messages %v, headers %v, want none", got.RecordID(), got.Messages(), got.Headers())
 	}
 }
 
@@ -89,5 +91,105 @@ func TestUnknownMetadataIsDropped(t *testing.T) {
 	s.WithMeta(RecordIDKey, "rec-1")
 	if got := s.Metadata(); len(got) != 1 || got[RecordIDKey] != "rec-1" {
 		t.Errorf("Metadata = %v, want only the record", got)
+	}
+}
+
+// TestHeadersRideTheEnvelopeUnfiltered pins where a mint's response headers
+// go: beside the spec under "headers", every one of them and every value in
+// order, X-Record-Id included, and back onto the spec on a decode. The
+// record's own metadata is a separate carrier and is not touched by them.
+func TestHeadersRideTheEnvelopeUnfiltered(t *testing.T) {
+	s := &Spec{ID: "id-1", Hostname: "h.tunneled.pizza", Secret: []byte("s")}
+	s.WithResponseHeader("x-record-id", "rec-1")
+	s.WithResponseHeader("X-Www-Authenticate", `Basic realm="h.tunneled.pizza", pw="$pbkdf2-sha256$i=600000$c2FsdA$aGFzaA"`)
+	s.WithResponseHeader("Date", "Sun, 04 Oct 2026 23:30:00 GMT")
+	s.WithResponseHeader("X-Twice", "one")
+	s.WithResponseHeader("X-Twice", "two")
+
+	envelope := s.Serialize()
+	var e struct {
+		Spec     map[string]json.RawMessage `json:"spec"`
+		Metadata map[string]string          `json:"metadata"`
+		Headers  http.Header                `json:"headers"`
+	}
+	if err := json.Unmarshal([]byte(envelope), &e); err != nil {
+		t.Fatal(err)
+	}
+	if _, inSpec := e.Spec["headers"]; inSpec {
+		t.Errorf("headers inside the spec body; want them beside it: %s", envelope)
+	}
+	want := http.Header{
+		"X-Record-Id":        {"rec-1"},
+		"X-Www-Authenticate": {`Basic realm="h.tunneled.pizza", pw="$pbkdf2-sha256$i=600000$c2FsdA$aGFzaA"`},
+		"Date":               {"Sun, 04 Oct 2026 23:30:00 GMT"},
+		"X-Twice":            {"one", "two"},
+	}
+	if !reflect.DeepEqual(e.Headers, want) {
+		t.Errorf("envelope headers = %v, want %v", e.Headers, want)
+	}
+	if e.Metadata != nil {
+		t.Errorf("metadata = %v; a header is not metadata, want none", e.Metadata)
+	}
+
+	_, raw, aside, err := v1alpha1.DecodeSpec(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := &Spec{}
+	if err := v1alpha1.Unpack(raw, aside, got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Headers(), want) {
+		t.Errorf("round trip headers = %v, want %v", got.Headers(), want)
+	}
+	if got.RecordID() != "" {
+		t.Errorf("RecordID = %q from a header alone, want it only from metadata", got.RecordID())
+	}
+}
+
+// TestHeadersFromAnOldEnvelope pins that an envelope written before headers
+// existed decodes as it always did, with no headers, and that a hand-written
+// lowercase key reads back canonical, so Get finds it.
+func TestHeadersFromAnOldEnvelope(t *testing.T) {
+	old := `{"backend":"cloudflare","hostname":"h.tunneled.pizza","spec":{"id":"id-1","name":"","hostname":"h.tunneled.pizza","account_tag":"","secret":"cw=="},"metadata":{"record_id":"rec-1"}}`
+	_, raw, aside, err := v1alpha1.DecodeSpec(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := &Spec{}
+	if err := v1alpha1.Unpack(raw, aside, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Headers() != nil || got.RecordID() != "rec-1" {
+		t.Errorf("headers %v, record %q; want none and rec-1", got.Headers(), got.RecordID())
+	}
+
+	lower := `{"backend":"cloudflare","spec":{"id":"id-1","hostname":"h.tunneled.pizza"},"headers":{"x-www-authenticate":["Basic realm=\"h\""]}}`
+	_, raw, aside, err = v1alpha1.DecodeSpec(lower)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = &Spec{}
+	if err := v1alpha1.Unpack(raw, aside, got); err != nil {
+		t.Fatal(err)
+	}
+	if v := got.Headers().Get("X-Www-Authenticate"); v != `Basic realm="h"` {
+		t.Errorf("Get(X-Www-Authenticate) = %q from a lowercase key, want it canonical", v)
+	}
+}
+
+// TestHeadersIsACopy pins that what Headers hands out is the caller's: a
+// change to it reaches neither the spec nor what it serializes.
+func TestHeadersIsACopy(t *testing.T) {
+	s := &Spec{ID: "id-1", Hostname: "h.tunneled.pizza"}
+	s.WithResponseHeader("X-One", "1")
+	h := s.Headers()
+	h.Set("X-One", "changed")
+	h.Set("X-Two", "2")
+	if got := s.Headers(); !reflect.DeepEqual(got, http.Header{"X-One": {"1"}}) {
+		t.Errorf("Headers after a caller's change = %v, want the spec's own", got)
+	}
+	if strings.Contains(s.Serialize(), "changed") {
+		t.Error("a caller's change to Headers reached the envelope")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"sync"
 
@@ -25,11 +26,13 @@ type specEnvelope struct {
 
 // Aside is what the envelope carries beside the spec, kept out of the spec's
 // own encoding so that stays the provider's: what the provider said in its
-// headers (v1.Spec.Metadata) and what it said to whoever runs this
-// (v1.Spec.Messages). Each absent when there was nothing.
+// headers that the backend reads (v1.Spec.Metadata), what it said to
+// whoever runs this (v1.Spec.Messages), and every header it answered with,
+// unread (v1.Spec.Headers). Each absent when there was nothing.
 type Aside struct {
 	Metadata v1.SpecMetadata `json:"metadata,omitempty"`
 	Messages []string        `json:"messages,omitempty"`
+	Headers  http.Header     `json:"headers,omitempty"`
 }
 
 // selfExported records v1.SpecEnv values this process exported itself, so
@@ -108,7 +111,7 @@ func EncodeSpec[T v1.Spec](backend string, spec T) (string, error) {
 		Backend:  backend,
 		Hostname: spec.GetHostname(),
 		Spec:     data,
-		Aside:    Aside{Metadata: spec.Metadata(), Messages: spec.Messages()},
+		Aside:    Aside{Metadata: spec.Metadata(), Messages: spec.Messages(), Headers: spec.Headers()},
 	})
 	if err != nil {
 		return "", fmt.Errorf("unable to encode spec envelope: %w", err)
@@ -132,8 +135,8 @@ func DecodeSpec(envelope string) (backend string, spec json.RawMessage, aside As
 }
 
 // Unpack fills into from what DecodeSpec split: the spec from its own JSON,
-// then what rode beside it, the metadata key by key and the messages in
-// order.
+// then what rode beside it, the metadata key by key, the messages in order,
+// and the headers value by value.
 func Unpack[T v1.Spec](spec json.RawMessage, aside Aside, into T) error {
 	if err := json.Unmarshal(spec, into); err != nil {
 		return err
@@ -143,6 +146,11 @@ func Unpack[T v1.Spec](spec json.RawMessage, aside Aside, into T) error {
 	}
 	for _, message := range aside.Messages {
 		into.WithMessage(message)
+	}
+	for key, values := range aside.Headers {
+		for _, value := range values {
+			into.WithResponseHeader(key, value)
+		}
 	}
 	return nil
 }
