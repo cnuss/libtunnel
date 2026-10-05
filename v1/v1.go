@@ -16,6 +16,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"time"
@@ -400,6 +401,15 @@ type Spec interface {
 	Messages() []string
 	// WithMessage records one message, and returns the spec.
 	WithMessage(message string) Spec
+	// Headers is every response header the provider answered the mint with,
+	// as it sent them: every name, every value in order, nothing filtered.
+	// libtunnel carries them, unread. It rides the envelope beside the
+	// spec, so a replay that cannot reach the provider still has it. A
+	// copy, nil when there were none. WithResponseHeader writes it.
+	Headers() http.Header
+	// WithResponseHeader records one value of a response header under its
+	// canonical name, after any already recorded, and returns the spec.
+	WithResponseHeader(key, value string) Spec
 }
 
 // Provider supplies a tunnel spec. Implementations may mint fresh credentials

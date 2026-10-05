@@ -4,6 +4,8 @@
 package spec
 
 import (
+	"net/http"
+
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
 )
@@ -23,11 +25,12 @@ const RecordIDKey = "record_id"
 // Meta is what tunnel.pizza said beside the spec, typed. The interface speaks
 // in keys (v1.SpecMetadata); they are filled in here and read out from here,
 // best effort — a key this backend does not know is dropped on the way in,
-// and a field it has nothing for is left out on the way out. Messages are
-// carried as sent.
+// and a field it has nothing for is left out on the way out. Messages and
+// headers are carried as sent.
 type Meta struct {
 	recordID string
 	messages []string
+	headers  http.Header
 }
 
 // Spec is the Cloudflare backend's credential set — the spec type T produced
@@ -75,6 +78,25 @@ func (s *Spec) Messages() []string {
 // WithMessage implements v1.Spec.
 func (s *Spec) WithMessage(message string) v1.Spec {
 	s.meta.messages = append(s.meta.messages, message)
+	return s
+}
+
+// Headers implements v1.Spec: a copy, so a caller's change stays the
+// caller's; nil when the mint answered with none.
+func (s *Spec) Headers() http.Header {
+	if s == nil || len(s.meta.headers) == 0 {
+		return nil
+	}
+	return s.meta.headers.Clone()
+}
+
+// WithResponseHeader implements v1.Spec: any name, kept under its canonical
+// form, the value after any already there.
+func (s *Spec) WithResponseHeader(key, value string) v1.Spec {
+	if s.meta.headers == nil {
+		s.meta.headers = http.Header{}
+	}
+	s.meta.headers.Add(key, value)
 	return s
 }
 
