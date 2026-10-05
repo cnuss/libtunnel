@@ -334,6 +334,15 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 					out.spec.WithMessage(e.Message)
 				}
 			}
+			// Every header the provider answered with, carried as sent: no
+			// name is chosen here, so what a provider adds tomorrow reaches
+			// whoever runs this without a libtunnel release. The record is
+			// still read off its own header into metadata, as before.
+			for key, values := range resp.Header {
+				for _, value := range values {
+					out.spec.WithResponseHeader(key, value)
+				}
+			}
 			if !throttled {
 				if !own && mintWait > 0 {
 					log.Info("waiting for the hostname's DNS record to spread", "endpoint", endpoint, "hostname", out.spec.Hostname, "delay", mintWait)
