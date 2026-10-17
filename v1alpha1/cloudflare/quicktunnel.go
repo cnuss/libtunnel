@@ -69,8 +69,9 @@ type mintResult struct {
 // endpoint.
 var budget = v1.Budget
 
-// QuickTunnelProvider mints an anonymous *.tunneled.pizza tunnel from the
-// quick-tunnel API, retrying with linear backoff until the context is done.
+// QuickTunnelProvider mints an anonymous quick tunnel from the quick-tunnel
+// API, on whichever tunnel domain the provider (tunnel.pizza by default)
+// chooses, retrying with linear backoff until the context is done.
 // The hint — whatever the caller already knows about the tunnel — rides the
 // request as the X-* headers, so a provider that reaps idle tunnels can hand
 // the named tunnel back instead of minting fresh — see Spec.

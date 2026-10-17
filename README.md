@@ -55,7 +55,7 @@ func main() {
 	if url == nil {
 		log.Fatal(conn.Err())
 	}
-	fmt.Println(url) // https://<something>.tunneled.pizza/
+	fmt.Println(url) // https://<hostname>/
 }
 ```
 
@@ -298,7 +298,7 @@ to do — and a spec is credentials, so store it as such.
 
 ```go
 // replay the most recently cached tunnel by hostname
-conn := libtunnel.From("foo.tunneled.pizza").WithListener(l)
+conn := libtunnel.From("foo.tunneld.domain").WithListener(l)
 ```
 
 ## Environment variables

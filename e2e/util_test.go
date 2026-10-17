@@ -222,6 +222,11 @@ func preflight() error {
 		qt := cloudflare.QuickTunnel()
 		qt.Log = slog.Default()
 		preflightSpec, preflightErr = qt.Spec(ctx)
+		if preflightErr == nil && ownProvider() {
+			if _, zone, ok := strings.Cut(preflightSpec.Hostname, "."); ok && zone != "" {
+				edgeZone = "." + zone
+			}
+		}
 		lastLiveStart = time.Now() // the mint counts toward pacing
 	})
 	return preflightErr
@@ -273,7 +278,7 @@ func waitReady(t *testing.T, conn v1.Tunnel, d time.Duration) {
 	}
 }
 
-// edgeAddrs are tunneled.pizza's anycast edge addresses. The harness dials
+// edgeAddrs are tunnel.pizza's anycast edge addresses. The harness dials
 // them directly instead of resolving the tunnel hostname: the edge routes by
 // TLS SNI, which the transport still sets from the URL's hostname, so DNS is
 // out of the request path entirely. That is deliberate — these scenarios are
@@ -285,11 +290,22 @@ func waitReady(t *testing.T, conn v1.Tunnel, d time.Duration) {
 // early lookup.
 var edgeAddrs = []string{"104.16.230.132:443", "104.16.231.132:443"}
 
-// edgeZone is the hostname suffix edgeAddrs serve. A tunnel minted from
-// another provider (api.trycloudflare.com) lands on a hostname these
-// addresses were never measured against, so it resolves normally rather than
-// riding an assumption about which anycast set answers for it.
-const edgeZone = ".tunneled.pizza"
+// edgeZone is the hostname suffix edgeAddrs serve: the parent domain of the
+// preflight's hostname, with a leading dot, when tunnel.pizza minted it. It
+// stays empty, and every hostname resolves normally, when the preflight
+// minted from another provider (api.trycloudflare.com), whose hostnames these
+// addresses were never measured against.
+var edgeZone string
+
+// ownProvider reports whether mints go to tunnel.pizza, the provider edgeAddrs
+// were measured against.
+func ownProvider() bool {
+	switch os.Getenv(v1.CloudflareProviderEnv) {
+	case "", "tunnel.pizza":
+		return true
+	}
+	return false
+}
 
 // dialEdge dials one of edgeAddrs for a :443 destination in edgeZone, falling
 // back to a normal resolve-and-dial (covering another provider's hostname, a
@@ -297,7 +313,7 @@ const edgeZone = ".tunneled.pizza"
 func dialEdge(ctx context.Context, network, addr string) (net.Conn, error) {
 	var d net.Dialer
 	var edgeErr error
-	if host, port, err := net.SplitHostPort(addr); err == nil && port == "443" && strings.HasSuffix(host, edgeZone) {
+	if host, port, err := net.SplitHostPort(addr); err == nil && port == "443" && edgeZone != "" && strings.HasSuffix(host, edgeZone) {
 		for _, edge := range edgeAddrs {
 			conn, err := d.DialContext(ctx, network, edge)
 			if err == nil {
@@ -433,7 +449,7 @@ func drain(t *testing.T, conn v1.Tunnel, cancel context.CancelFunc) {
 // startWatchOrigin starts a kube-apiserver `?watch=true` lookalike: GET /watch
 // returns a chunked application/json NDJSON stream that emits one
 // `{"type":"ADDED","object":{"seq":N,"ts":"<RFC3339Nano>","pad":"..."}}` event
-// per interval and flushes each — the exact shape a plain tunneled.pizza edge
+// per interval and flushes each — the exact shape a plain tunnel.pizza edge
 // buffers. Query params tune the stream: n (event count), ms (interval), pad
 // (filler bytes per event), since (first seq, so a reconnect resumes). GET
 // /body answers a fixed string, so the one tunnel TestLiveLocalURL puts in

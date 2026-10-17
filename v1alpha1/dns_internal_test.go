@@ -12,7 +12,7 @@ func TestDNSName(t *testing.T) {
 		{"app.example.com", "app.example.com"},
 		{"app.example.com:8443", "app.example.com"},
 		{"example.com:8443", "example.com"},
-		{"demo.tunneled.pizza", "demo.tunneled.pizza"},
+		{"demo.tunneld.domain", "demo.tunneld.domain"},
 		{"localhost:8080", "localhost"},
 	}
 	for _, c := range cases {
