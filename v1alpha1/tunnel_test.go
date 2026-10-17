@@ -125,7 +125,7 @@ func listen(t *testing.T) net.Listener {
 
 func TestLocalGettersDeriveFromListener(t *testing.T) {
 	l := listen(t)
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	conn := tun.WithListener(l)
 
 	addr := l.Addr().(*net.TCPAddr)
@@ -189,16 +189,16 @@ func TestUnspecifiedBindFallsBackToOutboundRouteIP(t *testing.T) {
 }
 
 func TestSpecGettersDeriveFromProvider(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 
-	if got := tun.Hostname(); got != "demo.tunneled.pizza" {
+	if got := tun.Hostname(); got != "demo.tunneled.test" {
 		t.Errorf("Hostname() = %q", got)
 	}
 	if got := tun.Host(); got != "demo" {
 		t.Errorf("Host() = %q, want %q", got, "demo")
 	}
-	if got := tun.Domain(); got != "tunneled.pizza" {
-		t.Errorf("Domain() = %q, want %q", got, "tunneled.pizza")
+	if got := tun.Domain(); got != "tunneled.test" {
+		t.Errorf("Domain() = %q, want %q", got, "tunneled.test")
 	}
 	if got := tun.Port(); got != 443 {
 		t.Errorf("Port() = %d, want 443", got)
@@ -250,7 +250,7 @@ func TestEngineReceivesListener(t *testing.T) {
 // prior WithListener binds a loopback listener, adopts it, and hands it to the
 // engine — so http.Serve(tun.Listener(), h) needs no net.Listen of its own.
 func TestListenerMintsWhenNoneProvided(t *testing.T) {
-	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	tun := v1alpha1.New(engine)
 
 	l := tun.Listener()
@@ -274,12 +274,12 @@ func TestListenerMintsWhenNoneProvided(t *testing.T) {
 // with no listener provided, it must mint a loopback listener and start the
 // tunnel — not block on readiness that could never arrive (#82).
 func TestURLMintsListenerWhenNoneProvided(t *testing.T) {
-	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	tun := v1alpha1.New(engine)
 
 	u := tun.URL()
-	if u == nil || u.String() != "https://demo.tunneled.pizza/" {
-		t.Fatalf("URL() = %v, want https://demo.tunneled.pizza/", u)
+	if u == nil || u.String() != "https://demo.tunneled.test/" {
+		t.Fatalf("URL() = %v, want https://demo.tunneled.test/", u)
 	}
 	select {
 	case got := <-engine.got:
@@ -295,7 +295,7 @@ func TestURLMintsListenerWhenNoneProvided(t *testing.T) {
 // waiting on it with no listener provided must start the tunnel and
 // eventually deliver, not block forever.
 func TestReadyStartsTunnelWhenNoneProvided(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 
 	select {
 	case _, ok := <-tun.Ready():
@@ -310,7 +310,7 @@ func TestReadyStartsTunnelWhenNoneProvided(t *testing.T) {
 // TestSecondWithListenerCancels pins the one-provide rule: a second
 // WithListener cancels the tunnel rather than silently dropping the listener.
 func TestSecondWithListenerCancels(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	tun.WithListener(listen(t))
 	tun.WithListener(listen(t))
 
@@ -327,7 +327,7 @@ func TestSecondWithListenerCancels(t *testing.T) {
 // TestListenerMintThenWithListenerCancels pins that a minted listener also
 // counts as provided: a following WithListener is a double-provide.
 func TestListenerMintThenWithListenerCancels(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	tun.Listener()
 	tun.WithListener(listen(t))
 
@@ -346,7 +346,7 @@ func TestListenerMintThenWithListenerCancels(t *testing.T) {
 // cancels.
 func TestWithListenerThenListenerReturnsProvided(t *testing.T) {
 	l := listen(t)
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	tun.WithListener(l)
 
 	got := tun.Listener()
@@ -362,7 +362,7 @@ func TestWithListenerThenListenerReturnsProvided(t *testing.T) {
 // local getters derive from the provided URL, and the engine receives the
 // URL — never a listener.
 func TestWithLocalURLGettersDeriveFromURL(t *testing.T) {
-	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	conn := v1alpha1.New(engine).WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
 
 	if got := conn.LocalPort(); got != 1234 {
@@ -394,7 +394,7 @@ func TestWithLocalURLGettersDeriveFromURL(t *testing.T) {
 // for https, 80 for http.
 func TestWithLocalURLDefaultPorts(t *testing.T) {
 	for scheme, want := range map[string]int{"http": 80, "https": 443} {
-		conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})).
+		conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})).
 			WithLocalURL(&url.URL{Scheme: scheme, Host: "127.0.0.1"})
 		if got := conn.LocalPort(); got != want {
 			t.Errorf("LocalPort() = %d for a portless %s URL, want %d", got, scheme, want)
@@ -405,7 +405,7 @@ func TestWithLocalURLDefaultPorts(t *testing.T) {
 // TestWithLocalURLResolvesHost pins LocalIP for a non-IP URL host: the name
 // is resolved (localhost ⇒ a loopback address).
 func TestWithLocalURLResolvesHost(t *testing.T) {
-	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})).
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})).
 		WithLocalURL(&url.URL{Scheme: "http", Host: "localhost:8080"})
 
 	if got := conn.LocalIP(); got == nil || !got.IsLoopback() {
@@ -426,7 +426,7 @@ func TestWithLocalURLInvalidCancels(t *testing.T) {
 		"wssMarkerTLS": {Scheme: "https+wss", Host: "127.0.0.1:5173"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+			tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 			tun.WithLocalURL(u)
 
 			select {
@@ -444,7 +444,7 @@ func TestWithLocalURLInvalidCancels(t *testing.T) {
 // TestWithLocalURLThenWithListenerCancels pins the one-provide rule across
 // origin kinds: a listener after a URL origin is a double-provide.
 func TestWithLocalURLThenWithListenerCancels(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
 	tun.WithListener(listen(t))
 
@@ -461,7 +461,7 @@ func TestWithLocalURLThenWithListenerCancels(t *testing.T) {
 // TestWithListenerThenWithLocalURLCancels pins the reverse order: a URL
 // origin after a listener is a double-provide.
 func TestWithListenerThenWithLocalURLCancels(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	tun.WithListener(listen(t))
 	tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
 
@@ -479,7 +479,7 @@ func TestWithListenerThenWithLocalURLCancels(t *testing.T) {
 // origin has no listener, so Listener() cancels the tunnel and returns nil
 // instead of blocking forever or minting a second origin.
 func TestListenerAfterWithLocalURLCancels(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
 
 	if l := tun.Listener(); l != nil {
@@ -499,12 +499,12 @@ func TestListenerAfterWithLocalURLCancels(t *testing.T) {
 // Ready must not mint a listener (the origin is already provided) and must
 // complete once the tunnel is established.
 func TestWithLocalURLReadiness(t *testing.T) {
-	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	tun := v1alpha1.New(engine)
 	conn := tun.WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
 
-	if u := conn.URL(); u == nil || u.String() != "https://demo.tunneled.pizza/" {
-		t.Fatalf("URL() = %v, want https://demo.tunneled.pizza/", u)
+	if u := conn.URL(); u == nil || u.String() != "https://demo.tunneled.test/" {
+		t.Fatalf("URL() = %v, want https://demo.tunneled.test/", u)
 	}
 	select {
 	case _, ok := <-conn.Ready():
@@ -538,7 +538,7 @@ func TestEnvLocalURLOverridesProvides(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(v1.LocalURLEnv, "http://127.0.0.1:4321")
-			engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+			engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 			tun := v1alpha1.New(engine)
 
 			provide(tun, listen(t))
@@ -574,7 +574,7 @@ func TestEnvLocalURLInvalidCancels(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(v1.LocalURLEnv, env)
-			tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+			tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 			tun.WithListener(listen(t))
 
 			select {
@@ -600,13 +600,13 @@ func TestEnvLocalURLInvalidCancels(t *testing.T) {
 func TestEnvLogSetsDefaultLevel(t *testing.T) {
 	t.Setenv(v1.LogEnv, "debug")
 
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	if !tun.Logger().Enabled(context.Background(), slog.LevelDebug) {
 		t.Error("Logger() does not enable debug with LIBTUNNEL_LOG=debug")
 	}
 
 	own := slog.New(slog.DiscardHandler)
-	tun2 := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun2 := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	tun2.WithLogger(own)
 	if got := tun2.Logger(); got != own {
 		t.Errorf("Logger() = %p with WithLogger set, want the explicit logger %p (env must not replace a sink)", got, own)
@@ -616,7 +616,7 @@ func TestEnvLogSetsDefaultLevel(t *testing.T) {
 // TestWithLoggerWriteOnce pins the write-once mutator contract: the first
 // WithLogger fixes the logger; a later call is a no-op, not a mutation.
 func TestWithLoggerWriteOnce(t *testing.T) {
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 	first := slog.New(slog.DiscardHandler)
 	second := slog.New(slog.DiscardHandler)
 
@@ -637,7 +637,7 @@ func TestWithLoggerWriteOnce(t *testing.T) {
 // canceled) context — if the second context won, URL would hang past the
 // test timeout.
 func TestWithContextWriteOnce(t *testing.T) {
-	tun := v1alpha1.New(newStuckEngine(t, &cloudflare.Spec{Hostname: "demo.tunneled.pizza"}))
+	tun := v1alpha1.New(newStuckEngine(t, &cloudflare.Spec{Hostname: "demo.tunneled.test"}))
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -774,7 +774,7 @@ func TestWithContextCancelReturnsNilURLAndTearsDown(t *testing.T) {
 func TestWithContextCancelTearsDownURLOrigin(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 
-	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})).
+	conn := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})).
 		WithContext(ctx).
 		WithLocalURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1234"})
 
@@ -886,7 +886,7 @@ func (failingProvider) Spec(context.Context) (*cloudflare.Spec, error) {
 // the remainder reassemble the input, and the port is 443 unless the
 // hostname encodes a valid one.
 func FuzzHostnameParsing(f *testing.F) {
-	f.Add("demo.tunneled.pizza")
+	f.Add("demo.tunneled.test")
 	f.Add("localhost")
 	f.Add("example.com:8443")
 	f.Add("")
@@ -921,7 +921,7 @@ func TestWithContextAlreadyCanceledCancelsSynchronously(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})).
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})).
 		WithContext(ctx)
 
 	select {
@@ -942,7 +942,7 @@ func TestWithContextAlreadyCanceledNeverReportsReady(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})).
+	tun := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})).
 		WithContext(ctx)
 	conn := tun.WithListener(listen(t))
 
@@ -1031,7 +1031,7 @@ func TestFailedTunnelEmitsErrorThenDone(t *testing.T) {
 // been fetched — the provider built from the backend's knobs — a later call
 // has nothing to land on and forwards nothing.
 func TestWithTokenForwardsOnce(t *testing.T) {
-	eng := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	eng := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	tun := v1alpha1.New(eng)
 
 	tun.WithToken("").WithToken("first").WithToken("second")
@@ -1039,9 +1039,9 @@ func TestWithTokenForwardsOnce(t *testing.T) {
 		t.Fatalf("backend saw tokens %v, want exactly [first]", got)
 	}
 
-	late := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	late := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	lateTun := v1alpha1.New(late)
-	if got := lateTun.Hostname(); got != "demo.tunneled.pizza" {
+	if got := lateTun.Hostname(); got != "demo.tunneled.test" {
 		t.Fatalf("Hostname = %q", got)
 	}
 	lateTun.WithToken("too-late")
@@ -1057,7 +1057,7 @@ func TestWithTokenForwardsOnce(t *testing.T) {
 // engine (a foreign backend, or From's failed placeholder) takes the call and
 // does nothing.
 func TestWithHeaderForwardsUntilTheSpecFetch(t *testing.T) {
-	eng := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	eng := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	tun := v1alpha1.New(eng)
 	tun.WithHeader("User-Agent", "tunneld/v1").WithHeader("X-Opaque", "true").WithHeader("X-Opaque", "again")
 	want := []string{"User-Agent: tunneld/v1", "X-Opaque: true", "X-Opaque: again"}
@@ -1065,7 +1065,7 @@ func TestWithHeaderForwardsUntilTheSpecFetch(t *testing.T) {
 		t.Fatalf("backend saw headers %q, want %q", got, want)
 	}
 
-	if got := tun.Hostname(); got != "demo.tunneled.pizza" {
+	if got := tun.Hostname(); got != "demo.tunneled.test" {
 		t.Fatalf("Hostname = %q", got)
 	}
 	tun.WithHeader("X-Late", "true")
@@ -1131,7 +1131,7 @@ func TestCancelWithCauseIsAFailure(t *testing.T) {
 // resolves the spec on first use rather than reading a field that nothing
 // has filled yet.
 func TestSerializeResolvesSpec(t *testing.T) {
-	spec := &cloudflare.Spec{ID: "id-1", Hostname: "ser.tunneled.pizza", AccountTag: "tag", Secret: []byte("s")}
+	spec := &cloudflare.Spec{ID: "id-1", Hostname: "ser.tunneled.test", AccountTag: "tag", Secret: []byte("s")}
 	conn := v1alpha1.New(newFakeEngine(spec))
 	if got, want := conn.Serialize(), spec.Serialize(); got != want {
 		t.Errorf("Serialize() = %q, want %q", got, want)
@@ -1151,7 +1151,7 @@ func TestURLWaitsForEstablished(t *testing.T) {
 		{"with WithContext", func(tun v1.Tunnel) v1.Tunnel { return tun.WithContext(context.Background()) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+			engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 			engine.manual = true
 			tun := v1alpha1.New(engine)
 			conn := tc.with(tun).WithListener(listen(t))
@@ -1169,8 +1169,8 @@ func TestURLWaitsForEstablished(t *testing.T) {
 			tun.Emit(v1.Event{Kind: v1.EventEstablished})
 			select {
 			case u := <-got:
-				if u == nil || u.String() != "https://demo.tunneled.pizza/" {
-					t.Errorf("URL() = %v, want https://demo.tunneled.pizza/", u)
+				if u == nil || u.String() != "https://demo.tunneled.test/" {
+					t.Errorf("URL() = %v, want https://demo.tunneled.test/", u)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("URL never returned after EventEstablished")
@@ -1181,7 +1181,7 @@ func TestURLWaitsForEstablished(t *testing.T) {
 
 // TestReadyDeliversOnEstablished pins Ready to the same moment as URL.
 func TestReadyDeliversOnEstablished(t *testing.T) {
-	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	engine.manual = true
 	tun := v1alpha1.New(engine)
 	conn := tun.WithListener(listen(t))
@@ -1209,7 +1209,7 @@ func TestReadyDeliversOnEstablished(t *testing.T) {
 // ready: an engine whose verification lands after the cancel changes
 // nothing.
 func TestEstablishedAfterCancelIsIgnored(t *testing.T) {
-	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	engine.manual = true
 	tun := v1alpha1.New(engine)
 	conn := tun.WithListener(listen(t))
@@ -1233,7 +1233,7 @@ func TestEstablishedAfterCancelIsIgnored(t *testing.T) {
 // that exited on the context alone left its connections behind, and the next
 // connector on the same tunnel answered 502 until the edge noticed.
 func TestDoneWaitsForTheEngineToLetGo(t *testing.T) {
-	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.pizza"})
+	engine := newFakeEngine(&cloudflare.Spec{Hostname: "demo.tunneled.test"})
 	engine.stopped = make(chan struct{})
 	var events []v1.EventKind
 	var mu sync.Mutex
@@ -1274,13 +1274,13 @@ func TestDoneWaitsForTheEngineToLetGo(t *testing.T) {
 // the spec is read off the tunnel as sent, and resolving the spec is what
 // the first call does, like Hostname.
 func TestMessagesComeOffTheSpec(t *testing.T) {
-	spec := &cloudflare.Spec{Hostname: "demo.tunneled.pizza"}
+	spec := &cloudflare.Spec{Hostname: "demo.tunneled.test"}
 	spec.WithMessage("data:text/markdown;base64,PiBbIW5vdGVdIGhp")
 	tun := v1alpha1.New(newFakeEngine(spec))
 	if got := tun.Messages(); len(got) != 1 || got[0] != spec.Messages()[0] {
 		t.Errorf("Messages = %q, want the spec's, as sent", got)
 	}
-	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.pizza"})).Messages(); got != nil {
+	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.test"})).Messages(); got != nil {
 		t.Errorf("Messages = %v with nothing said, want nil", got)
 	}
 }
@@ -1289,13 +1289,13 @@ func TestMessagesComeOffTheSpec(t *testing.T) {
 // are read off the tunnel as the spec carries them, and resolving the spec
 // is what the first call does, like Messages.
 func TestHeadersComeOffTheSpec(t *testing.T) {
-	spec := &cloudflare.Spec{Hostname: "demo.tunneled.pizza"}
-	spec.WithResponseHeader("X-Www-Authenticate", `Basic realm="demo.tunneled.pizza"`)
+	spec := &cloudflare.Spec{Hostname: "demo.tunneled.test"}
+	spec.WithResponseHeader("X-Www-Authenticate", `Basic realm="demo.tunneled.test"`)
 	tun := v1alpha1.New(newFakeEngine(spec))
-	if got := tun.Headers(); !reflect.DeepEqual(got, http.Header{"X-Www-Authenticate": {`Basic realm="demo.tunneled.pizza"`}}) {
+	if got := tun.Headers(); !reflect.DeepEqual(got, http.Header{"X-Www-Authenticate": {`Basic realm="demo.tunneled.test"`}}) {
 		t.Errorf("Headers = %v, want the spec's", got)
 	}
-	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.pizza"})).Headers(); got != nil {
+	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.test"})).Headers(); got != nil {
 		t.Errorf("Headers = %v with none sent, want nil", got)
 	}
 }
@@ -1303,11 +1303,11 @@ func TestHeadersComeOffTheSpec(t *testing.T) {
 // TestSecretComesOffTheSpec pins the accessor: the secret is read off the
 // spec as is, and a spec with none reads as nil.
 func TestSecretComesOffTheSpec(t *testing.T) {
-	spec := &cloudflare.Spec{Hostname: "demo.tunneled.pizza", Secret: []byte("s3cr3t")}
+	spec := &cloudflare.Spec{Hostname: "demo.tunneled.test", Secret: []byte("s3cr3t")}
 	if got := v1alpha1.New(newFakeEngine(spec)).Secret(); !bytes.Equal(got, spec.Secret) {
 		t.Errorf("Secret = %q, want %q", got, spec.Secret)
 	}
-	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.pizza"})).Secret(); got != nil {
+	if got := v1alpha1.New(newFakeEngine(&cloudflare.Spec{Hostname: "quiet.tunneled.test"})).Secret(); got != nil {
 		t.Errorf("Secret = %q with no secret, want nil", got)
 	}
 }

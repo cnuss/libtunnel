@@ -205,13 +205,13 @@ func New[T v1.Spec](backend v1.Backend[T]) TunnelV1 {
 // resolution), else a code-pinned From spec. A complete spec is put to the
 // edge before anything else: live and unserved, it is adopted as-is; served
 // by another connector, the tunnel fails with ErrInUse; gone or unanswered,
-// the chain mints an anonymous *.tunneled.pizza quick tunnel with the spec
-// as its hint, and the provider decides what to honor — a replacement behind
-// the same hostname, or a fresh one when the reservation is gone. The
-// resolved spec is exported back into the environment so spawned children
-// inherit the same tunnel identity; a spec this process exported itself
-// never becomes its own hint — a second in-process tunnel mints its own
-// identity.
+// the chain mints an anonymous quick tunnel on tunnel.pizza's tunnel domain
+// with the spec as its hint, and the provider decides what to honor — a
+// replacement behind the same hostname, or a fresh one when the reservation
+// is gone. The resolved spec is exported back into the environment so
+// spawned children inherit the same tunnel identity; a spec this process
+// exported itself never becomes its own hint — a second in-process tunnel
+// mints its own identity.
 //
 // Individual spec fields can be overridden with the backend's setters —
 // WithID, WithName, WithHostname, WithAccountTag, WithSecret — or their
