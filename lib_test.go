@@ -46,7 +46,7 @@ func mintServer(t *testing.T, spec *cloudflare.Spec) {
 // TestFromSerializeRoundTrip pins the Serialize -> From loop: a serialized spec
 // replays into a tunnel on the same hostname when the provider still has it.
 func TestFromSerializeRoundTrip(t *testing.T) {
-	want := &cloudflare.Spec{ID: "id-1", Hostname: "replay.tunneled.test", AccountTag: "tag", Secret: []byte("s")}
+	want := &cloudflare.Spec{ID: "id-1", Hostname: "replay.tunneld.domain", AccountTag: "tag", Secret: []byte("s")}
 	mintServer(t, want)
 	tun := libtunnel.From(want.Serialize())
 	if got := tun.Hostname(); got != want.Hostname {
@@ -59,9 +59,9 @@ func TestFromSerializeRoundTrip(t *testing.T) {
 
 // TestFromFile pins that From reads a spec file path (the cache-file form).
 func TestFromFile(t *testing.T) {
-	spec := &cloudflare.Spec{Hostname: "file.tunneled.test"}
+	spec := &cloudflare.Spec{Hostname: "file.tunneld.domain"}
 	mintServer(t, spec)
-	path := filepath.Join(t.TempDir(), "file.tunneled.test.spec.json")
+	path := filepath.Join(t.TempDir(), "file.tunneld.domain.spec.json")
 	if err := os.WriteFile(path, []byte(spec.Serialize()), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestFromFile(t *testing.T) {
 // TestFromEmptyMints pins that an empty spec is no spec: From("") starts the
 // way New(Cloudflare()) does, minting with nothing to hint.
 func TestFromEmptyMints(t *testing.T) {
-	want := &cloudflare.Spec{Hostname: "fresh.tunneled.test"}
+	want := &cloudflare.Spec{Hostname: "fresh.tunneld.domain"}
 	mintServer(t, want)
 	tun := libtunnel.From("")
 	if err := tun.Err(); err != nil {
@@ -94,14 +94,14 @@ func TestFromCarriesHeaders(t *testing.T) {
 	var seen http.Header
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = r.Header.Clone()
-		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"fresh.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"fresh.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	t.Cleanup(srv.Close)
 	t.Setenv(v1.CloudflareProviderEnv, srv.URL)
 	t.Setenv(v1.CloudflareMintWaitEnv, "0")
 
 	tun := libtunnel.From("").WithHeader("User-Agent", "tunneld/test").WithHeader("X-Opaque", "true")
-	if got := tun.Hostname(); got != "fresh.tunneled.test" {
+	if got := tun.Hostname(); got != "fresh.tunneld.domain" {
 		t.Fatalf("Hostname() = %q, want the mint's", got)
 	}
 	if got := seen.Get("User-Agent"); !strings.HasPrefix(got, "tunneld/test (") {
@@ -157,7 +157,7 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 	spec := &cloudflare.Spec{
 		ID:         "00000000-0000-0000-0000-000000000000",
 		Name:       "lib-scenario",
-		Hostname:   "scenario.tunneled.test",
+		Hostname:   "scenario.tunneld.domain",
 		AccountTag: "tag",
 		Secret:     []byte("secret"),
 	}
@@ -173,8 +173,8 @@ func TestSpecHandoffAcrossProcesses(t *testing.T) {
 		t.Fatalf("child failed: %v", err)
 	}
 	for _, want := range []string{
-		"handoff-child hostname: scenario.tunneled.test",
-		"handoff-child host=scenario domain=tunneled.test port=443",
+		"handoff-child hostname: scenario.tunneld.domain",
+		"handoff-child host=scenario domain=tunneld.domain port=443",
 		"handoff-child cacerts: true",
 	} {
 		if !strings.Contains(string(out), want) {
@@ -193,7 +193,7 @@ func TestReExecInheritsSpec(t *testing.T) {
 		return
 	}
 
-	spec := &cloudflare.Spec{Hostname: "reexec.tunneled.test"}
+	spec := &cloudflare.Spec{Hostname: "reexec.tunneld.domain"}
 	mintServer(t, spec)
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
@@ -206,7 +206,7 @@ func TestReExecInheritsSpec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("child failed: %v", err)
 	}
-	if want := "reexec-child hostname: reexec.tunneled.test"; !strings.Contains(string(out), want) {
+	if want := "reexec-child hostname: reexec.tunneld.domain"; !strings.Contains(string(out), want) {
 		t.Errorf("child output does not contain %q", want)
 	}
 }
@@ -232,7 +232,7 @@ func TestHandoffChain(t *testing.T) {
 		return
 	}
 
-	spec := &cloudflare.Spec{Hostname: "chain.tunneled.test"}
+	spec := &cloudflare.Spec{Hostname: "chain.tunneld.domain"}
 	mintServer(t, spec)
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
@@ -245,8 +245,8 @@ func TestHandoffChain(t *testing.T) {
 		t.Fatalf("chain failed: %v", err)
 	}
 	for _, want := range []string{
-		"chain-child hostname: chain.tunneled.test",
-		"chain-grandchild hostname: chain.tunneled.test",
+		"chain-child hostname: chain.tunneld.domain",
+		"chain-grandchild hostname: chain.tunneld.domain",
 	} {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("chain output does not contain %q", want)
@@ -291,7 +291,7 @@ func TestSpecHostnameWithPort(t *testing.T) {
 		return
 	}
 
-	spec := &cloudflare.Spec{Hostname: "scenario.tunneled.test:8443"}
+	spec := &cloudflare.Spec{Hostname: "scenario.tunneld.domain:8443"}
 	mintServer(t, spec)
 	entry, err := v1alpha1.SpecEnviron("cloudflare", spec)
 	if err != nil {
@@ -303,7 +303,7 @@ func TestSpecHostnameWithPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("child failed: %v", err)
 	}
-	if want := "port-child host=scenario domain=tunneled.test:8443 port=8443"; !strings.Contains(string(out), want) {
+	if want := "port-child host=scenario domain=tunneld.domain:8443 port=8443"; !strings.Contains(string(out), want) {
 		t.Errorf("child output does not contain %q", want)
 	}
 }

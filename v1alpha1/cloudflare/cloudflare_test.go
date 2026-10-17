@@ -30,7 +30,7 @@ import (
 // is what fails.
 func TestWithListenerRejectsMalformedSpecID(t *testing.T) {
 	clearSpecEnv(t)
-	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"not-a-uuid","hostname":"x.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	srv := echoServer(t)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -107,7 +107,7 @@ func TestReplayedSpecIsNotOverlaid(t *testing.T) {
 
 	// The hostname matches what the stub answers, so this exercises the
 	// result rather than the substitution notice.
-	replayed := &Spec{ID: "stale-id", Name: "mine", Hostname: "minted.tunneled.test", Secret: []byte("s")}
+	replayed := &Spec{ID: "stale-id", Name: "mine", Hostname: "minted.tunneld.domain", Secret: []byte("s")}
 	spec, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +115,7 @@ func TestReplayedSpecIsNotOverlaid(t *testing.T) {
 	if spec.ID == replayed.ID {
 		t.Errorf("ID = %q, want the provider's own — a replayed id must not be overlaid", spec.ID)
 	}
-	if spec.Hostname != "minted.tunneled.test" {
+	if spec.Hostname != "minted.tunneld.domain" {
 		t.Errorf("Hostname = %q, want the provider's own", spec.Hostname)
 	}
 	_ = seen
@@ -143,7 +143,7 @@ func TestSecretEnvUndecodableErrors(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.CloudflareSecretEnv, "%%%not-base64%%%")
 
-	_, err := From(&Spec{Hostname: "pinned.tunneled.test"}).Provider().Spec(context.Background())
+	_, err := From(&Spec{Hostname: "pinned.tunneld.domain"}).Provider().Spec(context.Background())
 	if err == nil || !strings.Contains(err.Error(), v1.CloudflareSecretEnv) {
 		t.Errorf("Spec err = %v, want a %s decode failure", err, v1.CloudflareSecretEnv)
 	}
@@ -157,7 +157,7 @@ func TestProviderEnvBeatsCode(t *testing.T) {
 	clearSpecEnv(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
 	t.Setenv(v1.CloudflareProviderEnv, srv.URL)
@@ -168,7 +168,7 @@ func TestProviderEnvBeatsCode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Hostname != "minted.tunneled.test" {
+	if spec.Hostname != "minted.tunneld.domain" {
 		t.Errorf("Hostname = %q, want the spec minted from the env endpoint", spec.Hostname)
 	}
 }
@@ -179,7 +179,7 @@ func mintServer(t *testing.T, seen *http.Header) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*seen = r.Header.Clone()
-		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -326,7 +326,7 @@ func TestProviderHostSynthesizesEndpoint(t *testing.T) {
 func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
 	clearSpecEnv(t)
 	t.Setenv(v1.TLSEnv, "banana")
-	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"x.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+	t.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"x.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	srv := echoServer(t)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -349,7 +349,7 @@ func TestEnvKnobUnparsableFailsConnect(t *testing.T) {
 const specJSON = `{"success":true,"result":{
 	"id":"00000000-0000-0000-0000-000000000000",
 	"name":"test",
-	"hostname":"test.tunneled.test",
+	"hostname":"test.tunneld.domain",
 	"account_tag":"tag",
 	"secret":"c2VjcmV0"}}`
 
@@ -366,7 +366,7 @@ func TestQuickTunnelSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Hostname != "test.tunneled.test" {
+	if spec.Hostname != "test.tunneld.domain" {
 		t.Errorf("Hostname = %q", spec.Hostname)
 	}
 	if string(spec.Secret) != "secret" {
@@ -433,7 +433,7 @@ func TestQuickTunnelRetriesAfter429(t *testing.T) {
 	if got := calls.Load(); got != 2 {
 		t.Errorf("API called %d times, want 2 (one 429, one success)", got)
 	}
-	if spec.Hostname != "test.tunneled.test" {
+	if spec.Hostname != "test.tunneld.domain" {
 		t.Errorf("Hostname = %q", spec.Hostname)
 	}
 }
@@ -806,7 +806,7 @@ func TestReplayFallsBackWhenProviderUnreachable(t *testing.T) {
 	addr := ln.Addr().String()
 	ln.Close() // nothing is listening now, so the mint is refused
 
-	replayed := &Spec{ID: "id", Name: "mine", Hostname: "offline.tunneled.test", AccountTag: "tag", Secret: []byte("s")}
+	replayed := &Spec{ID: "id", Name: "mine", Hostname: "offline.tunneld.domain", AccountTag: "tag", Secret: []byte("s")}
 	spec, err := From(replayed).WithProvider("http://" + addr).Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatalf("Spec() = %v, want the replayed spec when the provider cannot be reached", err)
@@ -825,14 +825,14 @@ func TestReplayAdoptsASubstitutedHostname(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		fmt.Fprint(w, `{"success":true,"result":{"id":"fresh","hostname":"substitute.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"fresh","hostname":"substitute.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
 
 	var buf strings.Builder
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	replayed := &Spec{Name: "mine", Hostname: "gone.tunneled.test", Secret: []byte("s")}
+	replayed := &Spec{Name: "mine", Hostname: "gone.tunneld.domain", Secret: []byte("s")}
 	b := From(replayed).WithProvider(srv.URL)
 	prov := b.Provider()
 	if pl, ok := prov.(v1alpha1.LoggerSetter); ok {
@@ -842,13 +842,13 @@ func TestReplayAdoptsASubstitutedHostname(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spec() = %v, want the substitute adopted", err)
 	}
-	if spec.Hostname != "substitute.tunneled.test" {
+	if spec.Hostname != "substitute.tunneld.domain" {
 		t.Errorf("Hostname = %q, want the one the provider minted", spec.Hostname)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("API called %d times, want 1 — a second mint is the bug", got)
 	}
-	if !strings.Contains(buf.String(), "gone.tunneled.test") {
+	if !strings.Contains(buf.String(), "gone.tunneld.domain") {
 		t.Errorf("the hostname change was not reported; log:\n%s", buf.String())
 	}
 }
@@ -860,11 +860,11 @@ func TestReplayAdoptsASubstitutedHostname(t *testing.T) {
 func TestReplayAcceptsAReplacedTunnel(t *testing.T) {
 	clearSpecEnv(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"success":true,"result":{"id":"replacement","hostname":"kept.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"replacement","hostname":"kept.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
 
-	replayed := &Spec{ID: "reaped", Name: "mine", Hostname: "kept.tunneled.test", Secret: []byte("s")}
+	replayed := &Spec{ID: "reaped", Name: "mine", Hostname: "kept.tunneld.domain", Secret: []byte("s")}
 	spec, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatalf("Spec() = %v, want the replacement accepted", err)
@@ -903,7 +903,7 @@ func TestRecordIDResumesAHostname(t *testing.T) {
 	var seen http.Header
 	srv := mintServer(t, &seen)
 
-	replayed := &Spec{Hostname: "minted.tunneled.test"}
+	replayed := &Spec{Hostname: "minted.tunneld.domain"}
 	replayed.WithMeta(RecordIDKey, "rec-1")
 	if _, err := From(replayed).WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
 		t.Fatal(err)
@@ -935,7 +935,7 @@ func TestRecordIDIsStoredOnTheSpec(t *testing.T) {
 	clearSpecEnv(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Record-Id", "rec-from-server")
-		fmt.Fprint(w, `{"success":true,"result":{"id":"t1","hostname":"minted.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"t1","hostname":"minted.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
 
@@ -969,7 +969,7 @@ func TestThrottledSpecWaitsForResolution(t *testing.T) {
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
 		}
-		fmt.Fprint(w, `{"success":true,"result":{"id":"t1","hostname":"settled.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"t1","hostname":"settled.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
 
@@ -977,7 +977,7 @@ func TestThrottledSpecWaitsForResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spec() = %v, want the settled spec", err)
 	}
-	if spec.Hostname != "settled.tunneled.test" {
+	if spec.Hostname != "settled.tunneld.domain" {
 		t.Errorf("Hostname = %q", spec.Hostname)
 	}
 	if got := calls.Load(); got != 2 {
@@ -1029,7 +1029,7 @@ func TestSettleBudgetKeepsTheMintedSpec(t *testing.T) {
 		w.Header().Set("X-Record-Id", "rec-slow")
 		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusTooManyRequests)
-		fmt.Fprint(w, `{"success":true,"result":{"id":"t1","hostname":"slow.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"t1","hostname":"slow.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	defer srv.Close()
 
@@ -1037,7 +1037,7 @@ func TestSettleBudgetKeepsTheMintedSpec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spec() = %v, want the minted spec rather than a failure", err)
 	}
-	if spec.Hostname != "slow.tunneled.test" {
+	if spec.Hostname != "slow.tunneld.domain" {
 		t.Errorf("Hostname = %q", spec.Hostname)
 	}
 	if spec.RecordID() != "rec-slow" {
@@ -1153,7 +1153,7 @@ func TestIngressAnswersOnlyItsLoop(t *testing.T) {
 		{"/", "https://127.0.0.1:8443"},
 		{"/.well-known/libtunnelx0123abcd", "https://127.0.0.1:8443"},
 	} {
-		rule, _ := ing.FindMatchingRule("demo.tunneled.test", tc.path)
+		rule, _ := ing.FindMatchingRule("demo.tunneld.domain", tc.path)
 		if got := rule.Service.String(); got != tc.want {
 			t.Errorf("%s goes to %s, want %s", tc.path, got, tc.want)
 		}
@@ -1467,7 +1467,7 @@ func TestMessagesRideTheMintWithoutACode(t *testing.T) {
 	clearSpecEnv(t)
 	const motd = "data:text/markdown;base64,PiBbIXdhcm5pbmddIHB1YmxpYw=="
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"},"errors":[{"message":%q},{"message":"second"}]}`, motd)
+		fmt.Fprintf(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"},"errors":[{"message":%q},{"message":"second"}]}`, motd)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -1497,13 +1497,13 @@ func TestMessagesRideTheMintWithoutACode(t *testing.T) {
 // survive the envelope, which is how a replay reads them back.
 func TestMintKeepsEveryResponseHeader(t *testing.T) {
 	clearSpecEnv(t)
-	const challenge = `Basic realm="minted.tunneled.test", pw="$pbkdf2-sha256$i=600000$c2FsdA$aGFzaA"`
+	const challenge = `Basic realm="minted.tunneld.domain", pw="$pbkdf2-sha256$i=600000$c2FsdA$aGFzaA"`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Record-Id", "rec-9")
 		w.Header().Set("X-Www-Authenticate", challenge)
 		w.Header().Add("Set-Cookie", "a=1")
 		w.Header().Add("Set-Cookie", "b=2")
-		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -1557,7 +1557,7 @@ func TestMintHeadersAreTheAnsweringResponses(t *testing.T) {
 			return
 		}
 		w.Header().Set("X-Attempt", "answered")
-		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneled.test","account_tag":"tag","secret":"c2VjcmV0"}}`)
+		fmt.Fprint(w, `{"success":true,"result":{"id":"3f1f9a3e-2f2a-4d59-a711-e57e2fc1c3a6","hostname":"minted.tunneld.domain","account_tag":"tag","secret":"c2VjcmV0"}}`)
 	}))
 	t.Cleanup(srv.Close)
 

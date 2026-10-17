@@ -28,7 +28,7 @@ var known = func() *Spec {
 	s := &Spec{
 		ID:         "id-1",
 		Name:       "name-1",
-		Hostname:   "known.tunneled.test",
+		Hostname:   "known.tunneld.domain",
 		AccountTag: "tag-1",
 		Secret:     []byte("secret-1"),
 	}
@@ -87,7 +87,7 @@ func wantHints(t *testing.T, seen http.Header, want *Spec) {
 // the hint handed back.
 func wantMinted(t *testing.T, spec *Spec) {
 	t.Helper()
-	if spec.Hostname != "minted.tunneled.test" {
+	if spec.Hostname != "minted.tunneld.domain" {
 		t.Errorf("Hostname = %q, want the provider's answer", spec.Hostname)
 	}
 }
@@ -175,15 +175,15 @@ func TestCompleteFieldSetMintsWithHints(t *testing.T) {
 // the replay mirror, env beats code throughout.
 func TestSpecEnvBeatsFromEnvAsHint(t *testing.T) {
 	clearSpecEnv(t)
-	t.Setenv(v1.SpecEnv, envelope(t, &Spec{Hostname: "handoff.tunneled.test"}))
-	t.Setenv(v1.FromEnv, envelope(t, &Spec{Hostname: "replay.tunneled.test"}))
+	t.Setenv(v1.SpecEnv, envelope(t, &Spec{Hostname: "handoff.tunneld.domain"}))
+	t.Setenv(v1.FromEnv, envelope(t, &Spec{Hostname: "replay.tunneld.domain"}))
 	var seen http.Header
 	srv := mintServer(t, &seen)
 
-	if _, err := From(&Spec{Hostname: "code.tunneled.test"}).WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
+	if _, err := From(&Spec{Hostname: "code.tunneld.domain"}).WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := seen.Get("X-Hostname"); got != "handoff.tunneled.test" {
+	if got := seen.Get("X-Hostname"); got != "handoff.tunneld.domain" {
 		t.Errorf("X-Hostname = %q, want the LIBTUNNEL_SPEC hint", got)
 	}
 }
@@ -211,7 +211,7 @@ func TestFieldSettersAreNotStampedOntoResult(t *testing.T) {
 	var seen http.Header
 	srv := mintServer(t, &seen)
 
-	spec, err := New().WithProvider(srv.URL).WithName("patched").WithHostname("patched.tunneled.test").Provider().Spec(context.Background())
+	spec, err := New().WithProvider(srv.URL).WithName("patched").WithHostname("patched.tunneld.domain").Provider().Spec(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestResolvedSpecExportedAfterAdopt(t *testing.T) {
 	if _, err := New().WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := os.Getenv(v1.SpecEnv); !strings.Contains(got, "minted.tunneled.test") {
+	if got := os.Getenv(v1.SpecEnv); !strings.Contains(got, "minted.tunneld.domain") {
 		t.Errorf("%s = %q, want the resolved spec exported", v1.SpecEnv, got)
 	}
 }
@@ -275,7 +275,7 @@ func TestSecondTunnelDoesNotHintWithOwnExport(t *testing.T) {
 	if _, err := New().WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(os.Getenv(v1.SpecEnv), "minted.tunneled.test") {
+	if !strings.Contains(os.Getenv(v1.SpecEnv), "minted.tunneld.domain") {
 		t.Fatalf("%s = %q, want the first mint exported", v1.SpecEnv, os.Getenv(v1.SpecEnv))
 	}
 	if _, err := New().WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
@@ -456,7 +456,7 @@ func TestPartialHintIsNotProbed(t *testing.T) {
 	var seen http.Header
 	srv := mintServer(t, &seen)
 
-	if _, err := New().WithHostname("named.tunneled.test").WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
+	if _, err := New().WithHostname("named.tunneld.domain").WithProvider(srv.URL).Provider().Spec(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if asked.Load() != 0 {

@@ -298,7 +298,7 @@ to do — and a spec is credentials, so store it as such.
 
 ```go
 // replay the most recently cached tunnel by hostname
-conn := libtunnel.From("foo.tunneled.test").WithListener(l)
+conn := libtunnel.From("foo.tunneld.domain").WithListener(l)
 ```
 
 ## Environment variables

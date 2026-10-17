@@ -56,22 +56,22 @@ func stubProvider() (stop func()) {
 // is populated by hand to stand in for the parent.
 func Example_handoff() {
 	defer stubProvider()()
-	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.tunneled.test"}}`)
+	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.tunneld.domain"}}`)
 	defer os.Unsetenv("LIBTUNNEL_SPEC")
 
 	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Println(t.Hostname())
-	// Output: demo.tunneled.test
+	// Output: demo.tunneld.domain
 }
 
 // Getters resolve lazily from the backend's credential chain — nothing is
 // fetched until the first one is read.
 func Example_lazy() {
 	defer stubProvider()()
-	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.tunneled.test"}}`)
+	os.Setenv("LIBTUNNEL_SPEC", `{"backend":"cloudflare","spec":{"hostname":"demo.tunneld.domain"}}`)
 	defer os.Unsetenv("LIBTUNNEL_SPEC")
 
 	t := libtunnel.New(libtunnel.Cloudflare())
 	fmt.Printf("%s . %s : %d\n", t.Host(), t.Domain(), t.Port())
-	// Output: demo . tunneled.test : 443
+	// Output: demo . tunneld.domain : 443
 }
