@@ -206,6 +206,10 @@ func (p *QuickTunnelProvider) Spec(ctx context.Context) (*Spec, error) {
 		// Report-To headers name, so the operator sees client-side failures
 		// without anyone filing them.
 		Transport: nel.Transport(&http.Transport{
+			// Through the proxy the environment names, as the bridge goes:
+			// on a network that only lets HTTPS out through one, a mint
+			// dialed directly never arrives.
+			Proxy: envProxy,
 			// The trust set libtunnel ships, not the host's alone: an image
 			// with no ca-certificates package still verifies the mint
 			// endpoint. Without this the edge connection would have verified
