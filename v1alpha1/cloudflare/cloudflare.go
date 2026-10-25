@@ -42,6 +42,7 @@ import (
 	"github.com/cloudflare/cloudflared/supervisor"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/net/http/httpproxy"
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
@@ -1057,7 +1058,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 				if alive && b.establishing.CompareAndSwap(false, true) {
 					go func() {
 						defer b.establishing.Store(false)
-						b.establish(ctx, t, loopThroughClient(prober), "https://"+spec.GetHostname()+loop, t.Logger())
+						b.establish(ctx, t, loopThroughClient(prober.LookupHost, spec.GetHostname()), "https://"+spec.GetHostname()+loop, t.Logger())
 					}()
 				}
 				if full {
@@ -1214,29 +1215,52 @@ func ingressFor(service, loop string, http2 bool) (ingress.Ingress, error) {
 	return parsed, nil
 }
 
-// loopThroughClient is the client the verification goes out on. It resolves
-// through the prober's DoH resolvers and dials the address itself, so the
-// machine's resolver is never asked: this is the first request for the name
-// from this host, and a resolver asked a beat early caches the NXDOMAIN for
-// the zone's SOA.
-func loopThroughClient(p *probe.Prober) *http.Client {
+// loopThroughClient is the client the verification goes out on.
+//
+// Through the proxy the environment names, when one applies to the tunnel's
+// URL, and the proxy resolves the name: on a network that only lets HTTPS
+// out through one, nothing else reaches the edge on 443.
+//
+// Otherwise the hostname is resolved through lookup, the prober's DoH
+// resolvers, and the address dialed directly, so the machine's resolver is
+// not asked: this is the first request for the name from this host, and a
+// resolver asked a beat early caches the NXDOMAIN for the zone's SOA. When
+// the resolvers themselves cannot be reached the machine's resolver is asked
+// after all, since otherwise the verification never succeeds and the address
+// is never handed out. A name they say does not exist yet is retried, not
+// handed to the machine's resolver to cache.
+func loopThroughClient(lookup func(context.Context, string) (string, error), hostname string) *http.Client {
+	var direct net.Dialer
 	return &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
+			Proxy:           envProxy,
 			TLSClientConfig: &tls.Config{RootCAs: trust.Pool()},
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				host, port, err := net.SplitHostPort(addr)
+				if err != nil || host != hostname {
+					// The proxy, when there is one.
+					return direct.DialContext(ctx, network, addr)
+				}
+				ip, err := lookup(ctx, host)
+				if errors.Is(err, probe.ErrRetry) && ctx.Err() == nil {
+					return direct.DialContext(ctx, network, addr)
+				}
 				if err != nil {
 					return nil, err
 				}
-				ip, err := p.LookupHost(ctx, host)
-				if err != nil {
-					return nil, err
-				}
-				return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(ip, port))
+				return direct.DialContext(ctx, network, net.JoinHostPort(ip, port))
 			},
 		},
 	}
+}
+
+// envProxy is the proxy the environment names for r, read afresh as the
+// bridge reads it: http.ProxyFromEnvironment caches the environment on first
+// use anywhere in the process, and a tunnel built after that call would not
+// see its own settings.
+func envProxy(r *http.Request) (*url.URL, error) {
+	return httpproxy.FromEnvironment().ProxyFunc()(r.URL)
 }
 
 // establish sends the loop-through to url until this tunnel's cloudflared

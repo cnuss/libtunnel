@@ -2,8 +2,11 @@ package cloudflare
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -21,6 +24,7 @@ import (
 	v1 "github.com/cnuss/libtunnel/v1"
 
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/probe"
 )
 
 // TestWithListenerRejectsMalformedSpecID pins the fail-fast contract: a spec
@@ -1567,5 +1571,129 @@ func TestMintHeadersAreTheAnsweringResponses(t *testing.T) {
 	}
 	if got := spec.Headers().Values("X-Attempt"); !reflect.DeepEqual(got, []string{"answered"}) {
 		t.Errorf("X-Attempt = %q, want only the answering response's", got)
+	}
+}
+
+// connectProxy is an HTTP CONNECT proxy that carries every tunnel to to,
+// whatever the client asked for, and counts the tunnels it opened.
+func connectProxy(t *testing.T, to string) (string, *atomic.Int32) {
+	t.Helper()
+	var opened atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT only", http.StatusMethodNotAllowed)
+			return
+		}
+		upstream, err := net.Dial("tcp", to)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		client, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			upstream.Close()
+			return
+		}
+		opened.Add(1)
+		fmt.Fprint(client, "HTTP/1.1 200 Connection established\r\n\r\n")
+		go func() { _, _ = io.Copy(upstream, client); upstream.Close() }()
+		_, _ = io.Copy(client, upstream)
+		client.Close()
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, &opened
+}
+
+// TestQuickTunnelMintsThroughTheProxy pins that the mint goes out through
+// the proxy the environment names, as the bridge does: on a network where
+// HTTPS only leaves through one, a mint dialed directly never arrives. The
+// mint host does not resolve here, so only the proxy can answer it.
+func TestQuickTunnelMintsThroughTheProxy(t *testing.T) {
+	var asked atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Host != "mint.invalid" {
+			t.Errorf("proxy got %s %s, want POST to mint.invalid", r.Method, r.URL)
+		}
+		asked.Add(1)
+		w.Write([]byte(specJSON))
+	}))
+	defer proxy.Close()
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	t.Setenv("NO_PROXY", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	spec, err := (&QuickTunnelProvider{URL: "http://mint.invalid/tunnel"}).Spec(ctx)
+	if err != nil {
+		t.Fatalf("Spec: %v", err)
+	}
+	if spec.Hostname != "test.tunneld.domain" || asked.Load() == 0 {
+		t.Errorf("hostname %q after %d requests through the proxy", spec.Hostname, asked.Load())
+	}
+}
+
+// edgeLoop stands in for the edge answering a tunnel's loop path, and
+// loopClient is loopThroughClient trusting its certificate.
+func edgeLoop(t *testing.T) *httptest.Server {
+	t.Helper()
+	edge := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(edge.Close)
+	return edge
+}
+
+func loopClient(edge *httptest.Server, lookup func(context.Context, string) (string, error), hostname string) *http.Client {
+	client := loopThroughClient(lookup, hostname)
+	pool := x509.NewCertPool()
+	pool.AddCert(edge.Certificate())
+	client.Transport.(*http.Transport).TLSClientConfig = &tls.Config{RootCAs: pool, ServerName: "example.com"}
+	return client
+}
+
+// TestLoopThroughFallsBackWhenDoHIsUnreachable pins the fallback: with the
+// DoH resolvers out of reach, the tunnel's hostname is resolved by the
+// system instead, rather than the verification retrying DoH forever and the
+// address never being handed out. A name DoH says does not exist yet is not
+// a reason to ask the system, which would cache the NXDOMAIN.
+func TestLoopThroughFallsBackWhenDoHIsUnreachable(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "")
+	edge := edgeLoop(t)
+	_, port, _ := net.SplitHostPort(edge.Listener.Addr().String())
+	url := "https://localhost:" + port + loopPrefix + "n"
+
+	blocked := func(context.Context, string) (string, error) {
+		return "", fmt.Errorf("%w: dial cloudflare-dns.com: i/o timeout", probe.ErrRetry)
+	}
+	if err := verify(context.Background(), loopClient(edge, blocked, "localhost"), url); err != nil {
+		t.Errorf("with DoH unreachable: %v, want the system resolver to find localhost", err)
+	}
+
+	notYet := func(context.Context, string) (string, error) {
+		return "", &net.DNSError{Err: "no such host", Name: "localhost", IsNotFound: true}
+	}
+	if err := verify(context.Background(), loopClient(edge, notYet, "localhost"), url); err == nil {
+		t.Error("with DoH saying the name does not exist yet, the system resolver was asked")
+	}
+}
+
+// TestLoopThroughGoesThroughTheProxy pins that the verification takes the
+// proxy the environment names, as the mint and the bridge do, and leaves
+// the name to the proxy: neither DoH nor the system resolver could find it.
+func TestLoopThroughGoesThroughTheProxy(t *testing.T) {
+	edge := edgeLoop(t)
+	proxy, opened := connectProxy(t, edge.Listener.Addr().String())
+	t.Setenv("HTTPS_PROXY", proxy)
+	t.Setenv("NO_PROXY", "")
+
+	unresolvable := func(context.Context, string) (string, error) {
+		return "", &net.DNSError{Err: "no such host", Name: "tunnel.invalid", IsNotFound: true}
+	}
+	err := verify(context.Background(), loopClient(edge, unresolvable, "tunnel.invalid"), "https://tunnel.invalid"+loopPrefix+"n")
+	if err != nil {
+		t.Fatalf("through the proxy: %v", err)
+	}
+	if opened.Load() == 0 {
+		t.Error("the proxy opened no tunnel")
 	}
 }
