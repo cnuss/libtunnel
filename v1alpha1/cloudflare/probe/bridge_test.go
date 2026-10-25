@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"crypto/x509"
 	"io"
 	"net"
 	"net/http"
@@ -19,7 +20,15 @@ import (
 // needs no certificate; the scheme is the only difference from the real one.
 func bridgeServer(t *testing.T, upstream string) string {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(relayHandler(upstream))
+	t.Cleanup(srv.Close)
+	return "ws://" + srv.Listener.Addr().String() + BridgePath
+}
+
+// relayHandler is the bridge's /relay: a WebSocket whose frames are piped,
+// unread, to upstream.
+func relayHandler(upstream string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != BridgePath {
 			http.NotFound(w, r)
 			return
@@ -40,9 +49,7 @@ func bridgeServer(t *testing.T, upstream string) string {
 				<-done
 			},
 		}.ServeHTTP(w, r)
-	}))
-	t.Cleanup(srv.Close)
-	return "ws://" + srv.Listener.Addr().String() + BridgePath
+	})
 }
 
 // roundTrip proves bytes cross conn both ways, against an echo at the far end.
@@ -70,6 +77,33 @@ func TestDialBridgeCarriesBytes(t *testing.T) {
 	defer cancel()
 
 	conn, err := New().WithBridge(bridge).dialBridge(ctx)
+	if err != nil {
+		t.Fatalf("dialBridge: %v", err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn)
+}
+
+// TestDialBridgeTrustsTheRootCAs pins that a wss bridge's host is verified
+// against the prober's trust set, the one the mint and the edge use, so a
+// host with no CA store of its own still reaches the bridge. The bridge's
+// certificate is in that set and in no system store.
+func TestDialBridgeTrustsTheRootCAs(t *testing.T) {
+	srv := httptest.NewTLSServer(relayHandler(echoServer(t)))
+	t.Cleanup(srv.Close)
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	bridge, err := url.Parse("wss://" + srv.Listener.Addr().String() + BridgePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	p := New().WithRootCAs(pool)
+	// This bridge alone: the default would reach tunnel.pizza.
+	p.bridges = []*url.URL{bridge}
+	conn, err := p.dialBridge(ctx)
 	if err != nil {
 		t.Fatalf("dialBridge: %v", err)
 	}

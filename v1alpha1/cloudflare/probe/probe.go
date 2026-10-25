@@ -158,8 +158,8 @@ type Prober struct {
 	// Cloudflare's edge, not that provider.
 	bridges []*url.URL
 	// bridgeTLS is the outer TLS to the bridge's host. Nil verifies against
-	// the system roots, which is what an ordinary host on 443 wants; a test
-	// standing up its own bridge sets its own.
+	// rootCAs, the trust set the mint and the edge are verified against, so a
+	// host with no CA store reaches the bridge as it reaches the mint.
 	bridgeTLS *tls.Config
 
 	// preferred is the route that answered last, tried first until
@@ -227,7 +227,8 @@ func (p *Prober) WithVersion(version string) *Prober {
 	return p
 }
 
-// WithRootCAs sets the trust set for the edge and the DoH resolvers.
+// WithRootCAs sets the trust set for the edge, the bridge's host and the DoH
+// resolvers.
 // Default: trust.Pool, the host's store plus the roots libtunnel ships.
 func (p *Prober) WithRootCAs(pool *x509.CertPool) *Prober {
 	if pool != nil {
@@ -582,8 +583,8 @@ func (p *Prober) forward(ctx context.Context, r route, dial func(context.Context
 
 // dialBridge opens the WebSocket to the first bridge that answers and returns
 // it as a stream: the outer TLS is the bridge host's own, verified against
-// the system roots like any host on 443, and what the caller writes rides
-// the frames unread. Through the proxy where the environment names one,
+// the prober's trust set like the mint and the edge, and what the caller
+// writes rides the frames unread. Through the proxy where the environment names one,
 // since a network that needs this route usually has one.
 func (p *Prober) dialBridge(ctx context.Context) (net.Conn, error) {
 	if len(p.bridges) == 0 {
@@ -632,7 +633,7 @@ func (p *Prober) dialOneBridge(ctx context.Context, bridge *url.URL) (net.Conn, 
 	if secure {
 		config := p.bridgeTLS
 		if config == nil {
-			config = &tls.Config{ServerName: host}
+			config = &tls.Config{ServerName: host, RootCAs: p.rootCAs}
 		}
 		tlsConn := tls.Client(raw, config)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
