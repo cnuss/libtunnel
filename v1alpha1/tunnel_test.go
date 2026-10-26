@@ -26,10 +26,9 @@ import (
 // records the origin it was handed (listener or URL) and reports success
 // immediately.
 type fakeEngine struct {
-	got         chan net.Listener
-	gotURL      chan *url.URL
-	spec        *cloudflare.Spec
-	reconnected bool
+	got    chan net.Listener
+	gotURL chan *url.URL
+	spec   *cloudflare.Spec
 	// tokens records every WithToken the tunnel forwarded, in order.
 	tokens []string
 	// headers records every WithHeader the tunnel forwarded, in order, as
@@ -57,9 +56,8 @@ func (e *fakeEngine) WithToken(token string) v1.Backend[*cloudflare.Spec] {
 	e.tokens = append(e.tokens, token)
 	return e
 }
-func (e *fakeEngine) Reconnect(context.Context) error { e.reconnected = true; return nil }
-func (e *fakeEngine) Stopped() <-chan struct{}        { return e.stopped }
-func (e *fakeEngine) AddHeader(key, value string)     { e.headers = append(e.headers, key+": "+value) }
+func (e *fakeEngine) Stopped() <-chan struct{}    { return e.stopped }
+func (e *fakeEngine) AddHeader(key, value string) { e.headers = append(e.headers, key+": "+value) }
 func (e *fakeEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	e.got <- l
 	if !e.manual {
@@ -106,7 +104,6 @@ func (foreignBackend) Provider() v1.Provider[*cloudflare.Spec] {
 func (f foreignBackend) WithTLS(bool) v1.Backend[*cloudflare.Spec]     { return f }
 func (f foreignBackend) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return f }
 func (f foreignBackend) WithToken(string) v1.Backend[*cloudflare.Spec] { return f }
-func (foreignBackend) Reconnect(context.Context) error                 { return nil }
 
 var (
 	_ v1alpha1.Engine[*cloudflare.Spec] = (*fakeEngine)(nil)
@@ -867,7 +864,6 @@ func (failingEngine) AddHeader(string, string)                        {}
 func (e failingEngine) WithTLS(bool) v1.Backend[*cloudflare.Spec]     { return e }
 func (e failingEngine) WithHTTP2(bool) v1.Backend[*cloudflare.Spec]   { return e }
 func (e failingEngine) WithToken(string) v1.Backend[*cloudflare.Spec] { return e }
-func (failingEngine) Reconnect(context.Context) error                 { return nil }
 func (failingEngine) WithListener(t *v1alpha1.TunnelImpl[*cloudflare.Spec], l net.Listener) error {
 	return nil
 }

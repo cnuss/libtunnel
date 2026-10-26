@@ -63,7 +63,7 @@ declare types against the interfaces imports `v1`. Direct access to the
 
 ## Local development
 
-Requires Go 1.26 or later (cloudflared's floor).
+Requires Go 1.27.3 or later (cloudflared's floor).
 
 ```sh
 git clone https://github.com/cnuss/libtunnel.git
