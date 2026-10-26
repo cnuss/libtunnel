@@ -454,12 +454,6 @@ type Backend[T Spec] interface {
 	// tunnel.pizza only, never to another mint endpoint. Chainable. The
 	// LIBTUNNEL_TOKEN environment variable beats it.
 	WithToken(token string) Backend[T]
-	// Reconnect forcefully cycles the engine's connection(s) to the tunnel edge
-	// and blocks until the edge is re-established or ctx is done (returning
-	// ctx.Err()); pass a ctx with a deadline to bound the wait. It also returns
-	// if the tunnel itself shuts down while waiting. It is an error to call
-	// before the tunnel has connected.
-	Reconnect(ctx context.Context) error
 }
 
 // Tunnel is the lazy tunnel handle returned by libtunnel.New. All getters

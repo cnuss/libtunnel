@@ -5,7 +5,7 @@
 # paths for a reproducible build. The builder runs on the native BUILDPLATFORM
 # and Go cross-compiles to the requested TARGETOS/TARGETARCH (both injected by
 # buildx), so a multi-arch image build stays a fast native compile — no QEMU.
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 WORKDIR /src
 
 # Warm the module cache on the manifests alone, so a source-only change

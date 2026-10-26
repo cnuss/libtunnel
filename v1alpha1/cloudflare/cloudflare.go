@@ -32,7 +32,6 @@ import (
 	"github.com/cloudflare/cloudflared/client"
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
-	"github.com/cloudflare/cloudflared/edgediscovery"
 	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
 	"github.com/cloudflare/cloudflared/features"
 	"github.com/cloudflare/cloudflared/ingress"
@@ -125,18 +124,12 @@ var originDNSResolver = netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 53)
 const gracePeriod = 30 * time.Second
 
 // haConnections is the number of edge (HA) connections the supervisor keeps.
-// The reconnect lever fires one ReconnectSignal per conn to cycle them all.
 const haConnections = 2
 
 // edgeWatcher tracks the tunnel's edge connections from the Observer sink:
-// Connected events, so a caller can wait for N of them past a barrier, and the
-// failed attempts between them.
+// which are up, and the failed attempts between them.
 //
-// The sink calls up on every Connected; generation returns the running count
-// plus a channel that closes on the next one. Because each delivered
-// ReconnectSignal breaks exactly one edge conn and thus yields exactly one
-// Connected, waiting for the count to advance by haConnections is a correct
-// "all cycled conns are back up" barrier for any HA count.
+// The sink calls up on every Connected.
 //
 // The sink calls attempt on every Reconnecting, which the supervisor sends
 // before each backoff — including after a dial that never connected, so before
@@ -148,9 +141,7 @@ const haConnections = 2
 // the count says how many serve attempts ended — not how many live connections
 // were lost, and not why.
 type edgeWatcher struct {
-	mu  sync.Mutex
-	gen uint64
-	ch  chan struct{}
+	mu sync.Mutex
 	// Per connection index, so the watcher knows which connections are up
 	// now and not only which have ever been. HA keeps every map to a
 	// handful.
@@ -161,13 +152,7 @@ type edgeWatcher struct {
 	live map[uint8]bool
 }
 
-func newEdgeWatcher() *edgeWatcher { return &edgeWatcher{ch: make(chan struct{})} }
-
-func (e *edgeWatcher) generation() (uint64, <-chan struct{}) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.gen, e.ch
-}
+func newEdgeWatcher() *edgeWatcher { return &edgeWatcher{} }
 
 // up records a Connected for index. Both results are transitions, not
 // states: alive reports that this registration is the first live connection
@@ -177,9 +162,6 @@ func (e *edgeWatcher) generation() (uint64, <-chan struct{}) {
 func (e *edgeWatcher) up(index uint8) (alive, full bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.gen++
-	close(e.ch)
-	e.ch = make(chan struct{})
 	if e.live == nil {
 		e.live = map[uint8]bool{}
 	}
@@ -299,12 +281,8 @@ type Backend struct {
 	// "Authorization: token <value>". Empty sends none; v1.TokenEnv
 	// supersedes either.
 	token string
-	// Runtime state wired at connect. reconnected feeds the supervisor's
-	// external-control channel, edge tracks edge connections, and reconnectCtx
-	// is the tunnel context Reconnect waits on. All nil until connect runs.
-	reconnected  chan supervisor.ReconnectSignal
-	edge         *edgeWatcher
-	reconnectCtx context.Context
+	// edge tracks edge connections, wired at connect; nil until connect runs.
+	edge *edgeWatcher
 	// stopped closes once the supervisor has returned: its edge connections
 	// unregistered and closed, or the grace period spent. Nil until connect.
 	stopped chan struct{}
@@ -379,45 +357,6 @@ func (b *Backend) WithHTTP2(http2 bool) v1.Backend[*Spec] {
 		b.http2 = http2
 	}
 	return b
-}
-
-// Reconnect forcefully cycles the cloudflared<->edge tunnel(s) and blocks until
-// they are re-established, ctx is done, or the tunnel shuts down (see
-// v1.Backend.Reconnect). It fires one ReconnectSignal per HA connection, then
-// waits for haConnections Connected events past the pre-send count — each
-// delivered signal breaks exactly one edge conn and thus yields exactly one
-// Connected, so the barrier is correct for any HA count. Errors if called before
-// the tunnel has connected.
-func (b *Backend) Reconnect(ctx context.Context) error {
-	if b.reconnected == nil || b.edge == nil || b.reconnectCtx == nil {
-		return fmt.Errorf("cloudflare: Reconnect before tunnel connected")
-	}
-	// Wait on the caller's ctx (its deadline/cancellation) and on the tunnel
-	// context, so a tunnel teardown mid-reconnect unblocks even if ctx does not.
-	done := b.reconnectCtx.Done()
-	base, _ := b.edge.generation()
-	for range haConnections {
-		select {
-		case b.reconnected <- supervisor.ReconnectSignal{}:
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-done:
-			return b.reconnectCtx.Err()
-		}
-	}
-	for {
-		gen, ch := b.edge.generation()
-		if gen-base >= haConnections {
-			return nil
-		}
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-done:
-			return b.reconnectCtx.Err()
-		}
-	}
 }
 
 // The spec-field setters are hints: each rides the mint request as a header,
@@ -877,13 +816,8 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 	// https origin is dialed without verification (noTLSVerify, see
 	// ingressFor).
 	service := (&url.URL{Scheme: origin.Scheme, Host: origin.Host}).String()
-	// Wire runtime state onto the backend: reconnected feeds the supervisor's
-	// external-control channel (see NewSupervisor below), edge counts Connected
-	// events via the Observer sink, and reconnectCtx is the tunnel context.
-	// Once set, b.Reconnect is live.
-	b.reconnected = make(chan supervisor.ReconnectSignal)
+	// edge counts Connected events via the Observer sink.
 	b.edge = newEdgeWatcher()
-	b.reconnectCtx = t.Context()
 	// stopped is the supervisor's to close once it runs; until then a
 	// connect that fails closes it on the way out, so Done never waits on
 	// an edge that was never held.
@@ -963,7 +897,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 		if err != nil {
 			return nil, fmt.Errorf("failed to create client config: %w", err)
 		}
-		protocolSelector, err := connection.NewProtocolSelector("http2", spec.AccountTag, false, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
+		protocolSelector, err := connection.NewProtocolSelector("http2", log)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create protocol selector: %w", err)
 		}
@@ -1030,7 +964,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 		// that feeds edge, so the Reconnect lever can block until the edge is
 		// back up and the ErrEdgeUnreachable bound can report how many attempts
 		// it took.
-		observer := connection.NewObserver(log, log)
+		observer := connection.NewObserver(log)
 		observer.RegisterSink(connection.EventSinkFunc(func(e connection.Event) {
 			// Every event, not only the two acted on: this is the only
 			// structured view of what the edge is doing, and cloudflared's own
@@ -1099,7 +1033,6 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 			// every request hitting the origin.)
 			Tags:            nil,
 			Log:             log,
-			LogTransport:    log,
 			Observer:        observer,
 			ReportedVersion: cloudflaredVersion,
 			Retries:         5,
@@ -1139,10 +1072,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 			return nil, fmt.Errorf("failed to create orchestrator: %w", err)
 		}
 
-		// b.reconnected is the backend's external-control channel, wired above;
-		// here it is handed to the supervisor, which selects on it. b.Reconnect
-		// sends on it to cycle the edge.
-		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, b.reconnected, graceful)
+		sup, err := supervisor.NewSupervisor(tunnelConfig, orchestrator, graceful)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create supervisor: %w", err)
 		}
