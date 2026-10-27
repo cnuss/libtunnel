@@ -3,8 +3,11 @@ package cloudflare
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -22,8 +25,46 @@ type slogWriter struct {
 var _ io.Writer = slogWriter{}
 
 func (w slogWriter) Write(p []byte) (int, error) {
-	w.log.Log(context.Background(), recordLevel(p), strings.TrimRight(string(p), "\n"))
+	w.log.Log(context.Background(), recordLevel(p), strings.TrimRight(string(redact(p)), "\n"))
 	return len(p), nil
+}
+
+// credentials are the request headers whose values never reach a log.
+var credentials = []string{"Authorization", "Cookie", "Proxy-Authorization", "Set-Cookie"}
+
+// redact replaces the values of credentials in a record's headers, the field
+// cloudflared logs each request's headers under at debug. A quote inside a
+// JSON string is escaped, so a bare "headers": is only ever the field. The
+// headers are re-encoded with encoding/json as zerolog encoded them, so
+// everything but the redacted values comes out as it went in; a record
+// without the field, or one that does not decode, is passed on as it is.
+func redact(p []byte) []byte {
+	field := []byte(`"headers":`)
+	i := bytes.Index(p, field)
+	if i < 0 {
+		return p
+	}
+	start := i + len(field)
+	dec := json.NewDecoder(bytes.NewReader(p[start:]))
+	var headers map[string][]string
+	if dec.Decode(&headers) != nil {
+		return p
+	}
+	redacted := false
+	for name := range headers {
+		if slices.Contains(credentials, http.CanonicalHeaderKey(name)) {
+			headers[name] = []string{"[redacted]"}
+			redacted = true
+		}
+	}
+	if !redacted {
+		return p
+	}
+	b, err := json.Marshal(headers)
+	if err != nil {
+		return p
+	}
+	return slices.Concat(p[:start], b, p[start+int(dec.InputOffset()):])
 }
 
 // recordLevel reads the level off a zerolog record. zerolog writes level as the

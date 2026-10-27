@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -89,5 +90,52 @@ func TestZerologgerThreshold(t *testing.T) {
 	loud := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	if got := zerologger(loud).GetLevel(); got != zerolog.DebugLevel {
 		t.Errorf("debug-level handler yields zerolog %v, want %v", got, zerolog.DebugLevel)
+	}
+}
+
+// TestSlogWriterRedactsCredentials pins that a request cloudflared logs at
+// debug reaches the caller's log without its credentials: the values of
+// Authorization, Proxy-Authorization, Cookie and Set-Cookie are replaced,
+// their names and every other header and field kept as they were.
+func TestSlogWriterRedactsCredentials(t *testing.T) {
+	for name, tc := range map[string]struct{ line, want string }{
+		"a request": {
+			`{"level":"debug","component":"tunnel","host":"0tabc.tunneld.to","path":"/_tunneld/mcp","headers":{"Accept":["application/json"],"Authorization":["Bearer eyJ.a.b"],"Cookie":["__Host-tunneld-auth=v1.x.y; theme=dark"],"Proxy-Authorization":["Basic dTpw"],"Set-Cookie":["a=b"],"X-Odd":["say \"]}\" twice"]},"content-length":0,"message":"POST https://0tabc.tunneld.to/_tunneld/mcp HTTP/1.1"}`,
+			`{"level":"debug","component":"tunnel","host":"0tabc.tunneld.to","path":"/_tunneld/mcp","headers":{"Accept":["application/json"],"Authorization":["[redacted]"],"Cookie":["[redacted]"],"Proxy-Authorization":["[redacted]"],"Set-Cookie":["[redacted]"],"X-Odd":["say \"]}\" twice"]},"content-length":0,"message":"POST https://0tabc.tunneld.to/_tunneld/mcp HTTP/1.1"}`,
+		},
+		"no credentials": {
+			`{"level":"debug","headers":{"Accept":["*/*"]},"message":"GET / HTTP/1.1"}`,
+			`{"level":"debug","headers":{"Accept":["*/*"]},"message":"GET / HTTP/1.1"}`,
+		},
+		"no headers": {
+			`{"level":"error","error":"headers: none","message":"failed"}`,
+			`{"level":"error","error":"headers: none","message":"failed"}`,
+		},
+		"not json": {`"headers":{"Authorization":["x"]`, `"headers":{"Authorization":["x"]`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &capture{}
+			if _, err := (slogWriter{log: slog.New(c)}).Write([]byte(tc.line + "\n")); err != nil {
+				t.Fatal(err)
+			}
+			if len(c.msgs) != 1 || c.msgs[0] != tc.want {
+				t.Errorf("forwarded %q\nwant      %q", c.msgs, tc.want)
+			}
+		})
+	}
+}
+
+// TestZerologgerRedactsARequest logs a request the way cloudflared's
+// logHTTPRequest does, through zerolog's own encoding, and pins that the
+// credential never reaches the caller and the other headers do.
+func TestZerologgerRedactsARequest(t *testing.T) {
+	c := &capture{}
+	h := http.Header{}
+	h.Set("Authorization", "Bearer eyJ.secret.sig")
+	h.Set("Cookie", "__Host-tunneld-auth=v1.secret.mac")
+	h.Set("Accept", "text/event-stream")
+	zerologger(slog.New(c)).Debug().Str("path", "/_tunneld/mcp").Interface("headers", h).Msg("POST /_tunneld/mcp HTTP/1.1")
+	if len(c.msgs) != 1 || strings.Contains(c.msgs[0], "secret") || !strings.Contains(c.msgs[0], `"Authorization":["[redacted]"]`) || !strings.Contains(c.msgs[0], `"Accept":["text/event-stream"]`) {
+		t.Errorf("forwarded %q, want the credentials redacted and Accept kept", c.msgs)
 	}
 }
