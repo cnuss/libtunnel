@@ -18,6 +18,8 @@ Deep-link by filename; line numbers will drift.
 | Generic providers (`Static`, `Env`) + handoff helpers | [`v1alpha1/provider.go`](./v1alpha1/provider.go)          |
 | Cloudflare engine (cloudflared supervisor wiring) | [`v1alpha1/cloudflare/cloudflare.go`](./v1alpha1/cloudflare/cloudflare.go) |
 | Gone probe (is the tunnel still there?)          | [`v1alpha1/cloudflare/probe/probe.go`](./v1alpha1/cloudflare/probe/probe.go) |
+| Edge socket readings + stall detector           | [`v1alpha1/cloudflare/edgesock/edgesock.go`](./v1alpha1/cloudflare/edgesock/edgesock.go) |
+| Edge socket watcher (logs stalls at debug)      | [`v1alpha1/cloudflare/edgesock/socketwatch.go`](./v1alpha1/cloudflare/edgesock/socketwatch.go) |
 | Trust set (embedded roots + host store)          | [`v1alpha1/cloudflare/trust/trust.go`](./v1alpha1/cloudflare/trust/trust.go) |
 | Quick-tunnel provider (tunnel.pizza)  | [`v1alpha1/cloudflare/quicktunnel.go`](./v1alpha1/cloudflare/quicktunnel.go) |
 | Network error reporting (NEL + Report-To client) | [`v1alpha1/nel/nel.go`](./v1alpha1/nel/nel.go) |

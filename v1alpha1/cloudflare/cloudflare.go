@@ -45,6 +45,7 @@ import (
 
 	v1 "github.com/cnuss/libtunnel/v1"
 	"github.com/cnuss/libtunnel/v1alpha1"
+	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/edgesock"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/probe"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/spec"
 	"github.com/cnuss/libtunnel/v1alpha1/cloudflare/trust"
@@ -904,6 +905,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 		// back up and the ErrEdgeUnreachable bound can report how many attempts
 		// it took.
 		observer := connection.NewObserver(log)
+		sockets := edgesock.NewWatch()
 		observer.RegisterSink(connection.EventSinkFunc(func(e connection.Event) {
 			// Every event, not only the two acted on: this is the only
 			// structured view of what the edge is doing, and cloudflared's own
@@ -927,6 +929,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 				// again: the edge may be fanning a new location out. Every
 				// connection up is the tunnel's news; one of several
 				// registering is neither.
+				sockets.Connected(ctx, e.Index, e.EdgeAddress, t.Logger())
 				alive, full := b.edge.up(e.Index)
 				if alive && b.establishing.CompareAndSwap(false, true) {
 					go func() {
@@ -938,8 +941,10 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 					t.Emit(v1.Event{Kind: v1.EventConnected})
 				}
 			case connection.Reconnecting:
+				sockets.Ended(e.Index)
 				b.edge.attempt(e.Index)
 			case connection.Disconnected:
+				sockets.Ended(e.Index)
 				// The last connection going is the tunnel's news; one of
 				// several is not, and neither is a serve attempt ending that
 				// never registered — which is most of what the supervisor
