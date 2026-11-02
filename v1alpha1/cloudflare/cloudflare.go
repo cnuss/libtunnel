@@ -270,9 +270,6 @@ type Backend struct {
 	// a scheme is used verbatim). Empty means the default (tunnel.pizza);
 	// v1.CloudflareProviderEnv supersedes either.
 	providerHost string
-	// edgeProtocol pins the edge transport (WithEdgeProtocol). Empty leaves the
-	// choice to cloudflared; v1.CloudflareEdgeProtocolEnv supersedes either.
-	edgeProtocol EdgeProtocol
 	// headers carries request headers added to the quick-tunnel mint call via
 	// WithHeader. Nil until the first WithHeader; overlaid by (and augmented
 	// with) v1.CloudflareHeadersEnv at mint time.
@@ -418,58 +415,6 @@ func (b *Backend) WithSecret(secret []byte) *Backend {
 func (b *Backend) WithProvider(host string) *Backend {
 	b.providerHost = host
 	return b
-}
-
-// EdgeProtocol is a transport cloudflared can use to reach the tunnel edge.
-type EdgeProtocol string
-
-const (
-	// EdgeQUIC reaches the edge over UDP. The edge closes a QUIC connection
-	// when the tunnel behind it goes away, so a client learns in seconds what
-	// http2 leaves it to discover minutes later.
-	EdgeQUIC EdgeProtocol = "quic"
-	// EdgeHTTP2 reaches the edge over TCP, which works on networks that drop
-	// UDP.
-	EdgeHTTP2 EdgeProtocol = "http2"
-	// EdgeAuto leaves the choice, and the fallback, to cloudflared.
-	EdgeAuto EdgeProtocol = "auto"
-)
-
-// WithEdgeProtocol pins the edge transport. Unset, cloudflared chooses and
-// falls back on its own, which is the right default: it knows QUIC to http2,
-// and it is the thing holding the connection when a transport turns out not to
-// work.
-//
-// Pin EdgeHTTP2 on a network known to drop UDP, where the fallback would
-// otherwise cost a minute before landing there anyway. Pin EdgeQUIC to refuse
-// that fallback, keeping the signal http2 does not carry.
-//
-// Not to be confused with WithHTTP2, which is about the other end of the
-// tunnel — whether the origin is dialed over HTTP/2.
-//
-// Env mirror: LIBTUNNEL__CLOUDFLARE_EDGE_PROTOCOL (env beats code). An
-// unrecognized protocol fails the tunnel at connect rather than falling back
-// silently — naming a transport means it.
-func (b *Backend) WithEdgeProtocol(p EdgeProtocol) *Backend {
-	b.edgeProtocol = p
-	return b
-}
-
-// resolveEdgeProtocol reports the transport to hand cloudflared: the env
-// mirror over the code value, and EdgeAuto when neither is set.
-func (b *Backend) resolveEdgeProtocol() (EdgeProtocol, error) {
-	p := b.edgeProtocol
-	if raw := strings.TrimSpace(os.Getenv(v1.CloudflareEdgeProtocolEnv)); raw != "" {
-		p = EdgeProtocol(raw)
-	}
-	switch p {
-	case "":
-		return EdgeAuto, nil
-	case EdgeQUIC, EdgeHTTP2, EdgeAuto:
-		return p, nil
-	default:
-		return "", fmt.Errorf("unknown edge protocol %q, want one of %q, %q, %q", p, EdgeQUIC, EdgeHTTP2, EdgeAuto)
-	}
 }
 
 // WithHeader adds a request header to the quick-tunnel mint call, so a provider
@@ -856,12 +801,6 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 	if _, set := os.LookupEnv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING"); !set {
 		os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
 	}
-
-	protocol, err := b.resolveEdgeProtocol()
-	if err != nil {
-		return err
-	}
-	t.Logger().Info("edge transport selected", "protocol", protocol)
 
 	// The supervisor runs on a context of its own that outlives the tunnel's
 	// by up to the grace period. cloudflared's graceful shutdown sends
@@ -1270,8 +1209,7 @@ type emitter interface{ Emit(v1.Event) }
 // about why the edge never answered.
 const edgeBlockedHint = "your machine/network is getting its egress to the tunnel edge " +
 	"blocked or dropped. Make sure to allow egress connectivity as per " +
-	"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/ " +
-	"(WithEdgeProtocol pins the transport when only one of UDP or TCP is allowed)"
+	"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/"
 
 // noopImpl satisfies the metrics interfaces cloudflared insists on with
 // do-nothing implementations.
