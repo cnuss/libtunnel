@@ -323,14 +323,6 @@ const (
 	// — the list form has no escaping. Only the mint path uses it.
 	CloudflareHeadersEnv = "LIBTUNNEL__CLOUDFLARE_HEADERS"
 
-	// CloudflareEdgeProtocolEnv mirrors WithEdgeProtocol: a comma-separated
-	// preference order for the edge transport, from quic, http2, and auto.
-	// Each is probed in turn and the first reachable one is used; the last is
-	// the fallback and is taken as given. An unrecognized value fails the
-	// tunnel rather than falling back silently — an operator naming a
-	// transport means it.
-	CloudflareEdgeProtocolEnv = "LIBTUNNEL__CLOUDFLARE_EDGE_PROTOCOL"
-
 	// CloudflareMintWaitEnv sets how long a hostname minted anywhere but
 	// tunnel.pizza waits before it is handed back (time.ParseDuration syntax,
 	// default 5s): tunnel.pizza answers once the record has spread, another

@@ -976,56 +976,6 @@ func TestNoSpecStillFails(t *testing.T) {
 	}
 }
 
-// TestEdgeProtocolDefaultsToAuto pins that libtunnel does not choose the
-// transport: cloudflared knows the QUIC-to-http2 fallback and is the thing
-// holding the connection when one turns out not to work.
-func TestEdgeProtocolDefaultsToAuto(t *testing.T) {
-	t.Setenv(v1.CloudflareEdgeProtocolEnv, "")
-
-	got, err := New().resolveEdgeProtocol()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != EdgeAuto {
-		t.Errorf("edge protocol = %q, want %q", got, EdgeAuto)
-	}
-}
-
-// TestEdgeProtocolEnvBeatsCode pins the mirror, and that a pin survives it.
-func TestEdgeProtocolEnvBeatsCode(t *testing.T) {
-	t.Setenv(v1.CloudflareEdgeProtocolEnv, "")
-	got, err := New().WithEdgeProtocol(EdgeQUIC).resolveEdgeProtocol()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != EdgeQUIC {
-		t.Errorf("edge protocol = %q, want the pinned %q", got, EdgeQUIC)
-	}
-
-	t.Setenv(v1.CloudflareEdgeProtocolEnv, " http2 ")
-	got, err = New().WithEdgeProtocol(EdgeQUIC).resolveEdgeProtocol()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != EdgeHTTP2 {
-		t.Errorf("edge protocol = %q, want the env value %q", got, EdgeHTTP2)
-	}
-}
-
-// TestEdgeProtocolRejectsNonsense pins that a transport cloudflared cannot
-// dial fails the tunnel rather than falling back quietly to auto.
-func TestEdgeProtocolRejectsNonsense(t *testing.T) {
-	t.Setenv(v1.CloudflareEdgeProtocolEnv, "")
-	if _, err := New().WithEdgeProtocol("h2mux").resolveEdgeProtocol(); err == nil {
-		t.Error("h2mux accepted in code, want it rejected")
-	}
-
-	t.Setenv(v1.CloudflareEdgeProtocolEnv, "tcp")
-	if _, err := New().resolveEdgeProtocol(); err == nil {
-		t.Error("tcp accepted from the env, want it rejected")
-	}
-}
-
 // recorder is an emitter that keeps what it was told.
 type recorder struct {
 	mu     sync.Mutex
