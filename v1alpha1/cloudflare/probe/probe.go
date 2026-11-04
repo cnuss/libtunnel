@@ -9,6 +9,7 @@ package probe
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -20,6 +21,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -832,17 +834,29 @@ func (p *Prober) probeHTTP2(ctx context.Context) error {
 	return fmt.Errorf("%w: edge refused the connection: %w", ErrGone, got.err)
 }
 
+// LookupHost is the first of LookupAddrs: an IPv4 address when there is one.
 func (p *Prober) LookupHost(ctx context.Context, host string) (string, error) {
+	addrs, err := p.LookupAddrs(ctx, host)
+	if err != nil {
+		return "", err
+	}
+	return addrs[0], nil
+}
+
+// LookupAddrs is host's addresses from the first DoH resolver that answers,
+// IPv4 first. A name a resolver says does not exist comes back as that
+// answer; anything else that leaves no resolver answering is ErrRetry.
+func (p *Prober) LookupAddrs(ctx context.Context, host string) ([]string, error) {
 	var lastErr error
 	for _, resolver := range p.dohResolvers() {
 		if ctx.Err() != nil {
-			return "", fmt.Errorf("%w: %w", ErrRetry, ctx.Err())
+			return nil, fmt.Errorf("%w: %w", ErrRetry, ctx.Err())
 		}
 		lookup, cancel := context.WithTimeout(ctx, dohTimeout)
 		addrs, err := resolver.LookupHost(lookup, host)
 		cancel()
 		if err == nil && len(addrs) > 0 {
-			return addrs[0], nil
+			return ipv4First(addrs), nil
 		}
 		lastErr = err
 	}
@@ -851,9 +865,31 @@ func (p *Prober) LookupHost(ctx context.Context, host string) (string, error) {
 	}
 	var dnsErr *net.DNSError
 	if errors.As(lastErr, &dnsErr) && dnsErr.IsNotFound {
-		return "", lastErr
+		return nil, lastErr
 	}
-	return "", fmt.Errorf("%w: %w", ErrRetry, lastErr)
+	return nil, fmt.Errorf("%w: %w", ErrRetry, lastErr)
+}
+
+// ipv4First orders addresses IPv4 before IPv6, each family as it came. The
+// edge is reached over IPv4 only, and a machine with no working IPv6 route
+// can drop packets to an IPv6 address rather than refuse them.
+func ipv4First(addrs []string) []string {
+	if addrs == nil {
+		return nil
+	}
+	ordered := slices.Clone(addrs)
+	slices.SortStableFunc(ordered, func(a, b string) int {
+		return cmp.Compare(family(a), family(b))
+	})
+	return ordered
+}
+
+// family is 4 for an IPv4 address and 6 for anything else.
+func family(addr string) int {
+	if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+		return 4
+	}
+	return 6
 }
 
 // dohResolvers builds the resolvers once, dropping any that will not
