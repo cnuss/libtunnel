@@ -1499,7 +1499,7 @@ func edgeLoop(t *testing.T) *httptest.Server {
 	return edge
 }
 
-func loopClient(edge *httptest.Server, lookup func(context.Context, string) (string, error), hostname string) *http.Client {
+func loopClient(edge *httptest.Server, lookup func(context.Context, string) ([]string, error), hostname string) *http.Client {
 	client := loopThroughClient(lookup, hostname)
 	pool := x509.NewCertPool()
 	pool.AddCert(edge.Certificate())
@@ -1518,18 +1518,36 @@ func TestLoopThroughFallsBackWhenDoHIsUnreachable(t *testing.T) {
 	_, port, _ := net.SplitHostPort(edge.Listener.Addr().String())
 	url := "https://localhost:" + port + loopPrefix + "n"
 
-	blocked := func(context.Context, string) (string, error) {
-		return "", fmt.Errorf("%w: dial cloudflare-dns.com: i/o timeout", probe.ErrRetry)
+	blocked := func(context.Context, string) ([]string, error) {
+		return nil, fmt.Errorf("%w: dial cloudflare-dns.com: i/o timeout", probe.ErrRetry)
 	}
 	if err := verify(context.Background(), loopClient(edge, blocked, "localhost"), url); err != nil {
 		t.Errorf("with DoH unreachable: %v, want the system resolver to find localhost", err)
 	}
 
-	notYet := func(context.Context, string) (string, error) {
-		return "", &net.DNSError{Err: "no such host", Name: "localhost", IsNotFound: true}
+	notYet := func(context.Context, string) ([]string, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "localhost", IsNotFound: true}
 	}
 	if err := verify(context.Background(), loopClient(edge, notYet, "localhost"), url); err == nil {
 		t.Error("with DoH saying the name does not exist yet, the system resolver was asked")
+	}
+}
+
+// TestLoopThroughTriesEveryAddress pins that the verification moves past an
+// address that does not answer to the next one DoH gave, rather than retrying
+// the first forever: here an IPv6 loopback nothing listens on, standing in
+// for an IPv6 address a machine without IPv6 cannot reach, ahead of the
+// edge's IPv4 one.
+func TestLoopThroughTriesEveryAddress(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "")
+	edge := edgeLoop(t)
+	_, port, _ := net.SplitHostPort(edge.Listener.Addr().String())
+	both := func(context.Context, string) ([]string, error) {
+		return []string{"::1", "127.0.0.1"}, nil
+	}
+	url := "https://tunnel.test:" + port + loopPrefix + "n"
+	if err := verify(context.Background(), loopClient(edge, both, "tunnel.test"), url); err != nil {
+		t.Errorf("with the first address dead: %v, want the second to answer", err)
 	}
 }
 
@@ -1542,8 +1560,8 @@ func TestLoopThroughGoesThroughTheProxy(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", proxy)
 	t.Setenv("NO_PROXY", "")
 
-	unresolvable := func(context.Context, string) (string, error) {
-		return "", &net.DNSError{Err: "no such host", Name: "tunnel.invalid", IsNotFound: true}
+	unresolvable := func(context.Context, string) ([]string, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "tunnel.invalid", IsNotFound: true}
 	}
 	err := verify(context.Background(), loopClient(edge, unresolvable, "tunnel.invalid"), "https://tunnel.invalid"+loopPrefix+"n")
 	if err != nil {

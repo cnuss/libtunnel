@@ -934,7 +934,7 @@ func (b *Backend) connect(t *v1alpha1.TunnelImpl[*Spec], origin *url.URL) error 
 				if alive && b.establishing.CompareAndSwap(false, true) {
 					go func() {
 						defer b.establishing.Store(false)
-						b.establish(ctx, t, loopThroughClient(prober.LookupHost, spec.GetHostname()), "https://"+spec.GetHostname()+loop, t.Logger())
+						b.establish(ctx, t, loopThroughClient(prober.LookupAddrs, spec.GetHostname()), "https://"+spec.GetHostname()+loop, t.Logger())
 					}()
 				}
 				if full {
@@ -1096,14 +1096,16 @@ func ingressFor(service, loop string, http2 bool) (ingress.Ingress, error) {
 // out through one, nothing else reaches the edge on 443.
 //
 // Otherwise the hostname is resolved through lookup, the prober's DoH
-// resolvers, and the address dialed directly, so the machine's resolver is
-// not asked: this is the first request for the name from this host, and a
+// resolvers, and its addresses dialed directly in the order given, IPv4
+// first, each but the last for at most dialEach, so one that drops packets,
+// as an IPv6 address does on a machine with no working IPv6 route, cannot
+// spend the whole budget. The machine's resolver is not asked: this is the first request for the name from this host, and a
 // resolver asked a beat early caches the NXDOMAIN for the zone's SOA. When
 // the resolvers themselves cannot be reached the machine's resolver is asked
 // after all, since otherwise the verification never succeeds and the address
 // is never handed out. A name they say does not exist yet is retried, not
 // handed to the machine's resolver to cache.
-func loopThroughClient(lookup func(context.Context, string) (string, error), hostname string) *http.Client {
+func loopThroughClient(lookup func(context.Context, string) ([]string, error), hostname string) *http.Client {
 	var direct net.Dialer
 	return &http.Client{
 		Timeout: 5 * time.Second,
@@ -1116,17 +1118,42 @@ func loopThroughClient(lookup func(context.Context, string) (string, error), hos
 					// The proxy, when there is one.
 					return direct.DialContext(ctx, network, addr)
 				}
-				ip, err := lookup(ctx, host)
+				ips, err := lookup(ctx, host)
 				if errors.Is(err, probe.ErrRetry) && ctx.Err() == nil {
 					return direct.DialContext(ctx, network, addr)
 				}
 				if err != nil {
 					return nil, err
 				}
-				return direct.DialContext(ctx, network, net.JoinHostPort(ip, port))
+				return dialEvery(ctx, &direct, network, ips, port)
 			},
 		},
 	}
+}
+
+// dialEach bounds a dial to one of several addresses, every one but the last.
+const dialEach = 2 * time.Second
+
+// dialEvery dials ips in turn on port and returns the first that answers.
+func dialEvery(ctx context.Context, dialer *net.Dialer, network string, ips []string, port string) (net.Conn, error) {
+	var errs []error
+	for i, ip := range ips {
+		attempt := ctx
+		if i < len(ips)-1 {
+			var cancel context.CancelFunc
+			attempt, cancel = context.WithTimeout(ctx, dialEach)
+			defer cancel()
+		}
+		conn, err := dialer.DialContext(attempt, network, net.JoinHostPort(ip, port))
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, err)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, errors.Join(errs...)
 }
 
 // envProxy is the proxy the environment names for r, read afresh as the

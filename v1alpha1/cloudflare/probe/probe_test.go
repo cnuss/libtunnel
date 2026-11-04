@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 )
@@ -45,5 +46,23 @@ func TestProbeStopsWithTheContextRatherThanGuessing(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Errorf("probe returned after %s, want it to stop with the context", elapsed)
+	}
+}
+
+// TestIPv4First pins the order a DoH answer is handed on in: IPv4 before
+// IPv6, each family as it came. A machine with no working IPv6 route can drop
+// packets to an IPv6 address rather than refuse them, and the edge is reached
+// over IPv4 only.
+func TestIPv4First(t *testing.T) {
+	for _, tc := range []struct{ in, want []string }{
+		{[]string{"2606:4700:a0::1", "104.21.33.129", "2606:4700:a0::2", "172.67.145.48"},
+			[]string{"104.21.33.129", "172.67.145.48", "2606:4700:a0::1", "2606:4700:a0::2"}},
+		{[]string{"198.41.192.7", "198.41.192.67"}, []string{"198.41.192.7", "198.41.192.67"}},
+		{[]string{"2606:4700:a0::1"}, []string{"2606:4700:a0::1"}},
+		{nil, nil},
+	} {
+		if got := ipv4First(tc.in); !slices.Equal(got, tc.want) {
+			t.Errorf("ipv4First(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
