@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -63,6 +64,26 @@ func TestIPv4First(t *testing.T) {
 	} {
 		if got := ipv4First(tc.in); !slices.Equal(got, tc.want) {
 			t.Errorf("ipv4First(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestDoHResolversLeaveTheEndpointsAlone pins that building a Prober's DoH
+// resolvers, as two Probers may at once, never writes dohEndpoints, which
+// every Prober shares: go-dns rewrites the addresses it is given in place.
+func TestDoHResolversLeaveTheEndpointsAlone(t *testing.T) {
+	want := make([][]string, len(dohEndpoints))
+	for i, e := range dohEndpoints {
+		want[i] = slices.Clone(e.addresses)
+	}
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Go(func() { New().dohResolvers() })
+	}
+	wg.Wait()
+	for i, e := range dohEndpoints {
+		if !slices.Equal(e.addresses, want[i]) {
+			t.Errorf("dohEndpoints[%d].addresses = %q after building resolvers, want %q", i, e.addresses, want[i])
 		}
 	}
 }
