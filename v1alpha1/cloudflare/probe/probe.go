@@ -899,8 +899,10 @@ func (p *Prober) dohResolvers() []*net.Resolver {
 	p.resolversOnce.Do(func() {
 		transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: p.rootCAs}}
 		for _, endpoint := range dohEndpoints {
+			// A copy: go-dns rewrites the addresses it is given in place,
+			// and dohEndpoints is every Prober's.
 			resolver, err := dns.NewDoHResolver(endpoint.uri,
-				dns.DoHAddresses(endpoint.addresses...),
+				dns.DoHAddresses(slices.Clone(endpoint.addresses)...),
 				dns.DoHTransport(transport),
 			)
 			if err != nil {
