@@ -140,7 +140,7 @@ jobs:
       # it.
       - name: identity
         id: identity
-        uses: cnuss/actions-identity@b9bc5d6472e00dfca0490bdf539eb4d4b729807d # v1.1.0
+        uses: cnuss/actions-identity@354ab9b3d96c9b2d23f2d8fcf4e62ff2e55f8132 # v1.2.0
 
       # All live-tier selection lives in the e2e package (#147, #255): which
       # tier a platform runs — the full scenario suite on linux/amd64; the
